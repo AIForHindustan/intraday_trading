@@ -1,7 +1,32 @@
 #!/usr/bin/env python3
 """
-Interactive Alert Validation Dashboard with Time Series Charts
-Shows validation alerts, patterns, and price movement charts
+Interactive Sent Alerts Dashboard with Real-time Data Visualization
+
+A comprehensive Dash-based web dashboard for visualizing and analyzing sent trading alerts
+from the intraday trading system. Displays alerts enriched with news, technical indicators,
+and options Greeks, with interactive price charts and filtering capabilities.
+
+Features:
+    - Sent Alerts Visualization: Displays alerts that were successfully sent to Telegram/Redis
+    - News Enrichment: Shows related news articles for each alert when available
+    - Technical Indicators: Displays RSI, MACD, EMA, ATR, VWAP, Bollinger Bands for equity/futures
+    - Options Greeks: Shows Delta, Gamma, Theta, Vega, Rho for options instruments
+    - Price Charts: Interactive Plotly charts with price action and volume analysis
+    - Instrument Filtering: Filters alerts to only intraday crawler instruments
+    - Expiry Dates: Extracts and displays expiry dates for F&O instruments
+    - Pattern Analysis: Shows pattern distribution and confidence scores
+    - Summary Statistics: Alert counts, news enrichment rates, symbol rankings
+
+Data Sources:
+    - Redis DB 0: Alert data (alert:*, alerts:stream)
+    - Redis DB 1: OHLC data, technical indicators, Greeks (ohlc_latest:*, indicators:*, greeks:*)
+    - Token Lookup: Core data/token_lookup_enriched.json for instrument resolution
+
+Usage:
+    python alert_validation/alert_dashboard.py
+    
+    Access dashboard at: http://localhost:8050
+    Network access: http://<local-ip>:8050
 """
 
 import json

@@ -220,7 +220,7 @@ class ConnectionPooledRedisClient:
         port: int = 6379,
         db: int = 0,
         password: Optional[str] = None,
-        max_connections: int = 20,
+        max_connections: int = 200,  # Increased default for high-frequency trading
         decode_responses: bool = True,
         socket_connect_timeout: int = 5,
         socket_timeout: int = 5,
@@ -294,9 +294,22 @@ class RobustRedisClient:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.health_check_interval = health_check_interval
-        self.max_connections = 20
+        
+        # Get max_connections from config, default to 200 for high-frequency trading
+        # Priority: config dict > centralized redis_config > default
+        self.max_connections = 200
         if config:
-            self.max_connections = int(config.get("redis_max_connections", self.max_connections))
+            # Check for both redis_max_connections and max_connections keys
+            self.max_connections = int(config.get("redis_max_connections") or config.get("max_connections", self.max_connections))
+        else:
+            # Try to get from centralized config if no config provided
+            try:
+                from config.redis_config import get_redis_config
+                redis_config = get_redis_config()
+                if "max_connections" in redis_config:
+                    self.max_connections = int(redis_config["max_connections"])
+            except Exception:
+                pass  # Use default if config unavailable
 
         # ✅ FIXED: Separate Redis clients per database
         self.clients = {}
