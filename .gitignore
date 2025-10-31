@@ -50,6 +50,11 @@ research_data/
 *.jsonl
 *.jsonl.gz
 *.jsonl.bz2
+*.jsonl.zst
+*.zst
+# Raw binary data
+crawlers/raw_data/
+*.bin
 
 # Temporary files
 *.tmp
