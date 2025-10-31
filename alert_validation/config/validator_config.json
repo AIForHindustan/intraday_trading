@@ -1,0 +1,132 @@
+{
+  "redis": {
+    "host": "localhost",
+    "port": 6379,
+    "db": 0,
+    "password": null
+  },
+  "datastores": {
+    "alerts": "pattern_alerts",
+    "rolling": "daily_cumulative"
+  },
+  "channels": {
+    "alerts_input": "alerts:notifications",
+    "validation_output": "validation_results"
+  },
+  "rolling_windows": [1, 3, 5, 10, 15, 30, 60],
+  "volume_thresholds": {
+    "LOW": {
+      "vix_max": 15,
+      "volume_spike": 3.08,
+      "volume_breakout": 2.8,
+      "volume_price_divergence": 2.8,
+      "upside_momentum": 1.82,
+      "downside_momentum": 1.82,
+      "breakout": 2.8,
+      "reversal": 2.38,
+      "hidden_accumulation": 2.8,
+      "volume_profile_breakout": 2.5,
+      "ict_liquidity_pools": 2.2,
+      "ict_fair_value_gaps": 1.8,
+      "ict_optimal_trade_entry": 1.6,
+      "ict_premium_discount": 1.4,
+      "ict_killzone": 2.0,
+      "ict_momentum": 1.8,
+      "kow_signal_straddle": 1.5
+    },
+    "NORMAL": {
+      "vix_max": 20,
+      "volume_spike": 2.2,
+      "volume_breakout": 1.8,
+      "volume_price_divergence": 1.5,
+      "upside_momentum": 1.3,
+      "downside_momentum": 1.3,
+      "breakout": 1.8,
+      "reversal": 1.6,
+      "hidden_accumulation": 1.6,
+      "volume_profile_breakout": 1.8,
+      "ict_liquidity_pools": 1.6,
+      "ict_fair_value_gaps": 1.4,
+      "ict_optimal_trade_entry": 1.2,
+      "ict_premium_discount": 1.0,
+      "ict_killzone": 1.5,
+      "ict_momentum": 1.3,
+      "kow_signal_straddle": 1.2
+    },
+    "HIGH": {
+      "vix_max": 25,
+      "volume_spike": 1.76,
+      "volume_breakout": 1.44,
+      "volume_price_divergence": 1.2,
+      "upside_momentum": 1.04,
+      "downside_momentum": 1.04,
+      "breakout": 1.44,
+      "reversal": 1.28,
+      "hidden_accumulation": 1.28,
+      "volume_profile_breakout": 1.4,
+      "ict_liquidity_pools": 1.3,
+      "ict_fair_value_gaps": 1.1,
+      "ict_optimal_trade_entry": 1.0,
+      "ict_premium_discount": 0.8,
+      "ict_killzone": 1.2,
+      "ict_momentum": 1.0,
+      "kow_signal_straddle": 0.9
+    },
+    "PANIC": {
+      "vix_max": 100,
+      "volume_spike": 1.32,
+      "volume_breakout": 1.08,
+      "volume_price_divergence": 0.9,
+      "upside_momentum": 0.78,
+      "downside_momentum": 0.78,
+      "breakout": 1.08,
+      "reversal": 0.96,
+      "hidden_accumulation": 0.96,
+      "volume_profile_breakout": 1.0,
+      "ict_liquidity_pools": 0.9,
+      "ict_fair_value_gaps": 0.8,
+      "ict_optimal_trade_entry": 0.7,
+      "ict_premium_discount": 0.6,
+      "ict_killzone": 0.8,
+      "ict_momentum": 0.7,
+      "kow_signal_straddle": 0.6
+    }
+  },
+  "validation": {
+    "confidence_threshold": 0.6,
+    "min_windows_required": 3,
+    "independent_validator": true,
+    "statistical_model_enabled": true
+  },
+  "forward_validation": {
+    "enabled": true,
+    "confidence_threshold": 0.9,
+    "windows_minutes": [1, 2, 5, 10, 30, 60],
+    "success_threshold_pct": 0.1,
+    "success_ratio_threshold": 0.5,
+    "poll_interval_seconds": 5,
+    "retry_delay_seconds": 15,
+    "max_retries": 3,
+    "state_ttl_seconds": 86400,
+    "redis_prefix": "forward_validation"
+  },
+  "recency_boost": {
+    "enabled": true,
+    "max_boost": 0.25,
+    "freshness_threshold_minutes": 30,
+    "freshness_factor": 0.1
+  },
+  "cooldown_seconds": 10,
+  "statistical_model": {
+    "enabled": true,
+    "model_building_enabled": true,
+    "validation_data_retention_days": 30,
+    "pattern_performance_tracking": true,
+    "confidence_calibration_enabled": true,
+    "independent_validator": true,
+    "model_update_frequency_hours": 24,
+    "min_samples_for_model": 100,
+    "performance_metrics_enabled": true,
+    "separate_from_main_system": true
+  }
+}

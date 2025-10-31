@@ -1,0 +1,494 @@
+{
+  "extraction_date": "2025-10-14",
+  "extraction_timestamp": "2025-10-14T08:44:05.141600",
+  "data": {
+    "db_0": {
+      "news:item:20251014:3": {
+        "source": "zerodha_pulse",
+        "title": "Mittal Sections IPO: Muted subscription and GMP suggest listing premium may be subdued",
+        "link": "https://economictimes.indiatimes.com/markets/stocks/news/mittal-sections-ipo-muted-subscription-and-gmp-suggest-listing-premium-may-be-subdued/articleshow/124541419.cms",
+        "date": "58 minutes ago",
+        "publisher": "Economic Times",
+        "collected_at": "2025-10-14T08:44:00.804064",
+        "sentiment": "neutral"
+      },
+      "index:NSE:NIFTY BANK": {
+        "symbol": "NSE:NIFTY BANK",
+        "instrument_token": 260105,
+        "tradingsymbol": "NIFTY BANK",
+        "timestamp": "2025-10-14T08:44:00",
+        "last_price": 56625,
+        "net_change": 0,
+        "ohlc": {
+          "open": 0,
+          "high": 0,
+          "low": 0,
+          "close": 56625
+        },
+        "percent_change": 0.0,
+        "timestamp_ns": 1760411640000000000,
+        "exchange": "NSE",
+        "segment": "INDEX",
+        "mode": "quote",
+        "news_sentiment_positive": 3,
+        "news_sentiment_negative": 0,
+        "news_sentiment_neutral": 7,
+        "news_total_count": 10,
+        "news_sentiment_score": 0.3,
+        "market_news_available": true,
+        "news_sources": [
+          "Finshots",
+          "Economic Times"
+        ],
+        "news_last_updated": "2025-10-14T08:44:00.868735"
+      },
+      "latest_gift_nifty_gap": {
+        "timestamp": "2025-10-14T08:44:00.940944",
+        "gift_price": 25306,
+        "nifty_price": 25227.35,
+        "gap_points": 78.65000000000146,
+        "gap_percent": 0.3117648108104952,
+        "signal": "GAP_UP - Watch for fade"
+      },
+      "market_data:indices:nse_nifty 50:volume": "5610132.5594",
+      "news:item:20251014:6": {
+        "source": "zerodha_pulse",
+        "title": "Gold hits record high on safe-haven rush; silver follows suit",
+        "link": "https://economictimes.indiatimes.com/markets/commodities/news/gold-hits-record-high-on-safe-haven-rush-silver-follows-suit/articleshow/124541322.cms",
+        "date": "1 hour ago",
+        "publisher": "Economic Times",
+        "collected_at": "2025-10-14T08:44:00.804159",
+        "sentiment": "neutral"
+      },
+      "index:NSEIX:GIFT NIFTY": {
+        "symbol": "NSEIX:GIFT NIFTY",
+        "instrument_token": 291849,
+        "tradingsymbol": "GIFT NIFTY",
+        "timestamp": "2025-10-14T08:43:47",
+        "last_price": 25306,
+        "net_change": 0,
+        "ohlc": {
+          "open": 25320,
+          "high": 25348,
+          "low": 25306,
+          "close": 25305
+        },
+        "percent_change": 0.0,
+        "timestamp_ns": 1760411627000000000,
+        "exchange": "NSEIX",
+        "segment": "INDEX",
+        "mode": "quote",
+        "news_sentiment_positive": 3,
+        "news_sentiment_negative": 0,
+        "news_sentiment_neutral": 7,
+        "news_total_count": 10,
+        "news_sentiment_score": 0.3,
+        "market_news_available": true,
+        "news_sources": [
+          "Finshots",
+          "Economic Times"
+        ],
+        "news_last_updated": "2025-10-14T08:44:00.901326"
+      },
+      "index:NSE:NIFTY 50": {
+        "symbol": "NSE:NIFTY 50",
+        "instrument_token": 256265,
+        "tradingsymbol": "NIFTY 50",
+        "timestamp": "2025-10-14T08:44:00",
+        "last_price": 25227.35,
+        "net_change": 0,
+        "ohlc": {
+          "open": 0,
+          "high": 0,
+          "low": 0,
+          "close": 25227.35
+        },
+        "percent_change": 0.0,
+        "timestamp_ns": 1760411640000000000,
+        "exchange": "NSE",
+        "segment": "INDEX",
+        "mode": "quote",
+        "news_sentiment_positive": 3,
+        "news_sentiment_negative": 0,
+        "news_sentiment_neutral": 7,
+        "news_total_count": 10,
+        "news_sentiment_score": 0.3,
+        "market_news_available": true,
+        "news_sources": [
+          "Finshots",
+          "Economic Times"
+        ],
+        "news_last_updated": "2025-10-14T08:44:00.839250"
+      },
+      "market_data:averages:nse_nifty 50:20d_avg": "5610132.5594",
+      "news:item:20251014:7": {
+        "source": "zerodha_pulse",
+        "title": "Wall Street ends sharply higher on Trump China comments; Broadcom surges",
+        "link": "https://economictimes.indiatimes.com/markets/stocks/news/wall-street-ends-sharply-higher-on-trump-china-comments-broadcom-surges/articleshow/124541290.cms",
+        "date": "1 hour ago",
+        "publisher": "Economic Times",
+        "collected_at": "2025-10-14T08:44:00.804191",
+        "sentiment": "positive"
+      },
+      "market_data:indices:nseix_gift nifty": {
+        "symbol": "NSEIX:GIFT NIFTY",
+        "instrument_token": 291849,
+        "tradingsymbol": "GIFT NIFTY",
+        "timestamp": "2025-10-14T08:43:47",
+        "last_price": 25306,
+        "net_change": 0,
+        "ohlc": {
+          "open": 25320,
+          "high": 25348,
+          "low": 25306,
+          "close": 25305
+        },
+        "percent_change": 0.0,
+        "timestamp_ns": 1760411627000000000,
+        "exchange": "NSEIX",
+        "segment": "INDEX",
+        "mode": "quote",
+        "news_sentiment_positive": 3,
+        "news_sentiment_negative": 0,
+        "news_sentiment_neutral": 7,
+        "news_total_count": 10,
+        "news_sentiment_score": 0.3,
+        "market_news_available": true,
+        "news_sources": [
+          "Finshots",
+          "Economic Times"
+        ],
+        "news_last_updated": "2025-10-14T08:44:00.901326"
+      },
+      "market_data:indices:nse_nifty 50": {
+        "symbol": "NSE:NIFTY 50",
+        "instrument_token": 256265,
+        "tradingsymbol": "NIFTY 50",
+        "timestamp": "2025-10-14T08:44:00",
+        "last_price": 25227.35,
+        "net_change": 0,
+        "ohlc": {
+          "open": 0,
+          "high": 0,
+          "low": 0,
+          "close": 25227.35
+        },
+        "percent_change": 0.0,
+        "timestamp_ns": 1760411640000000000,
+        "exchange": "NSE",
+        "segment": "INDEX",
+        "mode": "quote",
+        "news_sentiment_positive": 3,
+        "news_sentiment_negative": 0,
+        "news_sentiment_neutral": 7,
+        "news_total_count": 10,
+        "news_sentiment_score": 0.3,
+        "market_news_available": true,
+        "news_sources": [
+          "Finshots",
+          "Economic Times"
+        ],
+        "news_last_updated": "2025-10-14T08:44:00.839250"
+      },
+      "news:item:20251014:8": {
+        "source": "zerodha_pulse",
+        "title": "Inside the theories that won the 2025 Economics Nobel",
+        "link": "https://finshots.in/archive/inside-the-theories-that-won-the-2025-economics-nobel-joel-mokyr-philippe-aghion-peter-howitt/",
+        "date": "1 hour ago",
+        "publisher": "Finshots",
+        "collected_at": "2025-10-14T08:44:00.804222",
+        "sentiment": "neutral"
+      },
+      "market_data:indices:nse_india vix": {
+        "symbol": "NSE:INDIA VIX",
+        "instrument_token": 264969,
+        "tradingsymbol": "INDIA VIX",
+        "timestamp": "2025-10-14T08:44:00",
+        "last_price": 11.01,
+        "net_change": 0,
+        "ohlc": {
+          "open": 0,
+          "high": 0,
+          "low": 0,
+          "close": 11.01
+        },
+        "percent_change": 0.0,
+        "timestamp_ns": 1760411640000000000,
+        "exchange": "NSE",
+        "segment": "INDEX",
+        "mode": "quote",
+        "news_sentiment_positive": 3,
+        "news_sentiment_negative": 0,
+        "news_sentiment_neutral": 7,
+        "news_total_count": 10,
+        "news_sentiment_score": 0.3,
+        "market_news_available": true,
+        "news_sources": [
+          "Finshots",
+          "Economic Times"
+        ],
+        "news_last_updated": "2025-10-14T08:44:00.930596"
+      },
+      "market_data:averages:nse_nifty 50:30d_avg": "5610132.5594",
+      "news:item:20251014:4": {
+        "source": "zerodha_pulse",
+        "title": "Dollar rebounds as fears of renewed US-China trade feud abate",
+        "link": "https://economictimes.indiatimes.com/markets/forex/dollar-rebounds-as-fears-of-renewed-us-china-trade-feud-abate/articleshow/124541368.cms",
+        "date": "1 hour ago",
+        "publisher": "Economic Times",
+        "collected_at": "2025-10-14T08:44:00.804096",
+        "sentiment": "neutral"
+      },
+      "market_data.news:latest": {
+        "timestamp": "2025-10-14T08:44:00.940663",
+        "total_news": 10,
+        "sources": [
+          "Finshots",
+          "Economic Times"
+        ],
+        "sentiments": {
+          "positive": 3,
+          "negative": 0,
+          "neutral": 7
+        }
+      },
+      "index:NSE:INDIA VIX": {
+        "symbol": "NSE:INDIA VIX",
+        "instrument_token": 264969,
+        "tradingsymbol": "INDIA VIX",
+        "timestamp": "2025-10-14T08:44:00",
+        "last_price": 11.01,
+        "net_change": 0,
+        "ohlc": {
+          "open": 0,
+          "high": 0,
+          "low": 0,
+          "close": 11.01
+        },
+        "percent_change": 0.0,
+        "timestamp_ns": 1760411640000000000,
+        "exchange": "NSE",
+        "segment": "INDEX",
+        "mode": "quote",
+        "news_sentiment_positive": 3,
+        "news_sentiment_negative": 0,
+        "news_sentiment_neutral": 7,
+        "news_total_count": 10,
+        "news_sentiment_score": 0.3,
+        "market_news_available": true,
+        "news_sources": [
+          "Finshots",
+          "Economic Times"
+        ],
+        "news_last_updated": "2025-10-14T08:44:00.930596"
+      },
+      "news:item:20251014:0": {
+        "source": "zerodha_pulse",
+        "title": "Stocks to buy in 2025 for long term: Swiggy, CG Power among 5 stocks that could give 13-26% return",
+        "link": "https://economictimes.indiatimes.com/markets/stocks/news/stocks-to-buy-in-2025-for-long-term-swiggy-cg-power-among-5-stocks-that-could-give-13-26-return/slideshow/124541583.cms",
+        "date": "46 minutes ago",
+        "publisher": "Economic Times",
+        "collected_at": "2025-10-14T08:44:00.803949",
+        "sentiment": "neutral"
+      },
+      "news:item:20251014:1": {
+        "source": "zerodha_pulse",
+        "title": "Canara Robeco AMC to finalise IPO allotment today. Check status with direct links, GMP and other details",
+        "link": "https://economictimes.indiatimes.com/markets/ipos/fpos/canara-robeco-amc-to-finalise-ipo-allotment-today-check-status-with-direct-links-gmp-and-other-details/articleshow/124541504.cms",
+        "date": "49 minutes ago",
+        "publisher": "Economic Times",
+        "collected_at": "2025-10-14T08:44:00.803998",
+        "sentiment": "neutral"
+      },
+      "news:item:20251014:5": {
+        "source": "zerodha_pulse",
+        "title": "Oil edges up as US-China de-escalate trade tensions",
+        "link": "https://economictimes.indiatimes.com/markets/commodities/news/oil-edges-up-as-us-china-de-escalate-trade-tensions/articleshow/124541346.cms",
+        "date": "1 hour ago",
+        "publisher": "Economic Times",
+        "collected_at": "2025-10-14T08:44:00.804128",
+        "sentiment": "positive"
+      },
+      "news:item:20251014:2": {
+        "source": "zerodha_pulse",
+        "title": "Rubicon Research IPO allotment: How to check status, GMP and listing outlook",
+        "link": "https://economictimes.indiatimes.com/markets/ipos/fpos/rubicon-research-ipo-allotment-how-to-check-status-gmp-and-listing-outlook/articleshow/124541463.cms",
+        "date": "53 minutes ago",
+        "publisher": "Economic Times",
+        "collected_at": "2025-10-14T08:44:00.804032",
+        "sentiment": "neutral"
+      },
+      "market:context:latest": {
+        "timestamp": "2025-10-14T08:44:00.931580",
+        "indices": {
+          "NSE:NIFTY 50": {
+            "price": 25227.35,
+            "change_pct": 0.0,
+            "display_value": "25227.35 pts"
+          },
+          "NSE:NIFTY BANK": {
+            "price": 56625,
+            "change_pct": 0.0,
+            "display_value": "56625.00 pts"
+          },
+          "NSEIX:GIFT NIFTY": {
+            "price": 25306,
+            "change_pct": 0.0,
+            "display_value": "25306.00 pts"
+          },
+          "NSE:INDIA VIX": {
+            "price": 11.01,
+            "change_pct": 0.0,
+            "display_value": "11.01 pts"
+          }
+        },
+        "market_regime": "COMPLACENT",
+        "volatility_context": {
+          "vix_value": 11.01,
+          "vix_regime": "COMPLACENT",
+          "volatility_level": "LOW",
+          "sgx_nifty_gap_pct": 0.31,
+          "premarket_bias": "BULLISH"
+        },
+        "news": [
+          {
+            "source": "zerodha_pulse",
+            "title": "Stocks to buy in 2025 for long term: Swiggy, CG Power among 5 stocks that could give 13-26% return",
+            "link": "https://economictimes.indiatimes.com/markets/stocks/news/stocks-to-buy-in-2025-for-long-term-swiggy-cg-power-among-5-stocks-that-could-give-13-26-return/slideshow/124541583.cms",
+            "date": "46 minutes ago",
+            "publisher": "Economic Times",
+            "collected_at": "2025-10-14T08:44:00.803949",
+            "sentiment": "neutral"
+          },
+          {
+            "source": "zerodha_pulse",
+            "title": "Canara Robeco AMC to finalise IPO allotment today. Check status with direct links, GMP and other details",
+            "link": "https://economictimes.indiatimes.com/markets/ipos/fpos/canara-robeco-amc-to-finalise-ipo-allotment-today-check-status-with-direct-links-gmp-and-other-details/articleshow/124541504.cms",
+            "date": "49 minutes ago",
+            "publisher": "Economic Times",
+            "collected_at": "2025-10-14T08:44:00.803998",
+            "sentiment": "neutral"
+          },
+          {
+            "source": "zerodha_pulse",
+            "title": "Rubicon Research IPO allotment: How to check status, GMP and listing outlook",
+            "link": "https://economictimes.indiatimes.com/markets/ipos/fpos/rubicon-research-ipo-allotment-how-to-check-status-gmp-and-listing-outlook/articleshow/124541463.cms",
+            "date": "53 minutes ago",
+            "publisher": "Economic Times",
+            "collected_at": "2025-10-14T08:44:00.804032",
+            "sentiment": "neutral"
+          },
+          {
+            "source": "zerodha_pulse",
+            "title": "Mittal Sections IPO: Muted subscription and GMP suggest listing premium may be subdued",
+            "link": "https://economictimes.indiatimes.com/markets/stocks/news/mittal-sections-ipo-muted-subscription-and-gmp-suggest-listing-premium-may-be-subdued/articleshow/124541419.cms",
+            "date": "58 minutes ago",
+            "publisher": "Economic Times",
+            "collected_at": "2025-10-14T08:44:00.804064",
+            "sentiment": "neutral"
+          },
+          {
+            "source": "zerodha_pulse",
+            "title": "Dollar rebounds as fears of renewed US-China trade feud abate",
+            "link": "https://economictimes.indiatimes.com/markets/forex/dollar-rebounds-as-fears-of-renewed-us-china-trade-feud-abate/articleshow/124541368.cms",
+            "date": "1 hour ago",
+            "publisher": "Economic Times",
+            "collected_at": "2025-10-14T08:44:00.804096",
+            "sentiment": "neutral"
+          },
+          {
+            "source": "zerodha_pulse",
+            "title": "Oil edges up as US-China de-escalate trade tensions",
+            "link": "https://economictimes.indiatimes.com/markets/commodities/news/oil-edges-up-as-us-china-de-escalate-trade-tensions/articleshow/124541346.cms",
+            "date": "1 hour ago",
+            "publisher": "Economic Times",
+            "collected_at": "2025-10-14T08:44:00.804128",
+            "sentiment": "positive"
+          },
+          {
+            "source": "zerodha_pulse",
+            "title": "Gold hits record high on safe-haven rush; silver follows suit",
+            "link": "https://economictimes.indiatimes.com/markets/commodities/news/gold-hits-record-high-on-safe-haven-rush-silver-follows-suit/articleshow/124541322.cms",
+            "date": "1 hour ago",
+            "publisher": "Economic Times",
+            "collected_at": "2025-10-14T08:44:00.804159",
+            "sentiment": "neutral"
+          },
+          {
+            "source": "zerodha_pulse",
+            "title": "Wall Street ends sharply higher on Trump China comments; Broadcom surges",
+            "link": "https://economictimes.indiatimes.com/markets/stocks/news/wall-street-ends-sharply-higher-on-trump-china-comments-broadcom-surges/articleshow/124541290.cms",
+            "date": "1 hour ago",
+            "publisher": "Economic Times",
+            "collected_at": "2025-10-14T08:44:00.804191",
+            "sentiment": "positive"
+          },
+          {
+            "source": "zerodha_pulse",
+            "title": "Inside the theories that won the 2025 Economics Nobel",
+            "link": "https://finshots.in/archive/inside-the-theories-that-won-the-2025-economics-nobel-joel-mokyr-philippe-aghion-peter-howitt/",
+            "date": "1 hour ago",
+            "publisher": "Finshots",
+            "collected_at": "2025-10-14T08:44:00.804222",
+            "sentiment": "neutral"
+          },
+          {
+            "source": "zerodha_pulse",
+            "title": "Sensex Today | Stock Market LIVE Updates: GIFT Nifty signals a muted start; Asian shares trade mixed",
+            "link": "https://economictimes.indiatimes.com/markets/stocks/live-blog/bse-sensex-today-live-nifty-stock-market-updates-14-october-2025/liveblog/124541150.cms",
+            "date": "1 hour ago",
+            "publisher": "Economic Times",
+            "collected_at": "2025-10-14T08:44:00.804253",
+            "sentiment": "positive"
+          }
+        ]
+      },
+      "market_data:indices:nse_nifty bank": {
+        "symbol": "NSE:NIFTY BANK",
+        "instrument_token": 260105,
+        "tradingsymbol": "NIFTY BANK",
+        "timestamp": "2025-10-14T08:44:00",
+        "last_price": 56625,
+        "net_change": 0,
+        "ohlc": {
+          "open": 0,
+          "high": 0,
+          "low": 0,
+          "close": 56625
+        },
+        "percent_change": 0.0,
+        "timestamp_ns": 1760411640000000000,
+        "exchange": "NSE",
+        "segment": "INDEX",
+        "mode": "quote",
+        "news_sentiment_positive": 3,
+        "news_sentiment_negative": 0,
+        "news_sentiment_neutral": 7,
+        "news_total_count": 10,
+        "news_sentiment_score": 0.3,
+        "market_news_available": true,
+        "news_sources": [
+          "Finshots",
+          "Economic Times"
+        ],
+        "news_last_updated": "2025-10-14T08:44:00.868735"
+      },
+      "news:item:20251014:9": {
+        "source": "zerodha_pulse",
+        "title": "Sensex Today | Stock Market LIVE Updates: GIFT Nifty signals a muted start; Asian shares trade mixed",
+        "link": "https://economictimes.indiatimes.com/markets/stocks/live-blog/bse-sensex-today-live-nifty-stock-market-updates-14-october-2025/liveblog/124541150.cms",
+        "date": "1 hour ago",
+        "publisher": "Economic Times",
+        "collected_at": "2025-10-14T08:44:00.804253",
+        "sentiment": "positive"
+      }
+    },
+    "db_2": {},
+    "db_4": {},
+    "db_5": {},
+    "db_6": {},
+    "db_8": {},
+    "db_10": {},
+    "db_13": {}
+  }
+}

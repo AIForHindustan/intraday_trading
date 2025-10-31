@@ -1,0 +1,26 @@
+{
+  "date": "2025-10-14",
+  "extraction_count": 1,
+  "total_time_buckets": 464,
+  "symbols_with_buckets": 210,
+  "session_entries": 210,
+  "price_entries": 0,
+  "market_entries": 480,
+  "cumulative_entries": 0,
+  "alert_entries": 0,
+  "microstructure_entries": 0,
+  "pattern_entries": 0,
+  "performance_entries": 0,
+  "data_sources": [
+    "session_data_db0",
+    "price_data_db2",
+    "continuous_market_db4",
+    "cumulative_volume_db5",
+    "alert_system_db6",
+    "market_microstructure_db8",
+    "pattern_detection_db10",
+    "performance_metrics_db13"
+  ],
+  "first_extraction": "2025-10-14T09:12:12.788281",
+  "last_extraction": "2025-10-14T09:12:12.788281"
+}

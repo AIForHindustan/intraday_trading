@@ -46,6 +46,10 @@ parquet_test_output*/
 real_parquet_data/
 research_data/
 *.parquet
+*.parquet.*
+*.jsonl
+*.jsonl.gz
+*.jsonl.bz2
 
 # Temporary files
 *.tmp

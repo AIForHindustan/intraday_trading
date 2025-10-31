@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Professional Trading Dashboard</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://unpkg.com/date-fns@2.29.3/index.min.js"></script>
+    <script src="alerts/professional-chart.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0a0a;
+            color: #ffffff;
+            overflow-x: hidden;
+        }
+
+        .professional-trading-dashboard {
+            display: grid;
+            grid-template-rows: 80px 1fr 200px;
+            height: 100vh;
+            gap: 1px;
+            background: #1a1a1a;
+        }
+
+        /* Header */
+        .dashboard-header {
+            background: #1e1e1e;
+            border-bottom: 2px solid #00d4aa;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 30px;
+            box-shadow: 0 2px 10px rgba(0, 212, 170, 0.1);
+        }
+
+        .instrument-selector {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .instrument-selector select {
+            padding: 10px 15px;
+            background: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 6px;
+            color: #fff;
+            font-size: 14px;
+            min-width: 120px;
+        }
+
+        .market-data {
+            display: flex;
+            align-items: center;
+            gap: 30px;
+        }
+
+        .price-display {
+            text-align: right;
+        }
+
+        .price {
+            font-size: 32px;
+            font-weight: bold;
+            display: block;
+            margin-bottom: 5px;
+        }
+
+        .change {
+            font-size: 16px;
+            font-weight: bold;
+        }
+
+        .price-up {
+            color: #00d4aa;
+        }
+
+        .price-down {
+            color: #ff4444;
+        }
+
+        .market-info {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            text-align: right;
+        }
+
+        .session {
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+
+        .session-open {
+            background: #00d4aa;
+            color: #000;
+        }
+
+        .session-closed {
+            background: #ff4444;
+            color: #fff;
+        }
+
+        .session-pre {
+            background: #ffaa00;
+            color: #000;
+        }
+
+        .volume {
+            font-size: 14px;
+            color: #aaa;
+        }
+
+        /* Main Content */
+        .dashboard-main {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 1px;
+            background: #1a1a1a;
+        }
+
+        /* Chart Section */
+        .chart-section {
+            background: #0a0a0a;
+            position: relative;
+            overflow: hidden;
+        }
+
+        #tradingview-chart {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Data Panel */
+        .data-panel {
+            background: #1a1a1a;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .indicators-card, .greeks-card, .risk-card, .trading-card {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid #444;
+        }
+
+        .indicators-card h3, .greeks-card h3, .risk-card h3, .trading-card h3 {
+            color: #00d4aa;
+            margin-bottom: 15px;
+            font-size: 16px;
+            border-bottom: 1px solid #444;
+            padding-bottom: 10px;
+        }
+
+        .indicators-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .indicator-item {
+            background: #1a1a1a;
+            padding: 12px;
+            border-radius: 6px;
+            text-align: center;
+            border: 1px solid #333;
+        }
+
+        .indicator-name {
+            display: block;
+            font-size: 11px;
+            color: #aaa;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+
+        .indicator-value {
+            display: block;
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 3px;
+        }
+
+        .indicator-signal {
+            display: block;
+            font-size: 10px;
+            font-weight: bold;
+            text-transform: uppercase;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+
+        .signal-bullish {
+            background: #00d4aa;
+            color: #000;
+        }
+
+        .signal-bearish {
+            background: #ff4444;
+            color: #fff;
+        }
+
+        .signal-neutral {
+            background: #ffaa00;
+            color: #000;
+        }
+
+        .greeks-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .greek-item {
+            background: #1a1a1a;
+            padding: 12px;
+            border-radius: 6px;
+            text-align: center;
+            border: 1px solid #333;
+        }
+
+        .greek-item span:first-child {
+            display: block;
+            font-size: 11px;
+            color: #aaa;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+
+        .greek-item span:last-child {
+            display: block;
+            font-size: 16px;
+            font-weight: bold;
+            color: #fff;
+        }
+
+        .risk-fields {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .risk-field {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #333;
+        }
+
+        .risk-field:last-child {
+            border-bottom: none;
+        }
+
+        .risk-field label {
+            font-weight: bold;
+            color: #aaa;
+            font-size: 12px;
+        }
+
+        .risk-field span {
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        .stop-loss {
+            color: #ff4444;
+        }
+
+        .target {
+            color: #00d4aa;
+        }
+
+        .trade-actions {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .btn-buy, .btn-sell {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-buy {
+            background: #00d4aa;
+            color: #000;
+        }
+
+        .btn-buy:hover {
+            background: #00b894;
+            transform: translateY(-1px);
+        }
+
+        .btn-sell {
+            background: #ff4444;
+            color: #fff;
+        }
+
+        .btn-sell:hover {
+            background: #e63939;
+            transform: translateY(-1px);
+        }
+
+        .trade-settings {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .trade-settings input {
+            padding: 8px 12px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #fff;
+            font-size: 14px;
+        }
+
+        .trade-settings input:focus {
+            outline: none;
+            border-color: #00d4aa;
+        }
+
+        /* Alerts Panel */
+        .alerts-panel {
+            background: #1e1e1e;
+            border-top: 2px solid #00d4aa;
+            padding: 20px;
+            overflow-y: auto;
+        }
+
+        .alerts-panel h3 {
+            color: #00d4aa;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+
+        .alerts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+        }
+
+        .alert-card {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 15px;
+            border: 1px solid #444;
+            transition: all 0.2s;
+        }
+
+        .alert-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 212, 170, 0.1);
+        }
+
+        .alert-card.bullish {
+            border-left: 4px solid #00d4aa;
+        }
+
+        .alert-card.bearish {
+            border-left: 4px solid #ff4444;
+        }
+
+        .alert-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .symbol {
+            font-weight: bold;
+            font-size: 16px;
+        }
+
+        .confidence {
+            background: #00d4aa;
+            color: #000;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .alert-body {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .pattern {
+            font-size: 14px;
+            color: #aaa;
+        }
+
+        .price {
+            font-weight: bold;
+            font-size: 16px;
+        }
+
+        .direction {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .direction.BUY {
+            background: #00d4aa;
+            color: #000;
+        }
+
+        .direction.SELL {
+            background: #ff4444;
+            color: #fff;
+        }
+
+        .alert-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            color: #aaa;
+        }
+
+        .alert-footer button {
+            background: #00d4aa;
+            color: #000;
+            border: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        .alert-footer button:hover {
+            background: #00b894;
+        }
+
+        /* Responsive */
+        @media (max-width: 1200px) {
+            .dashboard-main {
+                grid-template-columns: 1fr 300px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .professional-trading-dashboard {
+                grid-template-rows: 120px 1fr 250px;
+            }
+            
+            .dashboard-main {
+                grid-template-columns: 1fr;
+                grid-template-rows: 1fr 300px;
+            }
+            
+            .data-panel {
+                order: 2;
+            }
+            
+            .chart-section {
+                order: 1;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="app" class="professional-trading-dashboard">
+        <!-- Header -->
+        <header class="dashboard-header">
+            <div class="instrument-selector">
+                <select v-model="selectedAssetClass" @change="loadInstruments">
+                    <option value="eq">Equity</option>
+                    <option value="eq_fut">Futures</option>
+                    <option value="index_fut">Index Futures</option>
+                    <option value="index_opt">Options</option>
+                </select>
+                
+                <select v-model="selectedInstrument" @change="loadInstrumentData">
+                    <option value="">Select Instrument</option>
+                    <option v-for="inst in instruments" :key="inst.symbol" :value="inst">
+                        {{ inst.symbol }} - {{ inst.name }}
+                    </option>
+                </select>
+            </div>
+            
+            <div class="market-data">
+                <div class="price-display">
+                    <span class="price" :class="priceChangeClass">
+                        {{ currentData.current_tick?.last_price || '--' }}
+                    </span>
+                    <span class="change" :class="priceChangeClass">
+                        {{ currentData.current_tick?.change || '--' }} 
+                        ({{ currentData.current_tick?.change_percent || '--' }}%)
+                    </span>
+                </div>
+                
+                <div class="market-info">
+                    <span class="session" :class="sessionClass">
+                        {{ currentData.market_session }}
+                    </span>
+                    <span class="volume">
+                        Vol: {{ formatVolume(currentData.current_tick?.volume) }}
+                    </span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="dashboard-main">
+            <!-- Left Panel - Chart -->
+            <section class="chart-section">
+                <div id="tradingview-chart" ref="chartContainer"></div>
+            </section>
+            
+            <!-- Right Panel - Trading & Data -->
+            <aside class="data-panel">
+                <!-- Technical Indicators -->
+                <div class="indicators-card">
+                    <h3>Technical Indicators</h3>
+                    <div class="indicators-grid">
+                        <div v-for="(indicator, name) in currentData.technical_indicators" 
+                             :key="name"
+                             class="indicator-item" :class="getIndicatorSignalClass(indicator)">
+                            <span class="indicator-name">{{ name.toUpperCase() }}</span>
+                            <span class="indicator-value">{{ indicator.value?.toFixed(2) }}</span>
+                            <span class="indicator-signal">{{ indicator.signal }}</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Options Greeks -->
+                <div class="greeks-card" v-if="currentData.options_greeks">
+                    <h3>Options Greeks</h3>
+                    <div class="greeks-grid">
+                        <div class="greek-item">
+                            <span>Delta</span>
+                            <span>{{ currentData.options_greeks.delta?.toFixed(4) }}</span>
+                        </div>
+                        <div class="greek-item">
+                            <span>Gamma</span>
+                            <span>{{ currentData.options_greeks.gamma?.toFixed(4) }}</span>
+                        </div>
+                        <div class="greek-item">
+                            <span>Theta</span>
+                            <span>{{ currentData.options_greeks.theta?.toFixed(4) }}</span>
+                        </div>
+                        <div class="greek-item">
+                            <span>Vega</span>
+                            <span>{{ currentData.options_greeks.vega?.toFixed(4) }}</span>
+                        </div>
+                        <div class="greek-item">
+                            <span>IV</span>
+                            <span>{{ (currentData.options_greeks.iv * 100)?.toFixed(2) }}%</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Risk Management -->
+                <div class="risk-card">
+                    <h3>Risk Management</h3>
+                    <div class="risk-fields">
+                        <div class="risk-field">
+                            <label>Position Size:</label>
+                            <span>{{ currentData.risk_metrics?.position_size || '0' }}</span>
+                        </div>
+                        <div class="risk-field">
+                            <label>Stop Loss:</label>
+                            <span class="stop-loss">{{ currentData.risk_metrics?.stop_loss || '--' }}</span>
+                        </div>
+                        <div class="risk-field">
+                            <label>Target:</label>
+                            <span class="target">{{ currentData.risk_metrics?.target || '--' }}</span>
+                        </div>
+                        <div class="risk-field">
+                            <label>R:R Ratio:</label>
+                            <span>{{ currentData.risk_metrics?.risk_reward_ratio?.toFixed(2) || '--' }}</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Trading Actions -->
+                <div class="trading-card">
+                    <h3>Quick Trade</h3>
+                    <div class="trade-actions">
+                        <button class="btn-buy" @click="executeTrade('BUY')">BUY</button>
+                        <button class="btn-sell" @click="executeTrade('SELL')">SELL</button>
+                    </div>
+                    
+                    <div class="trade-settings">
+                        <input type="number" v-model="tradeQuantity" placeholder="Quantity" min="1">
+                        <input type="number" v-model="stopLoss" :placeholder="currentData.risk_metrics?.stop_loss || 'Stop Loss'">
+                        <input type="number" v-model="targetPrice" :placeholder="currentData.risk_metrics?.target || 'Target'">
+                    </div>
+                </div>
+            </aside>
+        </main>
+        
+        <!-- Bottom Panel - Alerts -->
+        <footer class="alerts-panel">
+            <h3>Live Alerts</h3>
+            <div class="alerts-grid">
+                <div v-for="alert in filteredAlerts" :key="alert.id" class="alert-card" :class="getAlertClass(alert)">
+                    <div class="alert-header">
+                        <span class="symbol">{{ alert.symbol }}</span>
+                        <span class="confidence">{{ (alert.confidence * 100).toFixed(1) }}%</span>
+                    </div>
+                    <div class="alert-body">
+                        <span class="pattern">{{ alert.pattern }}</span>
+                        <span class="price">{{ formatPrice(alert.last_price) }}</span>
+                        <span class="direction" :class="alert.direction">{{ alert.direction }}</span>
+                    </div>
+                    <div class="alert-footer">
+                        <span>SL: {{ alert.stop_loss || '--' }} | TGT: {{ alert.target || '--' }}</span>
+                        <button @click="executeTradeFromAlert(alert)">Trade</button>
+                    </div>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script>
+        const { createApp } = Vue;
+
+        createApp({
+            data() {
+                return {
+                    // Market data
+                    selectedAssetClass: 'eq',
+                    selectedInstrument: null,
+                    instruments: [],
+                    currentData: {
+                        current_tick: null,
+                        market_session: 'CLOSED',
+                        technical_indicators: {},
+                        options_greeks: null,
+                        risk_metrics: null
+                    },
+                    
+                    // Trading
+                    tradeQuantity: 1,
+                    stopLoss: null,
+                    targetPrice: null,
+                    
+                    // Chart
+                    chart: null,
+                    
+                    // Alerts
+                    alerts: [],
+                    filteredAlerts: []
+                }
+            },
+            
+            computed: {
+                priceChangeClass() {
+                    if (!this.currentData.current_tick) return '';
+                    return this.currentData.current_tick.change > 0 ? 'price-up' : 'price-down';
+                },
+                
+                sessionClass() {
+                    return {
+                        'session-open': this.currentData.market_session === 'OPEN',
+                        'session-closed': this.currentData.market_session === 'CLOSED',
+                        'session-pre': this.currentData.market_session === 'PRE-MARKET'
+                    };
+                }
+            },
+            
+            async mounted() {
+                await this.loadInstruments();
+                this.connectEventStream();
+                this.startMarketTimer();
+            },
+            
+            methods: {
+                async loadInstruments() {
+                    try {
+                        const response = await fetch(`/api/instruments/${this.selectedAssetClass}`);
+                        this.instruments = await response.json();
+                    } catch (error) {
+                        console.error('Failed to load instruments:', error);
+                    }
+                },
+                
+                async loadInstrumentData() {
+                    if (!this.selectedInstrument) return;
+                    
+                    // Initialize chart
+                    this.initializeChart();
+                    
+                    // Load technical indicators
+                    await this.loadTechnicalIndicators();
+                    
+                    // Load options Greeks if applicable
+                    if (this.isOptionsInstrument()) {
+                        await this.loadOptionsGreeks();
+                    }
+                    
+                    // Load risk metrics
+                    await this.loadRiskMetrics();
+                },
+                
+                initializeChart() {
+                    if (this.chart) {
+                        this.chart.destroy();
+                    }
+                    
+                    this.chart = new ProfessionalTradingChart('tradingview-chart', this.selectedInstrument?.symbol);
+                },
+                
+                async loadTechnicalIndicators() {
+                    // Simulate technical indicators calculation
+                    this.currentData.technical_indicators = {
+                        rsi: { value: 65.4, signal: 'NEUTRAL' },
+                        ema20: { value: 2450.2, signal: 'BULLISH' },
+                        ema50: { value: 2435.8, signal: 'BULLISH' },
+                        vwap: { value: 2445.6, signal: 'BULLISH' },
+                        macd: { value: 2.4, signal: 'BULLISH' },
+                        bollinger_upper: { value: 2475.3, signal: 'NEUTRAL' },
+                        bollinger_lower: { value: 2415.1, signal: 'NEUTRAL' }
+                    };
+                },
+                
+                async loadOptionsGreeks() {
+                    // Simulate options Greeks calculation
+                    this.currentData.options_greeks = {
+                        delta: 0.65,
+                        gamma: 0.02,
+                        theta: -0.15,
+                        vega: 0.25,
+                        iv: 0.185
+                    };
+                },
+                
+                async loadRiskMetrics() {
+                    // Simulate risk metrics calculation
+                    this.currentData.risk_metrics = {
+                        position_size: 100,
+                        stop_loss: (this.currentData.current_tick?.last_price * 0.98)?.toFixed(2),
+                        target: (this.currentData.current_tick?.last_price * 1.02)?.toFixed(2),
+                        risk_reward_ratio: 2.0
+                    };
+                },
+                
+                isOptionsInstrument() {
+                    return this.selectedInstrument?.symbol?.includes('CE') || 
+                           this.selectedInstrument?.symbol?.includes('PE');
+                },
+                
+                connectEventStream() {
+                    this.eventSource = new EventSource('/alerts/stream');
+                    this.eventSource.onmessage = (event) => {
+                        const alert = JSON.parse(event.data);
+                        this.handleAlert(alert);
+                    };
+                },
+                
+                handleAlert(alert) {
+                    // Add to alerts list
+                    this.alerts.unshift({
+                        ...alert,
+                        id: Date.now() + Math.random()
+                    });
+                    
+                    // Keep only last 50 alerts
+                    if (this.alerts.length > 50) {
+                        this.alerts = this.alerts.slice(0, 50);
+                    }
+                    
+                    // Update current tick if it's the selected instrument
+                    if (this.selectedInstrument && alert.symbol === this.selectedInstrument.symbol) {
+                        this.currentData.current_tick = {
+                            last_price: alert.last_price,
+                            change: (Math.random() - 0.5) * 10,
+                            change_percent: (Math.random() - 0.5) * 2,
+                            volume: alert.volume_ratio * 1000000
+                        };
+                    }
+                    
+                    // Update filtered alerts
+                    this.updateFilteredAlerts();
+                },
+                
+                updateFilteredAlerts() {
+                    // Filter alerts based on selected instrument or show all
+                    if (this.selectedInstrument) {
+                        this.filteredAlerts = this.alerts.filter(alert => 
+                            alert.symbol === this.selectedInstrument.symbol
+                        );
+                    } else {
+                        this.filteredAlerts = this.alerts.slice(0, 10);
+                    }
+                },
+                
+                executeTrade(direction) {
+                    if (!this.selectedInstrument) return;
+                    
+                    const trade = {
+                        symbol: this.selectedInstrument.symbol,
+                        direction: direction,
+                        quantity: this.tradeQuantity,
+                        price: this.currentData.current_tick?.last_price,
+                        stop_loss: this.stopLoss,
+                        target: this.targetPrice
+                    };
+                    
+                    console.log('Executing trade:', trade);
+                    
+                    // Here you would send the trade to your trading API
+                    this.showTradeConfirmation(trade);
+                },
+                
+                executeTradeFromAlert(alert) {
+                    this.selectedInstrument = { symbol: alert.symbol };
+                    this.tradeQuantity = 1;
+                    this.stopLoss = alert.stop_loss;
+                    this.targetPrice = alert.target;
+                    this.executeTrade(alert.direction);
+                },
+                
+                showTradeConfirmation(trade) {
+                    alert(`Trade Executed:\n${trade.direction} ${trade.quantity} ${trade.symbol} @ ${trade.price}`);
+                },
+                
+                startMarketTimer() {
+                    setInterval(() => {
+                        const now = new Date();
+                        const hour = now.getHours();
+                        const minute = now.getMinutes();
+                        
+                        if (hour >= 9 && hour < 15) {
+                            this.currentData.market_session = 'OPEN';
+                        } else if (hour >= 15) {
+                            this.currentData.market_session = 'CLOSED';
+                        } else {
+                            this.currentData.market_session = 'PRE-MARKET';
+                        }
+                    }, 1000);
+                },
+                
+                // Utility methods
+                formatPrice(price) {
+                    if (!price) return '0.00';
+                    return parseFloat(price).toFixed(2);
+                },
+                
+                formatVolume(volume) {
+                    if (!volume) return '0';
+                    if (volume >= 1000000) {
+                        return (volume / 1000000).toFixed(1) + 'M';
+                    } else if (volume >= 1000) {
+                        return (volume / 1000).toFixed(1) + 'K';
+                    }
+                    return volume.toString();
+                },
+                
+                getIndicatorSignalClass(indicator) {
+                    return indicator.signal === 'BULLISH' ? 'signal-bullish' : 
+                           indicator.signal === 'BEARISH' ? 'signal-bearish' : 'signal-neutral';
+                },
+                
+                getAlertClass(alert) {
+                    return alert.direction === 'BUY' ? 'bullish' : 'bearish';
+                }
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>

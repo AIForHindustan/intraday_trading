@@ -1,0 +1,38 @@
+{
+  "bot_token": "7586453352:AAGuAnng91UTtG1081FwSzYOhO3rwIrvvCA",
+  "chat_ids": [
+    "@NSEAlgoTrading"
+  ],
+  "single_source": true,
+  "channel_name": "NSE Algo Trading",
+  "description": "Single source of truth for algorithmic trading alerts",
+  "signal_bot": {
+    "bot_token": "8028133937:AAE0uW_t8Re4_4qtVZNsfAqKOVBSBT5iouw",
+    "bot_username": "kow_signal_bot",
+    "chat_ids": [
+      "@kow_signal_bot"
+    ],
+    "description": "High-priority trading signals and validation reports",
+    "alert_types": [
+      "volume_spike",
+      "breakout_confirmation",
+      "ict_setups",
+      "mm_exploitation",
+      "critical_reversals",
+      "alert_validation_report",
+      "performance_report"
+    ],
+    "max_alerts_per_day": 15,
+    "priority": "high",
+    "symbols": [
+      "NIFTY",
+      "BANKNIFTY",
+      "KOW_SIGNAL_STRADDLE"
+    ],
+    "report_types": [
+      "alert_validation",
+      "performance_summary",
+      "system_status"
+    ]
+  }
+}

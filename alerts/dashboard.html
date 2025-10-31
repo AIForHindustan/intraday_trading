@@ -1,0 +1,630 @@
+<!-- templates/dashboard.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ultra Low-Latency Trading Dashboard</title>
+    <style>
+        :root {
+            --color-high: #10b981;
+            --color-medium: #f59e0b;
+            --color-low: #ef4444;
+        }
+        
+        .alert {
+            transition: all 0.1s ease;
+            border-left: 4px solid;
+        }
+        
+        .alert-high { border-color: var(--color-high); }
+        .alert-medium { border-color: var(--color-medium); }
+        .alert-low { border-color: var(--color-low); }
+        
+        .flash-new {
+            animation: highlight 2s ease;
+        }
+        
+        @keyframes highlight {
+            0% { background-color: yellow; }
+            100% { background-color: transparent; }
+        }
+        
+        .indicator-item {
+            background: #1a1a1a;
+            padding: 12px;
+            border-radius: 6px;
+            text-align: center;
+            border: 1px solid #333;
+        }
+        
+        .indicator-name {
+            display: block;
+            font-size: 11px;
+            color: #aaa;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        
+        .indicator-value {
+            display: block;
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 3px;
+        }
+        
+        .indicator-signal {
+            display: block;
+            font-size: 10px;
+            font-weight: bold;
+            text-transform: uppercase;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        
+        .signal-bullish {
+            background: #00d4aa;
+            color: #000;
+        }
+        
+        .signal-bearish {
+            background: #ff4444;
+            color: #fff;
+        }
+        
+        .signal-neutral {
+            background: #ffaa00;
+            color: #000;
+        }
+    </style>
+</head>
+<body>
+    <h1>⚡ Ultra Low-Latency Alerts</h1>
+    <section id="architecture" style="margin: 8px 0 16px 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">
+        <div style="font-weight: 700; margin-bottom: 6px;">PROFESSIONAL TRADING DASHBOARD ARCHITECTURE</div>
+        <div>WebSocket → Redis Streams → FastAPI → Modern Frontend (Vue.js/React) + Charting Library</div>
+        <div style="padding-left: 22ch;">↓</div>
+        <div style="padding-left: 8ch;">Real-time Charts + Pattern Overlays</div>
+    </section>
+    
+    <!-- Performance Metrics -->
+    <div id="performance">
+        <span id="latency">Latency: < 10ms</span>
+        <span id="alerts-count">Alerts: 0</span>
+        <span id="last-update">Last: -</span>
+    </div>
+    
+    <!-- Filters -->
+    <div class="filters">
+        <input type="text" id="symbolFilter" placeholder="Symbol (NIFTY, BANKNIFTY)">
+        <select id="patternFilter">
+            <option value="">All Patterns</option>
+            <option value="kow_signal_straddle">KOW Straddle</option>
+            <option value="reversal">Reversal</option>
+        </select>
+        <button onclick="applyFilters()">Apply Filters</button>
+    </div>
+
+    <!-- Professional Instrument Selector -->
+    <div class="instrument-panel" style="margin: 12px 0; padding: 12px; background: #f8fafc; border-radius: 8px;">
+        <div class="selectors" style="display:flex; gap:10px; align-items:center; margin-bottom: 8px;">
+            <label style="font-weight: bold;">Asset Class:</label>
+            <select id="assetClassSelect" onchange="loadInstruments()">
+                <option value="index_fut">Index Futures</option>
+                <option value="index_opt">Index Options</option>
+                <option value="eq">Equity Cash</option>
+                <option value="eq_fut">Equity Futures</option>
+            </select>
+            
+            <label style="font-weight: bold;">Instrument:</label>
+            <select id="instrumentSelect" onchange="onInstrumentChange()">
+                <option value="">Select Instrument</option>
+            </select>
+            
+            <select id="expirySelect" style="display:none;" onchange="onExpiryChange()">
+                <option value="">Select Expiry</option>
+            </select>
+        </div>
+        
+        <div class="pattern-selector" style="display:flex; gap:10px; align-items:center;">
+            <label style="font-weight: bold;">Pattern Filter:</label>
+            <select id="patternTypeSelect" onchange="onPatternChange()">
+                <option value="">All Patterns</option>
+                <option value="volume_spike">Volume Spike</option>
+                <option value="kow_signal_straddle">KOW Straddle</option>
+                <option value="reversal">Reversal</option>
+                <option value="breakout">Breakout</option>
+            </select>
+        </div>
+    </div>
+    
+    <!-- Alerts Table -->
+    <div id="alerts-container">
+        <table id="alerts-table">
+            <thead>
+                <tr>
+                    <th>Symbol</th>
+                    <th>Pattern</th>
+                    <th>Confidence</th>
+                    <th>Price</th>
+                    <th>Latency</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="alerts-body">
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Advanced Charting Component -->
+    <div class="chart-container" style="margin: 16px 0; padding: 12px; background: #1e293b; border-radius: 8px;">
+        <div class="chart-controls" style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
+            <span style="color: #d1d5db; font-weight: bold; margin-right: 8px;">Timeframe:</span>
+            <button onclick="setTimeframe('1m')" style="padding: 4px 8px; background: #374151; color: #d1d5db; border: 1px solid #4b5563; border-radius: 4px; cursor: pointer;">1m</button>
+            <button onclick="setTimeframe('5m')" style="padding: 4px 8px; background: #374151; color: #d1d5db; border: 1px solid #4b5563; border-radius: 4px; cursor: pointer;">5m</button>
+            <button onclick="setTimeframe('15m')" style="padding: 4px 8px; background: #374151; color: #d1d5db; border: 1px solid #4b5563; border-radius: 4px; cursor: pointer;">15m</button>
+            <button onclick="setTimeframe('1h')" style="padding: 4px 8px; background: #374151; color: #d1d5db; border: 1px solid #4b5563; border-radius: 4px; cursor: pointer;">1h</button>
+
+            <div class="pattern-toggles" style="display:flex; gap: 12px; margin-left: 16px;">
+                <label style="color: #d1d5db;"><input type="checkbox" id="showVolumeSpikes" style="margin-right: 4px;"> Volume Spikes</label>
+                <label style="color: #d1d5db;"><input type="checkbox" id="showKOWSignals" style="margin-right: 4px;"> KOW Signals</label>
+                <label style="color: #d1d5db;"><input type="checkbox" id="showReversals" style="margin-right: 4px;"> Reversals</label>
+                <label style="color: #d1d5db;"><input type="checkbox" id="showICTLevels" style="margin-right: 4px;"> ICT Levels</label>
+            </div>
+
+            <!-- Latest News -->
+            <div class="news-section" style="margin: 16px 0; padding: 12px; background: #f8fafc; border-radius: 8px;">
+                <h3 style="color: #111827; margin-bottom: 10px; font-size: 16px;">Latest Market News</h3>
+                <ul id="news-list" style="list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px;"></ul>
+            </div>
+        </div>
+
+        <div id="trading-chart" style="height: 420px; width: 100%; border: 1px solid #4b5563; border-radius: 6px; background: #0f172a;"></div>
+    </div>
+
+    <!-- Technical Indicators Section -->
+    <div class="indicators-section" style="margin: 16px 0; padding: 12px; background: #1e293b; border-radius: 8px;">
+        <h3 style="color: #00d4aa; margin-bottom: 15px; font-size: 16px;">Technical Indicators</h3>
+        <div class="indicators-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;">
+            <!-- Indicators will be populated by JavaScript -->
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+        class UltraLowLatencyDashboard {
+            constructor() {
+                this.eventSource = null;
+                this.alerts = new Map(); // Use Map for O(1) lookups
+                this.filters = {
+                    symbol: '',
+                    pattern: ''
+                };
+                this.performance = {
+                    startTime: 0,
+                    alertCount: 0
+                };
+                
+                this.init();
+            }
+            
+            init() {
+                this.currentIndicators = [];
+                this.connectEventStream();
+                this.setupPerformanceMonitoring();
+                this.setupFilters();
+                this.initializeChart();
+                loadInstruments();
+                
+                // Show initial indicators
+                this.showInitialIndicators();
+
+                        // Load news feed
+                        this.loadNews();
+            }
+            
+            showInitialIndicators() {
+                this.currentIndicators = [
+                    { name: 'RSI', value: '50.0', signal: 'NEUTRAL' },
+                    { name: 'EMA 20', value: '0.00', signal: 'NEUTRAL' },
+                    { name: 'EMA 50', value: '0.00', signal: 'NEUTRAL' },
+                    { name: 'VWAP', value: '0.00', signal: 'NEUTRAL' },
+                    { name: 'MACD', value: '0.00', signal: 'NEUTRAL' },
+                    { name: 'BB Upper', value: '0.00', signal: 'NEUTRAL' }
+                ];
+                this.updateIndicatorsDisplay();
+            }
+
+                    async loadNews() {
+                        try {
+                            const t0 = performance.now();
+                            const res = await fetch('/api/news?limit=20');
+                            const items = await res.json();
+                            const t1 = performance.now();
+                            console.log(`📰 News loaded in ${(t1 - t0).toFixed(2)}ms (${items.length} items)`);
+                            const list = document.getElementById('news-list');
+                            if (!list) return;
+                            list.innerHTML = (items || []).map(n => {
+                                const title = n.title || n.headline || 'News Item';
+                                const url = n.url || n.link || '#';
+                                const ts = n.timestamp || n.time || Date.now();
+                                const when = new Date(ts).toLocaleTimeString();
+                                return `<li style="background:#ffffff;border:1px solid #e5e7eb;border-radius:6px;padding:10px;">
+                                    <a href="${url}" target="_blank" style="color:#111827;text-decoration:none;font-weight:600;">${title}</a>
+                                    <div style="font-size:12px;color:#6b7280;margin-top:4px;">${when}</div>
+                                </li>`;
+                            }).join('');
+                        } catch (e) {
+                            console.warn('News load failed', e);
+                        }
+                    }
+            
+            initializeChart() {
+                try {
+                    const container = document.getElementById('trading-chart');
+                    if (container && typeof LightweightCharts !== 'undefined') {
+                        this._chart = LightweightCharts.createChart(container, {
+                            width: container.clientWidth,
+                            height: container.clientHeight,
+                            layout: { 
+                                backgroundColor: '#0f172a', 
+                                textColor: '#d1d5db' 
+                            },
+                            grid: { 
+                                vertLines: { color: '#334155' }, 
+                                horzLines: { color: '#334155' } 
+                            },
+                            timeScale: {
+                                timeVisible: true,
+                                secondsVisible: false,
+                            },
+                            rightPriceScale: {
+                                borderColor: '#4b5563',
+                            },
+                        });
+                        this._series = this._chart.addCandlestickSeries({
+                            upColor: '#10b981',
+                            downColor: '#ef4444',
+                            borderDownColor: '#ef4444',
+                            borderUpColor: '#10b981',
+                            wickDownColor: '#ef4444',
+                            wickUpColor: '#10b981',
+                        });
+                        this._patternMarkers = [];
+                        console.log('Chart initialized successfully');
+                    } else {
+                        console.log('Chart container or LightweightCharts not available');
+                    }
+                } catch (error) {
+                    console.error('Chart initialization error:', error);
+                }
+            }
+            
+            connectEventStream() {
+                // Close existing connection
+                if (this.eventSource) {
+                    this.eventSource.close();
+                }
+                
+                // Build query string with filters
+                const params = new URLSearchParams();
+                if (this.filters.symbol) params.set('symbol', this.filters.symbol);
+                if (this.filters.pattern) params.set('pattern', this.filters.pattern);
+                
+                this.eventSource = new EventSource(`/alerts/stream?${params}`);
+                
+                this.eventSource.onmessage = (event) => {
+                    const alert = JSON.parse(event.data);
+                    this.handleAlert(alert);
+                    this.updateIndicators(alert);
+                    this.updateChart(alert);
+                };
+                
+                this.eventSource.onerror = (error) => {
+                    console.error('SSE Error:', error);
+                    // Auto-reconnect after 1 second
+                    setTimeout(() => this.connectEventStream(), 1000);
+                };
+            }
+            
+            updateIndicators(alert) {
+                // Update technical indicators based on alert data
+                if (alert.technical_indicators) {
+                    this.currentIndicators = Object.entries(alert.technical_indicators).map(([name, data]) => ({
+                        name: name.toUpperCase(),
+                        value: data.value?.toFixed(2) || '0.00',
+                        signal: data.signal || 'NEUTRAL'
+                    }));
+                } else {
+                    // Generate synthetic indicators based on price and pattern
+                    const price = alert.last_price || 0;
+                    const change = alert.change || 0;
+                    
+                    this.currentIndicators = [
+                        {
+                            name: 'RSI',
+                            value: (50 + (change * 5)).toFixed(1),
+                            signal: change > 0 ? 'BULLISH' : change < 0 ? 'BEARISH' : 'NEUTRAL'
+                        },
+                        {
+                            name: 'EMA 20',
+                            value: (price * 0.998).toFixed(2),
+                            signal: 'BULLISH'
+                        },
+                        {
+                            name: 'EMA 50',
+                            value: (price * 0.995).toFixed(2),
+                            signal: 'BULLISH'
+                        },
+                        {
+                            name: 'VWAP',
+                            value: (price * 1.001).toFixed(2),
+                            signal: 'BULLISH'
+                        },
+                        {
+                            name: 'MACD',
+                            value: (change * 0.1).toFixed(2),
+                            signal: change > 0 ? 'BULLISH' : 'BEARISH'
+                        },
+                        {
+                            name: 'BB Upper',
+                            value: (price * 1.02).toFixed(2),
+                            signal: 'NEUTRAL'
+                        }
+                    ];
+                }
+                
+                // Update indicators display
+                this.updateIndicatorsDisplay();
+            }
+            
+            updateIndicatorsDisplay() {
+                // Update the indicators section in the UI
+                const indicatorsContainer = document.querySelector('.indicators-grid');
+                if (indicatorsContainer) {
+                    indicatorsContainer.innerHTML = this.currentIndicators.map(indicator => `
+                        <div class="indicator-item">
+                            <span class="indicator-name">${indicator.name}</span>
+                            <span class="indicator-value">${indicator.value}</span>
+                            <span class="indicator-signal ${indicator.signal.toLowerCase()}">${indicator.signal}</span>
+                        </div>
+                    `).join('');
+                }
+            }
+            
+            updateChart(alert) {
+                // Push to chart with minimal synthetic OHLC and add marker
+                try {
+                    if (this._series && alert.last_price) {
+                        const t = Math.floor(alert.timestamp / 1000);
+                        const p = Number(alert.last_price);
+                        // Minimal synthetic bar
+                        this._series.update({ time: t, open: p, high: p, low: p, close: p });
+                        // Marker for pattern
+                        const marker = {
+                            time: t,
+                            position: 'aboveBar',
+                            color: alert.pattern === 'reversal' ? '#ef4444' : '#10b981',
+                            shape: alert.pattern === 'reversal' ? 'circle' : 'square',
+                            text: `${alert.pattern} ${(alert.confidence*100).toFixed(0)}%`,
+                        };
+                        this._patternMarkers.push(marker);
+                        this._series.setMarkers(this._patternMarkers);
+                    }
+                } catch (error) {
+                    console.error('Chart update error:', error);
+                }
+            }
+            
+            handleAlert(alert) {
+                const receivedTime = Date.now();
+                const latency = receivedTime - alert.timestamp;
+                
+                // Update performance metrics
+                this.updatePerformanceMetrics(latency);
+                
+                // Apply client-side filtering (additional safety)
+                if (!this.matchesFilters(alert)) return;
+                
+                // Add to alerts map (deduplication)
+                const alertKey = `${alert.symbol}-${alert.pattern}-${alert.timestamp}`;
+                this.alerts.set(alertKey, {
+                    ...alert,
+                    receivedTime,
+                    latency
+                });
+                
+                // Update UI
+                this.renderAlert(alert, latency);
+                
+                // Keep only last 100 alerts
+                if (this.alerts.size > 100) {
+                    const firstKey = this.alerts.keys().next().value;
+                    this.alerts.delete(firstKey);
+                }
+            }
+            
+            matchesFilters(alert) {
+                if (this.filters.symbol && !alert.symbol.includes(this.filters.symbol)) {
+                    return false;
+                }
+                if (this.filters.pattern && alert.pattern !== this.filters.pattern) {
+                    return false;
+                }
+                return true;
+            }
+            
+            updatePerformanceMetrics(latency) {
+                this.performance.alertCount++;
+                
+                document.getElementById('latency').textContent = 
+                    `Latency: ${latency}ms`;
+                document.getElementById('alerts-count').textContent = 
+                    `Alerts: ${this.performance.alertCount}`;
+                document.getElementById('last-update').textContent = 
+                    `Last: ${new Date().toLocaleTimeString()}`;
+            }
+            
+            renderAlert(alert, latency) {
+                const tbody = document.getElementById('alerts-body');
+                const row = document.createElement('tr');
+                
+                row.className = `alert alert-${this.getConfidenceClass(alert.confidence)} flash-new`;
+                
+                row.innerHTML = `
+                    <td>${alert.symbol}</td>
+                    <td>${alert.pattern}</td>
+                    <td>${(alert.confidence * 100).toFixed(1)}%</td>
+                    <td>${alert.last_price}</td>
+                    <td>${latency}ms</td>
+                    <td>
+                        <button onclick="dashboard.executeTrade('${alert.symbol}', '${alert.direction}')">
+                            ⚡ Trade
+                        </button>
+                    </td>
+                `;
+                
+                // Insert at top for latest first
+                tbody.insertBefore(row, tbody.firstChild);
+                
+                // Remove highlight after animation
+                setTimeout(() => {
+                    row.classList.remove('flash-new');
+                }, 2000);
+            }
+            
+            getConfidenceClass(confidence) {
+                if (confidence >= 0.9) return 'high';
+                if (confidence >= 0.8) return 'medium';
+                return 'low';
+            }
+            
+            applyFilters() {
+                this.filters = {
+                    symbol: document.getElementById('symbolFilter').value,
+                    pattern: document.getElementById('patternFilter').value
+                };
+                
+                // Clear current alerts
+                this.alerts.clear();
+                document.getElementById('alerts-body').innerHTML = '';
+                
+                // Reconnect with new filters
+                this.connectEventStream();
+            }
+            
+            async executeTrade(symbol, direction) {
+                const startTime = performance.now();
+                
+                try {
+                    const response = await fetch('/trade', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({symbol, direction})
+                    });
+                    
+                    const result = await response.json();
+                    const tradeLatency = performance.now() - startTime;
+                    
+                    console.log(`Trade executed in ${tradeLatency.toFixed(2)}ms:`, result);
+                    
+                } catch (error) {
+                    console.error('Trade execution error:', error);
+                }
+            }
+        }
+        // Backend wiring for selectors
+        async function loadInstruments() {
+            const asset = document.getElementById('assetClassSelect').value;
+            const instrumentSelect = document.getElementById('instrumentSelect');
+            const expirySelect = document.getElementById('expirySelect');
+            
+            console.log('Loading instruments for asset class:', asset);
+            
+            expirySelect.style.display = (asset === 'index_opt' || asset === 'eq_opt') ? 'inline-block' : 'none';
+            instrumentSelect.innerHTML = '<option value="">Loading…</option>';
+            try {
+                const res = await fetch(`/api/instruments/${asset}`);
+                const list = await res.json();
+                console.log('Received instruments:', list);
+                
+                instrumentSelect.innerHTML = '';
+                const opts = [];
+                list.forEach(item => {
+                    const opt = document.createElement('option');
+                    opt.value = item.symbol || item;
+                    opt.textContent = item.name || item.symbol || String(item);
+                    if (item.expiry) { opt.setAttribute('data-expiry', item.expiry); }
+                    opts.push(opt);
+                });
+                opts.forEach(o => instrumentSelect.appendChild(o));
+                if (expirySelect.style.display !== 'none') {
+                    populateExpiries(list);
+                }
+                console.log('Instruments loaded successfully');
+            } catch (e) {
+                console.error('Error loading instruments:', e);
+                instrumentSelect.innerHTML = '<option value="">Error loading</option>';
+            }
+        }
+
+        function populateExpiries(list) {
+            const expirySelect = document.getElementById('expirySelect');
+            const expiries = new Set();
+            list.forEach(item => {
+                if (item.expiry) expiries.add(item.expiry);
+                else if (item.symbol) {
+                    const m = String(item.symbol).match(/(\d{2}[A-Z]{3}\d{2})/);
+                    if (m) expiries.add(m[1]);
+                }
+            });
+            expirySelect.innerHTML = '';
+            Array.from(expiries).forEach(exp => {
+                const o = document.createElement('option');
+                o.value = exp; o.textContent = exp; expirySelect.appendChild(o);
+            });
+        }
+
+        function onInstrumentChange() {
+            const symbol = document.getElementById('instrumentSelect').value;
+            document.getElementById('symbolFilter').value = symbol;
+            applyFilters();
+        }
+
+        function onExpiryChange() {
+            // Optional: append expiry to symbol if needed
+        }
+
+        function onPatternChange() {
+            const p = document.getElementById('patternTypeSelect').value;
+            document.getElementById('patternFilter').value = p;
+            applyFilters();
+        }
+
+        // Additional functions for chart controls
+        function setTimeframe(timeframe) {
+            console.log('Setting timeframe:', timeframe);
+            if (window.dashboard && window.dashboard._chart) {
+                // Update chart timeframe (this would typically involve fetching new data)
+                console.log('Chart timeframe updated to:', timeframe);
+                // In a real implementation, you would fetch new data based on timeframe
+                // and update the chart series with the new data
+            }
+        }
+
+        // Expose for inline handlers
+        window.loadInstruments = loadInstruments;
+        window.onInstrumentChange = onInstrumentChange;
+        window.onExpiryChange = onExpiryChange;
+        window.onPatternChange = onPatternChange;
+        window.setTimeframe = setTimeframe;
+
+        // Initialize dashboard when page loads
+        let dashboard;
+        document.addEventListener('DOMContentLoaded', () => {
+            dashboard = new UltraLowLatencyDashboard();
+            window.dashboard = dashboard; // Make dashboard globally available
+            // Load instruments for the default selected asset class
+            loadInstruments();
+        });
+    </script>
+</body>
+</html>
