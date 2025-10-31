@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.DS_Store
+.cursor/
+.zed/
+*.sublime-*
+
+# Sensitive files
+config/zerodha_token.json
+config/*.key
+*.env
+.env.local
+.secrets
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+
+# Logs
+logs/
+*.log
+
+# Parquet and data files
+parquet_output/
+parquet_test_output*/
+real_parquet_data/
+research_data/
+*.parquet
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+backup_files/
+*.cache
+
+# Python virtual environment
+.venv/
+venv/
+
+# Aider
+.aider.input.history
+.aider.tags.cache.v4/
+
+# Token cache
+token_cache.py
+zerodha_token_list/
+
+# CSV files with sensitive data
+hdfc_csv_files/
+*.csv
+
+# Documentation that might contain sensitive info
+correlation_analysis_report.md
+daily_alert_report_*.md
+alert_validator_report_*.md
+signal_provider_report.md
+
+# Statistical model data
+statistical_model_data_*.json
+
+# Test files
+test_*.py
+*_test.py
+
