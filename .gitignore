@@ -29,6 +29,7 @@ config/*.key
 *.env
 .env.local
 .secrets
+alerts/config/reddit_config.json
 
 # Database files
 *.db

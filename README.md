@@ -1,5 +1,5 @@
 # High-Performance Intraday Trading System
-*Last Updated: October 27, 2025 - Crawler Usage & Troubleshooting Guide Complete* (Time 8:30 AM IST)
+*Last Updated: October 31, 2025 - Dashboard & Integration Points Complete* (Time 11:00 PM IST)
 
 ## 🧭 End-to-End Audit Playbook (Nightly Reference)
 1. **Environment Baseline** — Activate the project venv and refresh dependencies: `python -m pip install -r requirements_apple_silicon.txt`; confirm `.env`/config secrets align with `config/optimized_field_mapping.yaml`.
@@ -8,6 +8,14 @@
 4. **Pattern & Math Integrity Sweep** — During the scanner dry run, tail logs for `MathDispatcher` warnings (search for “fallback math”) to confirm every detector stays on the shared engine. Any fallback hit requires a docstring + implementation review in `patterns/pattern_mathematics.py` or `core/math_dispatcher.py`.
 5. **Risk & Alerts Validation** — Launch `python -m alert_validation.alert_validator` after market open; confirm the market-hours guard halts processing post 15:30 IST and that the generated report writes to `alert_validator_report_*.md`. Review the risk outputs in `alerts/risk_manager.py` for dispatcher usage.
 6. **Data Quality & Reporting** — Execute `python quality_dashboard.py` for the full snapshot and `python quality_monitor.py` for the quick quality check. Archive the dashboards in `logs/audit/` with timestamps.
+7. **Alert Dashboard Verification** — Start `python alert_validation/alert_dashboard.py` and verify:
+   - Alerts are loading from `alerts:stream` (check console output)
+   - Price charts display full trading session data
+   - Technical indicators overlay correctly (VWAP, EMAs, RSI, MACD)
+   - Volume Profile shows POC and Value Area lines
+   - Market indices (VIX, NIFTY 50, BANKNIFTY) refresh every 30s
+   - News feed displays with 180-minute TTL filtering
+   - Stop loss/target are correctly oriented for SELL vs BUY actions
 7. **Docstring & Standards Pass** — Run `pydocstyle` (or `ruff check --select D` if available). Update docstrings immediately where violations are flagged, keeping canonical field references consistent with YAML mappings.
 
 > ✅ Log findings in `audit.md` after each nightly run so the subsequent session knows which modules require corrective action.
@@ -137,6 +145,32 @@
 - **Usage**: Price level volume analysis and gravitational effect zones
 - **Historical Analysis**: Trend analysis with 24-hour lookback for pattern detection
 
+### **📊 Alert Validation Dashboard**
+- **Primary Source**: `alert_validation/alert_dashboard.py` (AlertValidationDashboard)
+- **Framework**: Dash (Plotly) with Bootstrap components
+- **Port**: 53056 (fixed for external consumer access)
+- **External Access**: ngrok tunnel (https://jere-unporous-magan.ngrok-free.dev)
+- **Features**:
+  - Real-time alert visualization with interactive charts
+  - Technical indicators overlay (VWAP, EMAs, Bollinger Bands, RSI, MACD)
+  - Volume Profile visualization (POC, Value Area, distribution histogram)
+  - Options Greeks display (Delta, Gamma, Theta, Vega, Rho)
+  - News enrichment integration
+  - Market indices (VIX, NIFTY 50, BANKNIFTY) with 30s auto-refresh
+  - Full trading session time series data
+  - Action-aware stop loss/target correction (BUY vs SELL)
+- **Data Sources**:
+  - Redis DB 0: Alert storage (`alert:*`, `forward_validation:alert:*`)
+  - Redis DB 1: Real-time data (`alerts:stream`, `ohlc_updates:*`, `ohlc_daily:*`, indicators, Greeks)
+  - Redis DB 2: Analytics (`volume_profile:poc:*`, `volume_profile:distribution:*`)
+  - Redis DB 4/5: Additional indicator storage (fallback)
+- **Integration Points**:
+  - Scanner: Loads alerts from `alerts:stream` (primary source)
+  - Redis Storage: Reads indicators/Greeks from multiple DBs
+  - Volume Profile: Integrates with `VolumeProfileManager` for POC/VA data
+  - News System: Enriches alerts with news from `news:MARKET_NEWS:*` keys
+  - Instrument Mapper: Resolves tokens to symbols for display
+
 ## 🔄 **HOW THE SYSTEM WORKS**
 
 ### **1. Data Ingestion Flow**
@@ -234,17 +268,79 @@ Tick Data → Standardized Fields → Volume State → Pattern Analysis → Trad
 
 ### **7. Redis Multi-Database Architecture**
 ```
-DB 0: System → system_config, metadata, session_data, health_checks
-DB 2: Prices → equity_prices, futures_prices, options_prices, OHLC data
-DB 3: Premarket → premarket_trades, incremental_volume, opening_data
-DB 4: Continuous Market → 5s_ticks, real_time_data, streaming_data
-DB 5: Cumulative Volume → daily_cumulative, symbol_volume, volume profiles
-DB 6: Alerts → pattern_alerts, trading_alerts, system_alerts
-DB 8: Microstructure → depth_analysis, flow_data, microstructure_metrics
-DB 10: Patterns → pattern_candidates, detection_data, analysis_cache
-DB 11: News → news_data, sentiment_scores, market_news
-DB 13: Metrics → performance_data, metrics_cache, analytics_data
+DB 0: System → system_config, metadata, session_data, health_checks, volume baselines
+DB 1: Realtime → alerts:stream, ticks:*, indicators:* (indicators, Greeks), patterns:*, news:*
+DB 2: Analytics → volume_profile:poc:*, volume_profile:distribution:*, ohlc_daily:*, metrics
+DB 4: Fallback → Additional indicator storage (backup)
+DB 5: Fallback → Additional indicator/Greek storage (backup), ohlc_daily:* (OHLC sorted sets)
 ```
+
+**⚠️ CRITICAL: Redis Storage Schema for Indicators, Greeks, and Volume Profile**
+
+All assistants must know where indicators, Greeks, and volume profile are stored in Redis:
+
+#### **📊 Technical Indicators (DB 1 - Primary)**
+- **Key Pattern**: `indicators:{symbol}:{indicator_name}`
+- **Examples**:
+  - `indicators:NFO:NIFTY25DEC26000CE:rsi` → RSI value (float as string)
+  - `indicators:NFO:NIFTY25DEC26000CE:atr` → ATR value (float as string)
+  - `indicators:NFO:NIFTY25DEC26000CE:vwap` → VWAP value (float as string)
+  - `indicators:NFO:NIFTY25DEC26000CE:ema_20` → EMA 20 value (float as string)
+  - `indicators:NFO:NIFTY25DEC26000CE:ema_50` → EMA 50 value (float as string)
+  - `indicators:NFO:NIFTY25DEC26000CE:macd` → MACD dict (JSON: `{'value': {'macd': ..., 'signal': ..., 'histogram': ...}, 'timestamp': ..., 'symbol': ...}`)
+  - `indicators:NFO:NIFTY25DEC26000CE:bollinger_bands` → BB dict (JSON: `{'value': {'upper': ..., 'middle': ..., 'lower': ...}, ...}`)
+- **Storage Method**: `redis_storage.publish_indicators_to_redis()` stores via `analysis_cache` data type
+- **Format**: 
+  - Simple indicators (RSI, EMA, ATR, VWAP): Stored as string/number
+  - Complex indicators (MACD, BB, Volume Profile): Stored as JSON with `{'value': {...}, 'timestamp': ..., 'symbol': ...}`
+- **Fallback DBs**: DB 4 and DB 5 (checked if not found in DB 1)
+- **Calculation**: Pure Python libraries (pandas_ta → pandas → polars → TA-Lib fallback)
+
+#### **📈 Options Greeks (DB 1 - Primary)**
+- **Key Patterns**:
+  - `indicators:{symbol}:greeks` → Combined Greeks dict (JSON: `{'value': {'delta': ..., 'gamma': ..., 'theta': ..., 'vega': ..., 'rho': ...}, 'timestamp': ..., 'symbol': ...}`)
+  - `indicators:{symbol}:delta` → Delta value (float as string)
+  - `indicators:{symbol}:gamma` → Gamma value (float as string)
+  - `indicators:{symbol}:theta` → Theta value (float as string)
+  - `indicators:{symbol}:vega` → Vega value (float as string)
+  - `indicators:{symbol}:rho` → Rho value (float as string)
+- **Examples**:
+  - `indicators:NFO:NIFTY25DEC26000CE:greeks` → All Greeks combined
+  - `indicators:NFO:NIFTY25DEC26000CE:delta` → Individual Delta
+- **Storage Method**: `redis_storage.publish_indicators_to_redis()` stores both combined and individual
+- **Format**: 
+  - Combined: JSON with nested `{'value': {'delta': ..., 'gamma': ..., ...}, ...}`
+  - Individual: Float as string
+- **Fallback DBs**: DB 4 and DB 5 (checked if not found in DB 1)
+- **Calculation**: `EnhancedGreekCalculator.black_scholes_greeks()` using `scipy.stats.norm` (pure Python, NO TA-Lib)
+
+#### **📊 Volume Profile (DB 2 - Analytics, DB 1 - Fallback)**
+- **Key Patterns**:
+  - `volume_profile:poc:{symbol}` → Hash with POC/VA data (`poc_price`, `poc_volume`, `value_area_high`, `value_area_low`)
+  - `volume_profile:distribution:{symbol}:{YYYY-MM-DD}` → Hash with daily distribution
+  - `indicators:{symbol}:poc_price` → POC price indicator (float as string, stored in DB 1)
+  - `indicators:{symbol}:value_area_high` → Value Area High (float as string)
+  - `indicators:{symbol}:value_area_low` → Value Area Low (float as string)
+- **Examples**:
+  - `volume_profile:poc:NFO:NIFTY25DECFUT` → Hash with POC data
+  - `indicators:NFO:NIFTY25DECFUT:poc_price` → POC price as indicator
+- **Storage Method**: 
+  - Primary: `VolumeProfileManager` stores in DB 2 (analytics)
+  - Secondary: `redis_storage.publish_indicators_to_redis()` stores POC/VA in DB 1 as indicators
+- **Format**: Hash (for poc/distribution) or string/JSON (for indicators)
+- **Calculation**: `HybridCalculations.calculate_volume_profile()` using Polars/pandas
+
+#### **🔑 Key Access Patterns**
+- **Dashboard**: `alert_dashboard.py` loads from DB 1 (primary), DB 4/5 (fallbacks), DB 2 (volume profile)
+- **Alert Templates**: `alerts/notifiers.py` extracts from alert payload (`signal['indicators']`, `signal['delta']`, etc.)
+- **Alert Validator**: `alert_validation/alert_validator.py` can load from Redis if needed
+- **Alert Manager**: `alerts/alert_manager.py` merges indicators from Redis into alert payload via `_fetch_indicators_from_redis()`
+
+#### **📝 Important Notes**
+- All indicators/Greeks calculated by `HybridCalculations` (pure Python: pandas_ta/pandas/scipy)
+- Greeks only exist for F&O instruments (options/futures with CE/PE/FUT suffix)
+- Volume Profile POC stored both as hash (DB 2) and indicator (DB 1) for easy access
+- Dashboard checks multiple DBs and key variants for maximum compatibility
 
 ### **8. Mathematical Volume Engine**
 ```
@@ -1531,6 +1627,7 @@ redis-cli keys "volume:*" | head -5
 - **Python**: 3.8+ with asyncio support
 - **WebSocket**: Zerodha API access
 - **Memory**: 2GB+ available for Redis operations
+- **Dependencies**: Dash, Plotly, dash-bootstrap-components (for dashboard)
 
 ### **2. Start Intraday Crawler**
 ```bash
@@ -1542,6 +1639,29 @@ python core/data/redis_health.py
 
 # Check system status
 redis-cli --stat
+```
+
+### **3. Start Alert Dashboard**
+```bash
+# Start the dashboard (local access)
+python alert_validation/alert_dashboard.py
+
+# Dashboard will be available at:
+# - Local: http://localhost:53056
+# - Network: http://<local-ip>:53056
+# - External: Requires ngrok tunnel (see below)
+
+# For external access, start ngrok tunnel:
+ngrok http 53056
+
+# Dashboard features:
+# - Real-time alert visualization
+# - Technical indicators (VWAP, EMAs, RSI, MACD, Bollinger Bands)
+# - Volume Profile (POC, Value Area, distribution)
+# - Options Greeks (Delta, Gamma, Theta, Vega, Rho)
+# - Market indices (VIX, NIFTY 50, BANKNIFTY)
+# - News enrichment with sentiment analysis
+# - Interactive price charts with full trading session data
 ```
 
 ### **3. Verify Data Flow**
