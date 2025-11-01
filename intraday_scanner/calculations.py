@@ -124,14 +124,23 @@ class CircularEMA:
     def get_current_ema(self) -> float:
         return self.ema
 
-# TA-Lib imports for enhanced technical analysis
+# TA-Lib imports for enhanced technical analysis (fallback only)
 try:
     import talib
     TALIB_AVAILABLE = True
-    logger.info("✅ TA-Lib loaded successfully for enhanced technical analysis")
+    logger.info("✅ TA-Lib loaded (used as fallback only - pure Python libraries preferred)")
 except ImportError as e:
     TALIB_AVAILABLE = False
     logger.warning(f"⚠️ TA-Lib not available: {e}")
+
+# pandas_ta - Pure Python alternative to TA-Lib (preferred)
+try:
+    import pandas_ta as pta
+    PANDAS_TA_AVAILABLE = True
+    logger.info("✅ pandas_ta loaded successfully (pure Python technical analysis)")
+except ImportError as e:
+    PANDAS_TA_AVAILABLE = False
+    logger.debug(f"pandas_ta not available: {e}")
 
 # Numba imports for ultra-fast calculations
 try:
@@ -266,7 +275,7 @@ class HybridCalculations:
     
     def calculate_atr(self, highs: List[float], lows: List[float], 
                      closes: List[float], period: int = 14, symbol: str = None) -> float:
-        """ATR using TA-Lib (preferred) with Polars fallback and Redis caching"""
+        """ATR using pure Python libraries (pandas/pandas_ta preferred) with TA-Lib fallback"""
         # ✅ CACHED INDICATORS: Check in-memory cache first (5 min TTL)
         if symbol:
             cached = self._get_cached_indicators(symbol, 'atr', closes)
@@ -279,20 +288,47 @@ class HybridCalculations:
             if redis_atr is not None:
                 return redis_atr
         
-        # Try TA-Lib first (fastest and most accurate)
-        if TALIB_AVAILABLE and len(highs) >= period:
+        # ✅ PREFERRED: Use pandas_ta (pure Python) first
+        if PANDAS_TA_AVAILABLE and len(highs) >= period:
             try:
-                np_highs = np.array(highs, dtype=np.float64)
-                np_lows = np.array(lows, dtype=np.float64)
-                np_closes = np.array(closes, dtype=np.float64)
-                
-                atr = talib.ATR(np_highs, np_lows, np_closes, timeperiod=period)
-                result = float(atr[-1]) if len(atr) > 0 and not np.isnan(atr[-1]) else 0.0
-                return result
+                import pandas as pd
+                df = pd.DataFrame({
+                    'high': highs,
+                    'low': lows,
+                    'close': closes
+                })
+                atr = pta.atr(df['high'], df['low'], df['close'], length=period)
+                result = float(atr.iloc[-1]) if len(atr) > 0 and not pd.isna(atr.iloc[-1]) else 0.0
+                if result > 0:
+                    return result
             except Exception as e:
-                logger.warning(f"TA-Lib ATR failed, using fallback: {e}")
+                logger.debug(f"pandas_ta ATR failed, using fallback: {e}")
         
-        # Fallback to Polars
+        # ✅ FALLBACK 1: Use pandas (pure Python)
+        if PANDAS_AVAILABLE and len(highs) >= period + 1:
+            try:
+                import pandas as pd
+                df = pd.DataFrame({
+                    'high': highs,
+                    'low': lows,
+                    'close': closes
+                })
+                
+                # True Range calculation
+                df['tr1'] = df['high'] - df['low']
+                df['tr2'] = (df['high'] - df['close'].shift(1)).abs()
+                df['tr3'] = (df['low'] - df['close'].shift(1)).abs()
+                df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+                
+                # ATR as rolling mean
+                atr = df['tr'].rolling(window=period).mean()
+                result = float(atr.iloc[-1]) if len(atr) > 0 and not pd.isna(atr.iloc[-1]) else 0.0
+                if result > 0:
+                    return result
+            except Exception as e:
+                logger.debug(f"pandas ATR failed, using fallback: {e}")
+        
+        # ✅ FALLBACK 2: Use Polars (pure Python)
         if POLARS_AVAILABLE and len(highs) >= period + 1:
             try:
                 df = pl.DataFrame({
@@ -312,39 +348,82 @@ class HybridCalculations:
                 
                 # ATR as rolling mean
                 atr = df['tr'].tail(period).mean()
-                return float(atr) if atr is not None else 0.0
+                result = float(atr) if atr is not None else 0.0
+                if result > 0:
+                    return result
             except Exception as e:
-                logger.warning(f"Polars ATR failed, using simple fallback: {e}")
+                logger.debug(f"Polars ATR failed, using fallback: {e}")
+        
+        # ✅ FALLBACK 3: Use TA-Lib (if available)
+        if TALIB_AVAILABLE and len(highs) >= period:
+            try:
+                np_highs = np.array(highs, dtype=np.float64)
+                np_lows = np.array(lows, dtype=np.float64)
+                np_closes = np.array(closes, dtype=np.float64)
+                
+                atr = talib.ATR(np_highs, np_lows, np_closes, timeperiod=period)
+                result = float(atr[-1]) if len(atr) > 0 and not np.isnan(atr[-1]) else 0.0
+                if result > 0:
+                    return result
+            except Exception as e:
+                logger.debug(f"TA-Lib ATR failed, using simple fallback: {e}")
         
         # Simple fallback
         return self._fallback_atr(highs, lows, closes, period)
     
     def calculate_ema(self, prices: List[float], period: int = 20) -> float:
-        """EMA using TA-Lib (preferred) with Polars fallback and Redis caching"""
+        """EMA using pure Python libraries (pandas/pandas_ta preferred) with TA-Lib fallback"""
         # First try Redis fallback
         if hasattr(self, 'redis_client') and self.redis_client:
             redis_ema = get_indicator_from_redis("SYMBOL", f"ema_{period}", self.redis_client)
             if redis_ema is not None:
                 return redis_ema
         
-        # Try TA-Lib first (fastest and most accurate)
+        # ✅ PREFERRED: Use pandas_ta (pure Python) first
+        if PANDAS_TA_AVAILABLE and len(prices) >= period:
+            try:
+                import pandas as pd
+                series = pd.Series(prices)
+                ema = pta.ema(series, length=period)
+                result = float(ema.iloc[-1]) if len(ema) > 0 and not pd.isna(ema.iloc[-1]) else float(prices[-1]) if prices else 0.0
+                if result > 0:
+                    return result
+            except Exception as e:
+                logger.debug(f"pandas_ta EMA failed, using fallback: {e}")
+        
+        # ✅ FALLBACK 1: Use pandas (pure Python)
+        if PANDAS_AVAILABLE and len(prices) >= period:
+            try:
+                import pandas as pd
+                series = pd.Series(prices)
+                ema = series.ewm(span=period, adjust=False).mean()
+                result = float(ema.iloc[-1]) if len(ema) > 0 and not pd.isna(ema.iloc[-1]) else float(prices[-1]) if prices else 0.0
+                if result > 0:
+                    return result
+            except Exception as e:
+                logger.debug(f"pandas EMA failed, using fallback: {e}")
+        
+        # ✅ FALLBACK 2: Use Polars (pure Python)
+        if POLARS_AVAILABLE and len(prices) >= period:
+            try:
+                series = pl.Series('last_price', prices)
+                ema = series.ewm_mean(span=period).tail(1)[0]
+                result = float(ema) if ema is not None else float(prices[-1]) if prices else 0.0
+                if result > 0:
+                    return result
+            except Exception as e:
+                logger.debug(f"Polars EMA failed, using fallback: {e}")
+        
+        # ✅ FALLBACK 3: Use TA-Lib (if available)
         if TALIB_AVAILABLE and len(prices) >= period:
             try:
                 np_prices = np.array(prices, dtype=np.float64)
                 ema = talib.EMA(np_prices, timeperiod=period)
                 result = float(ema[-1]) if len(ema) > 0 and not np.isnan(ema[-1]) else float(prices[-1]) if prices else 0.0
-                return result
+                if result > 0:
+                    return result
             except Exception as e:
-                logger.warning(f"TA-Lib EMA failed, using fallback: {e}")
-        
-        # Fallback to Polars
-        if POLARS_AVAILABLE and len(prices) >= period:
-            try:
-                series = pl.Series('last_price', prices)
-                ema = series.ewm_mean(span=period).tail(1)[0]
-                return float(ema)
-            except Exception as e:
-                logger.warning(f"Polars EMA failed, using simple fallback: {e}")
+                logger.debug(f"TA-Lib EMA failed, using simple fallback: {e}")
         
         # Simple fallback
         return self._fallback_ema(prices, period)

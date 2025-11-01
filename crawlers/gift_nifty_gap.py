@@ -65,12 +65,26 @@ class IndexDataUpdater:
         # Initialize Redis connection using centralized configuration
         try:
             from redis_files.redis_client import get_redis_client
-            self.redis_client = get_redis_client()
+            # Get DB 0 client for system operations
+            self.redis_client = get_redis_client(db=0)
+            # Get DB 1 client for realtime data (news, indices)
+            self.redis_db1 = get_redis_client(db=1, decode_responses=True)
+            
+            # Verify both clients are initialized
+            if self.redis_client is None:
+                raise Exception("Redis DB 0 client is None")
+            if self.redis_db1 is None:
+                raise Exception("Redis DB 1 client is None")
+                
             self.redis_initialized = True
-            logger.info("✅ Redis connected for index data publishing")
+            logger.info("✅ Redis connected for index data publishing (DB 0 and DB 1)")
         except Exception as e:
-            logger.warning(f"⚠️ Redis connection failed: {e}")
+            logger.error(f"⚠️ Redis connection failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             self.redis_initialized = False
+            self.redis_client = None
+            self.redis_db1 = None
 
         # Index definitions with tokens
         self.indices = {
@@ -448,8 +462,12 @@ class IndexDataUpdater:
             return
 
         try:
-            # Get realtime client (DB 1) for publishing
-            realtime_client = self.redis_client.get_client(1) if hasattr(self.redis_client, 'get_client') else self.redis_client
+            # Use DB 1 client for realtime data (indices)
+            realtime_client = self.redis_db1 if self.redis_db1 else self.redis_client
+            
+            if not realtime_client:
+                logger.warning(f"⚠️ No Redis client available for publishing {symbol}")
+                return
             
             # Publish to individual index channel (keep original case for VIX detector compatibility)
             channel = f"index:{symbol}"
@@ -461,10 +479,12 @@ class IndexDataUpdater:
             realtime_client.set(key1, json.dumps(data))
             realtime_client.set(key2, json.dumps(data))
 
-            logger.debug(f"📡 Published {symbol} to Redis (channels: {channel}, keys: {key1}, {key2})")
+            logger.debug(f"📡 Published {symbol} to Redis DB 1 (channels: {channel}, keys: {key1}, {key2})")
 
         except Exception as e:
             logger.error(f"❌ Redis publish error for {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _publish_market_context(self):
         """Publish market context for AION U-shaped volume formula"""
@@ -485,10 +505,12 @@ class IndexDataUpdater:
                     'display_value': f"{data['last_price']:.2f} pts"  # Add display format
                 }
 
-            # Publish market context
+            # Publish market context - use DB 1 for realtime data
             if self.redis_initialized:
-                self.redis_client.publish('market:context', json.dumps(context))
-                self.redis_client.set('market:context:latest', json.dumps(context))
+                redis_client = self.redis_db1 if self.redis_db1 else self.redis_client
+                if redis_client:
+                    redis_client.publish('market:context', json.dumps(context))
+                    redis_client.set('market:context:latest', json.dumps(context))
 
             logger.info("📡 Published market context for AION calculations")
 
@@ -497,24 +519,35 @@ class IndexDataUpdater:
 
     def _publish_news_data(self):
         """Publish news data to Redis and write to disk"""
-        if not self.redis_initialized or not self.news_data:
+        if not self.redis_initialized or not self.news_data or not self.redis_db1:
+            if not self.redis_db1:
+                logger.warning("⚠️ Redis DB 1 client not available for news publishing")
             return
         
         try:
             # Write news to disk first
             self._write_news_to_disk()
             
+            # Use DB 1 client for all news operations (realtime database)
+            redis_client = self.redis_db1
+            
             # Publish individual news items AND store them persistently
             for i, news_item in enumerate(self.news_data):
                 # Publish to channel
-                self.redis_client.publish('market_data.news', json.dumps(news_item))
+                redis_client.publish('market_data.news', json.dumps(news_item))
                 
-                # Store individual news item persistently in Redis
+                # Store individual news item persistently in Redis DB 1
                 news_key = f"news:item:{datetime.now().strftime('%Y%m%d')}:{i}"
-                self.redis_client.setex(news_key, 86400, json.dumps(news_item))  # Store for 24 hours
+                redis_client.setex(news_key, 86400, json.dumps(news_item))  # Store for 24 hours
+                
+                # Also store using store_news_sentiment format (news:MARKET_NEWS:timestamp) for dashboard compatibility
+                import time
+                timestamp = int(time.time())
+                market_news_key = f"news:MARKET_NEWS:{timestamp}"
+                redis_client.setex(market_news_key, 10800, json.dumps(news_item))  # Store for 3 hours (180 mins + buffer)
                 
                 # NEW: Publish to symbol-specific keys for DataPipeline consumption
-                self._publish_news_to_symbols(news_item)
+                self._publish_news_to_symbols(news_item, redis_client)
             
             # Publish news summary
             news_summary = {
@@ -528,16 +561,24 @@ class IndexDataUpdater:
                 }
             }
             
-            self.redis_client.publish('market_data.news_summary', json.dumps(news_summary))
-            self.redis_client.set('market_data.news:latest', json.dumps(news_summary))
+            redis_client.publish('market_data.news_summary', json.dumps(news_summary))
+            redis_client.set('market_data.news:latest', json.dumps(news_summary))
             
-            logger.info(f"📰 Published {len(self.news_data)} news items to Redis and disk")
+            logger.info(f"📰 Published {len(self.news_data)} news items to Redis DB 1 and disk")
 
         except Exception as e:
             logger.error(f"❌ Error publishing news data: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
-    def _publish_news_to_symbols(self, news_item):
+    def _publish_news_to_symbols(self, news_item, redis_client=None):
         """Publish news to symbol-specific keys for DataPipeline consumption"""
+        if redis_client is None:
+            redis_client = self.redis_db1 if self.redis_db1 else self.redis_client
+        
+        if not redis_client:
+            return
+            
         try:
             # Extract relevant symbols from news content
             relevant_symbols = self._extract_symbols_from_news(news_item)
@@ -570,13 +611,13 @@ class IndexDataUpdater:
                     "volume_trigger": self._is_volume_trigger_news(news_item)
                 }
                 
-                # Add to sorted set (DataPipeline uses zrevrangebyscore)
-                self.redis_client.zadd(symbol_key, {json.dumps(news_data): timestamp})
+                # Add to sorted set (DataPipeline uses zrevrangebyscore) - use DB 1
+                redis_client.zadd(symbol_key, {json.dumps(news_data): timestamp})
                 # Set expiry on the sorted set
-                self.redis_client.expire(symbol_key, 300)  # 5 minute TTL
+                redis_client.expire(symbol_key, 300)  # 5 minute TTL
                 
                 # Also publish to symbol-specific channel
-                self.redis_client.publish(f"news:symbol:{symbol}", json.dumps(news_data))
+                redis_client.publish(f"news:symbol:{symbol}", json.dumps(news_data))
                 
             if relevant_symbols:
                 logger.info(f"📰 Published news to {len(relevant_symbols)} symbols: {relevant_symbols}")
@@ -799,10 +840,12 @@ class IndexDataUpdater:
                 'signal': self._get_gap_signal(gap_percent)
             }
 
-            # Publish to Redis (legacy channel)
+            # Publish to Redis (legacy channel) - use DB 1 for realtime data
             if self.redis_initialized:
-                self.redis_client.publish('market.gift_nifty.gap', json.dumps(gap_analysis))
-                self.redis_client.set('latest_gift_nifty_gap', json.dumps(gap_analysis))
+                redis_client = self.redis_db1 if self.redis_db1 else self.redis_client
+                if redis_client:
+                    redis_client.publish('market.gift_nifty.gap', json.dumps(gap_analysis))
+                    redis_client.set('latest_gift_nifty_gap', json.dumps(gap_analysis))
 
             # Save to JSON file for scanner compatibility
             self._save_gap_to_file(gap_analysis)

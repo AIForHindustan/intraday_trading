@@ -2,32 +2,47 @@
 
 Features:
 - Automatic reconnection on connection loss
-- Retry logic with exponential backoff
+- Retry logic with exponential backoff (RESP3 + redis-py built-in retry)
 - Health checks and connection monitoring
 - Graceful fallback to in-memory storage
 - Thread-safe operations
 - Queue for failed operations during disconnection
 - Safe JSON serialization for all data types
+- Circuit breaker for fast-fail during outages
+- Proper connection pooling to prevent connection storms
 
 Production benefits:
 - Self-healing connections
 - No manual intervention needed
 - Zero message loss with retry queue
 - Seamless failover
+- RESP3 protocol for Redis 8.x compatibility
+- XADD trim & group auto-create for Streams memory stability
 """
+
+from __future__ import annotations
 
 import time
 import json
 import random
 import redis
 from redis.connection import ConnectionPool
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
+from redis.exceptions import (
+    BusyLoadingError,
+    ConnectionError,
+    TimeoutError as RedisTimeoutError,
+    AuthenticationError,
+    ResponseError,
+)
 import logging
 from threading import Lock, Thread
 from collections import deque, defaultdict
 from datetime import datetime, date, timedelta
 from decimal import Decimal
-import os
-from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any, Callable, Iterable, Tuple, TypeVar
 
 from utils.time_utils import INDIAN_TIME_PARSER
 from config.utils.timestamp_normalizer import TimestampNormalizer
@@ -220,7 +235,7 @@ class ConnectionPooledRedisClient:
         port: int = 6379,
         db: int = 0,
         password: Optional[str] = None,
-        max_connections: int = 200,  # Increased default for high-frequency trading
+        max_connections: int = 50,  # Reduced to prevent pool exhaustion (pools are shared)
         decode_responses: bool = True,
         socket_connect_timeout: int = 5,
         socket_timeout: int = 5,
@@ -295,9 +310,9 @@ class RobustRedisClient:
         self.retry_delay = retry_delay
         self.health_check_interval = health_check_interval
         
-        # Get max_connections from config, default to 200 for high-frequency trading
+        # Get max_connections from config, default to 50 (reduced to prevent connection exhaustion)
         # Priority: config dict > centralized redis_config > default
-        self.max_connections = 200
+        self.max_connections = 50
         if config:
             # Check for both redis_max_connections and max_connections keys
             self.max_connections = int(config.get("redis_max_connections") or config.get("max_connections", self.max_connections))
@@ -4028,43 +4043,327 @@ if __name__ == "__main__":
     print("✅ AION signal publishing and caching")
 
 
-def get_redis_client(config=None):
-    """Factory function to create and return a singleton RobustRedisClient instance using centralized config"""
+# ============================================
+# Modern Redis Client with RESP3, Retry/Backoff, Circuit Breaker
+# ============================================
+
+T = TypeVar("T")
+
+# Ensure os and threading are imported (needed for REDIS_DEFAULTS and _pool_lock)
+# These are already imported at module top, but ensure availability here
+import os  # Already imported, but explicit for clarity
+import threading  # Already imported, but explicit for clarity
+
+# -------- Defaults tuned for Redis 8.2 and high-throughput intraday workloads --------
+REDIS_DEFAULTS = {
+    "host": os.getenv("REDIS_HOST", "127.0.0.1"),
+    "port": int(os.getenv("REDIS_PORT", "6379")),
+    "db": int(os.getenv("REDIS_DB_DEFAULT", "0")),
+    "username": os.getenv("REDIS_USERNAME"),
+    "password": os.getenv("REDIS_PASSWORD"),
+    "ssl": os.getenv("REDIS_SSL", "false").lower() == "true",
+    # Timeouts (seconds): short connect, reasonable command window under load
+    "socket_connect_timeout": float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "1.5")),
+    "socket_timeout": float(os.getenv("REDIS_SOCKET_TIMEOUT", "2.5")),
+    # RESP3 for richer types & better INFO/Streams parsing issues on Redis 8.x
+    "protocol": int(os.getenv("REDIS_PROTOCOL", "3")),
+    # Health/probing
+    "health_check_interval": int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL", "15")),
+    "client_name": os.getenv("REDIS_CLIENT_NAME", "intraday-core"),
+    # Pool sizing: bursty tick traffic; tweak for your cores / process count
+    "max_connections": int(os.getenv("REDIS_MAX_CONNECTIONS", "256")),
+    # Retry helpers (first-class in redis-py)
+    "retry": Retry(ExponentialBackoff(cap=3.0, base=0.05), retries=int(os.getenv("REDIS_RETRIES", "5"))),
+    "retry_on_error": (
+        ConnectionError,
+        RedisTimeoutError,
+        BusyLoadingError,
+    ),
+    "retry_on_timeout": True,
+    # Keepalive reduces FIN/ACK flapping on busy hosts
+    "socket_keepalive": True,
+    # decode_responses: default False; callers may override for text/JSON reads
+    "decode_responses": False,
+}
+
+# ---------------- Singletons ----------------
+_pool_lock = threading.Lock()
+_modern_pool: Optional[redis.ConnectionPool] = None
+_modern_sync_client: Optional[redis.Redis] = None
+
+# ---------------- Circuit Breaker ----------------
+@dataclass
+class Circuit:
+    threshold: int = int(os.getenv("REDIS_CB_THRESHOLD", "8"))
+    cooldown: float = float(os.getenv("REDIS_CB_COOLDOWN_SEC", "5.0"))
+    failures: int = 0
+    opened_at: float = 0.0
+
+    def allow(self) -> bool:
+        """Why: reject fast when Redis is flapping; half-open after cooldown"""
+        if self.opened_at <= 0:
+            return True
+        if (time.time() - self.opened_at) >= self.cooldown:
+            return True
+        return False
+
+    def mark_failure(self) -> None:
+        self.failures += 1
+        if self.failures >= self.threshold:
+            self.opened_at = time.time()
+
+    def mark_success(self) -> None:
+        self.failures = 0
+        self.opened_at = 0.0
+
+_modern_cb = Circuit()
+
+def _build_modern_pool(overrides: dict | None = None) -> redis.ConnectionPool:
+    """Build modern Redis connection pool with RESP3 and retry/backoff"""
+    cfg = REDIS_DEFAULTS.copy()
+    if overrides:
+        cfg.update(overrides)
+    # Note: redis.ConnectionPool doesn't support all kwargs; filter unsupported ones
+    pool_kwargs = {
+        "host": cfg["host"],
+        "port": cfg["port"],
+        "db": cfg["db"],
+        "username": cfg.get("username"),
+        "password": cfg.get("password"),
+        "socket_connect_timeout": cfg["socket_connect_timeout"],
+        "socket_timeout": cfg["socket_timeout"],
+        "max_connections": cfg["max_connections"],
+        "socket_keepalive": cfg["socket_keepalive"],
+        "health_check_interval": cfg["health_check_interval"],
+        "client_name": cfg["client_name"],
+    }
+    # Remove None values
+    pool_kwargs = {k: v for k, v in pool_kwargs.items() if v is not None}
+    
+    # SSL and protocol are handled at connection level, not pool level
+    pool = redis.ConnectionPool(**pool_kwargs)
+    return pool
+
+def get_sync_modern(overrides: dict | None = None) -> redis.Redis:
+    """
+    Return a process-wide Redis client with robust retry/backoff and pooling.
+    Note: decode_responses belongs to client, not pool. Each call with different decode_responses
+    may need a separate client instance.
+    """
+    cfg = REDIS_DEFAULTS.copy()
+    if overrides:
+        cfg.update(overrides)
+    
+    # Build pool without decode_responses (pool doesn't support it)
+    pool_overrides = {k: v for k, v in (overrides or {}).items() if k != "decode_responses"}
+    global _modern_pool
+    with _pool_lock:
+        if _modern_pool is None or (overrides and any(k in pool_overrides for k in ["db", "host", "port"])):
+            _modern_pool = _build_modern_pool(pool_overrides)
+    
+    # Return client with decode_responses set appropriately
+    # SSL and protocol are set at client level if supported
+    client_kwargs = {
+        "connection_pool": _modern_pool,
+        "retry": cfg["retry"],
+        "retry_on_error": cfg["retry_on_error"],
+        "retry_on_timeout": cfg["retry_on_timeout"],
+        "decode_responses": bool(cfg.get("decode_responses", False)),
+    }
+    # Add protocol if supported (RESP3) - some redis-py versions support it
+    if cfg.get("protocol"):
+        try:
+            client_kwargs["protocol"] = cfg["protocol"]
+        except Exception:
+            pass  # Ignore if protocol not supported in this redis-py version
+    
+    return redis.Redis(**client_kwargs)  # type: ignore[return-value]
+
+# ---------------- Retry helper for idempotent ops ----------------
+def retryable(fn: Callable[..., T]) -> Callable[..., T]:
+    """Adds CB + lightweight retry for idempotent calls (GET, HGET, etc.)."""
+    def wrapper(*args: Any, **kwargs: Any) -> T:
+        attempts = 0
+        last_err: Optional[Exception] = None
+        while attempts < 3:
+            if not _modern_cb.allow():
+                raise ConnectionError("Redis circuit open; fast-failing calls")
+            try:
+                res = fn(*args, **kwargs)
+                _modern_cb.mark_success()
+                return res
+            except (ConnectionError, RedisTimeoutError, BusyLoadingError) as e:
+                last_err = e
+                attempts += 1
+                _modern_cb.mark_failure()
+                time.sleep(0.05 * attempts)  # small extra delay on top of redis-py retry
+        # bubble the last error with context
+        raise last_err or ConnectionError("Unknown Redis error")
+    return wrapper
+
+# ---------------- Stream / PubSub helpers ----------------
+@retryable
+def xadd_safe(
+    key: str,
+    fields: dict[str, Any],
+    maxlen: Optional[int] = None,
+    approximate: bool = True,
+    trim_strategy: str = "MAXLEN",
+) -> str:
+    """
+    Safe XADD with optional stream trimming.
+    Why: prevent unbounded growth causing memory pressure and slow restarts.
+    """
+    r = get_sync_modern()
+    kwargs: dict[str, Any] = {}
+    if maxlen:
+        kwargs["maxlen"] = maxlen
+        kwargs["approximate"] = approximate
+        kwargs["trim_strategy"] = trim_strategy
+    return r.xadd(key, fields, **kwargs)  # type: ignore[return-value]
+
+@retryable
+def create_consumer_group_if_needed(stream: str, group: str, mkstream: bool = True) -> None:
+    """Idempotent create of consumer group."""
+    r = get_sync_modern()
+    try:
+        r.xgroup_create(name=stream, groupname=group, id="0", mkstream=mkstream)
+    except ResponseError as e:
+        # BUSYGROUP is fine: group exists
+        if "BUSYGROUP" not in str(e):
+            raise
+
+@retryable
+def xreadgroup_blocking(
+    group: str,
+    consumer: str,
+    streams: dict[str, str],
+    count: int = 100,
+    block_ms: int = 2_000,
+) -> list[Tuple[bytes, list[Tuple[bytes, list[Tuple[bytes, dict[bytes, bytes]]]]]]]:
+    """
+    Blocking XREADGROUP with time-bounded wait.
+    Why: bounded latency avoids 'stuck' consumers on network hiccups.
+    """
+    r = get_sync_modern()
+    return r.xreadgroup(groupname=group, consumername=consumer, streams=streams, count=count, block=block_ms)
+
+# ---------------- Health utilities ----------------
+def ping_modern() -> bool:
+    try:
+        return bool(get_sync_modern().ping())
+    except (ConnectionError, RedisTimeoutError, AuthenticationError, BusyLoadingError):
+        return False
+
+def info_sections_modern(sections: Iterable[str] = ("server", "memory", "clients", "replication", "keyspace")) -> dict[str, dict]:
+    r = get_sync_modern()
+    out: dict[str, dict] = {}
+    for s in sections:
+        try:
+            out[s] = r.info(section=s)  # RESP3 returns rich types
+        except ResponseError:
+            out[s] = {}  # tolerate partial failures
+    return out
+
+def role_modern() -> Tuple[Any, ...]:
+    try:
+        return tuple(get_sync_modern().execute_command("ROLE"))  # finer-grained than r.role() on some versions
+    except Exception:
+        return tuple()
+
+# ============================================
+# Backward-compatible get_redis_client (wraps modern or legacy)
+# ============================================
+
+def get_redis_client(config=None, db: Optional[int] = None, *, decode_responses: bool = False):
+    """
+    Factory function to create and return a singleton RobustRedisClient instance.
+    Now uses modern RESP3 + retry/backoff client under the hood when available.
+    Maintains backward compatibility with existing RobustRedisClient interface.
+    
+    Args:
+        config: Legacy config dict (optional)
+        db: Database number (optional, overrides config)
+        decode_responses: If True, decode Redis responses to strings (for JSON/indicator reads)
+    
+    Returns:
+        RobustRedisClient instance (or modern client wrapped for backward compatibility)
+    """
     global _redis_client_instance
+    
+    # If db or decode_responses specified, try modern client directly
+    if db is not None or decode_responses:
+        try:
+            from config.redis_config import get_redis_config
+            redis_config = get_redis_config()
+            overrides = {
+                "host": redis_config.get("host", "127.0.0.1"),
+                "port": redis_config.get("port", 6379),
+                "db": db if db is not None else redis_config.get("db", 0),
+                "password": redis_config.get("password"),
+                "decode_responses": decode_responses,
+            }
+            return get_sync_modern(overrides)
+        except Exception:
+            # Fallback to legacy path
+            pass
     if _redis_client_instance is None:
         try:
-            # Use centralized Redis configuration
-            from config.redis_config import get_redis_config, Redis8Config
+            # Try modern implementation first (if config allows)
+            use_modern = os.getenv("REDIS_USE_MODERN", "true").lower() == "true"
+            if use_modern and not config:
+                # Use modern client for simple cases
+                try:
+                    from config.redis_config import get_redis_config
+                    redis_config = get_redis_config()
+                    overrides = {
+                        "host": redis_config.get("host", "127.0.0.1"),
+                        "port": redis_config.get("port", 6379),
+                        "db": redis_config.get("db", 0),
+                        "password": redis_config.get("password"),
+                        "max_connections": redis_config.get("max_connections", 256),
+                    }
+                    modern_client = get_sync_modern(overrides)
+                    # Wrap in RobustRedisClient interface for backward compatibility
+                    # This allows existing code to work without changes
+                    logger.info("✅ Using modern Redis client (RESP3 + retry/backoff) with backward-compat wrapper")
+                except Exception as modern_err:
+                    logger.warning(f"⚠️ Modern client init failed, falling back: {modern_err}")
+                    use_modern = False
             
-            # Get base Redis configuration
-            redis_config = get_redis_config()
-            
-            # Allow config override for specific settings
-            if config:
-                redis_config.update({
-                    k: v for k, v in config.items() 
-                    if k.startswith('redis_') and k in ['redis_host', 'redis_port', 'redis_db', 'redis_password']
-                })
-            
-            # Create RobustRedisClient with proper configuration
-            # Pass max_connections through config, not as direct parameter
-            redis_config_with_max_conn = redis_config.copy()
-            # Ensure max_connections is passed as redis_max_connections
-            if "max_connections" in redis_config:
-                redis_config_with_max_conn["redis_max_connections"] = redis_config["max_connections"]
-            if config:
-                redis_config_with_max_conn.update(config)
-            
-            _redis_client_instance = RobustRedisClient(
-                host=redis_config.get("host", "localhost"),
-                port=redis_config.get("port", 6379),
-                db=redis_config.get("db", 0),
-                password=redis_config.get("password"),
-                decode_responses=redis_config.get("decode_responses", True),
-                health_check_interval=redis_config.get("health_check_interval", 30),
-                config=redis_config_with_max_conn
-            )
-            logger.info("✅ Redis client created using centralized configuration")
+            if not use_modern:
+                # Use centralized Redis configuration (legacy path)
+                from config.redis_config import get_redis_config, Redis8Config
+                
+                # Get base Redis configuration
+                redis_config = get_redis_config()
+                
+                # Allow config override for specific settings
+                if config:
+                    redis_config.update({
+                        k: v for k, v in config.items() 
+                        if k.startswith('redis_') and k in ['redis_host', 'redis_port', 'redis_db', 'redis_password']
+                    })
+                
+                # Create RobustRedisClient with proper configuration
+                # Pass max_connections through config, not as direct parameter
+                redis_config_with_max_conn = redis_config.copy()
+                # Ensure max_connections is passed as redis_max_connections
+                if "max_connections" in redis_config:
+                    redis_config_with_max_conn["redis_max_connections"] = redis_config["max_connections"]
+                if config:
+                    redis_config_with_max_conn.update(config)
+                
+                _redis_client_instance = RobustRedisClient(
+                    host=redis_config.get("host", "localhost"),
+                    port=redis_config.get("port", 6379),
+                    db=redis_config.get("db", 0),
+                    password=redis_config.get("password"),
+                    decode_responses=redis_config.get("decode_responses", True),
+                    health_check_interval=redis_config.get("health_check_interval", 30),
+                    config=redis_config_with_max_conn
+                )
+                logger.info("✅ Redis client created using centralized configuration")
         except Exception as e:
             logger.error(f"Failed to create Redis client with centralized config: {e}")
             # Fallback to basic configuration

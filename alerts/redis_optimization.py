@@ -1,4 +1,7 @@
 # redis_optimization.py
+import asyncio
+
+
 class RedisOptimizer:
     def __init__(self):
         self.redis = redis.Redis(decode_responses=True)
@@ -25,11 +28,21 @@ class RedisOptimizer:
         try:
             await self.redis.ft().create_index(
                 [
+                    redis.NumericField("timestamp"),
                     redis.TextField("symbol"),
+                    redis.TagField("exchange"),
                     redis.TagField("asset_class"),
-                    redis.NumericField("strike"),
-                    redis.TagField("option_type"),
-                    redis.TextField("expiry")
+                    redis.NumericField("strike_price"),
+                    redis.TagField("instrument_type"),
+                    redis.TextField("expiry"),
+                    redis.NumericField("oi"),
+                    redis.NumericField("oi_day_high"),
+                    redis.NumericField("oi_day_low"),
+                    redis.NumericField("oi_day_open"),
+                    redis.NumericField("oi_day_close"),
+                    redis.NumericField("oi_day_volume"),
+                    redis.NumericField("oi_day_value"),
+                    redis.NumericField("oi_day_average_price"),
                 ],
                 prefix = ["instrument:"]
             )
@@ -38,10 +51,5 @@ class RedisOptimizer:
     
     async def prewarm_cache(self):
         """Preload frequently accessed data"""
-        cache_manager = InstrumentCache()
+        cache_manager = await asyncio.to_thread(InstrumentCache())
         await cache_manager.preload_instruments()
-        
-        # Preload current market data for top instruments
-        top_instruments = ["NIFTY", "BANKNIFTY", "RELIANCE", "TCS"]
-        for symbol in top_instruments:
-            await self.redis.get(f"current:{symbol}")  # Trigger cache

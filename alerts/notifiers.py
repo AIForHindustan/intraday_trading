@@ -490,7 +490,34 @@ class RedisNotifier:
             # Also publish to main alerts channel for backward compatibility
             realtime_client.publish(self.channel, message)
             
-            logger.info(f"Alert published to {success_count} channels + main channel")
+            # CRITICAL: Also publish to Redis Stream for dashboard (alerts.optimized_main)
+            # HighPerformanceAlertStream expects binary data in b"data" field using orjson
+            try:
+                # Use orjson for binary JSON encoding (matches HighPerformanceAlertStream format)
+                try:
+                    import orjson
+                    binary_data = orjson.dumps(enhanced_alert)
+                    stream_result = realtime_client.xadd(
+                        'alerts:stream',
+                        {b'data': binary_data},  # Binary data using orjson - matches HighPerformanceAlertStream.consume_alerts
+                        maxlen=10000,
+                        approximate=True
+                    )
+                except ImportError:
+                    # Fallback to json if orjson not available
+                    import json
+                    binary_data = json.dumps(enhanced_alert).encode('utf-8')
+                    stream_result = realtime_client.xadd(
+                        'alerts:stream',
+                        {b'data': binary_data},  # Binary data (utf-8 encoded JSON)
+                        maxlen=10000,
+                        approximate=True
+                    )
+                logger.debug(f"✅ Alert published to alerts:stream (dashboard) - ID: {stream_result}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to publish to alerts:stream (dashboard may be static): {e}")
+            
+            logger.info(f"Alert published to {success_count} channels + main channel + alerts:stream")
             return success_count > 0
             
         except Exception as e:
@@ -702,10 +729,15 @@ class HumanReadableAlertTemplates:
     
     @classmethod
     def format_telegram_alert(cls, alert_data: Dict[str, Any]) -> str:
-        """Format alert data for Telegram using actionable format.
+        """
+        Format alert data for Telegram using actionable format.
         
         All production alerts should have trading parameters. If missing, actionable format
         will handle gracefully with defaults.
+        
+        CRITICAL: Dashboard URL is hardcoded for consumer access:
+        - Dashboard URL: http://122.167.83.133:53056
+        - DO NOT CHANGE without approval
         """
         try:
             # Resolve token to symbol if needed (fallback if not resolved earlier)
@@ -772,8 +804,43 @@ class HumanReadableAlertTemplates:
             volume_ratio = float(signal.get('volume_ratio', 1.0))
             risk_summary = signal.get('risk_summary', '')
             
-            # Format news context (integrated into main template)
+            # ✅ Extract indicators and Greeks from signal data
+            # Indicators can be in: signal['indicators'], signal['rsi'], etc., or nested
+            indicators = signal.get('indicators', {})
+            if not isinstance(indicators, dict):
+                indicators = {}
+            # Also check top-level indicator fields
+            if not indicators.get('rsi'):
+                indicators['rsi'] = signal.get('rsi')
+            if not indicators.get('atr'):
+                indicators['atr'] = signal.get('atr')
+            if not indicators.get('vwap'):
+                indicators['vwap'] = signal.get('vwap')
+            if not indicators.get('ema_20'):
+                indicators['ema_20'] = signal.get('ema_20')
+            if not indicators.get('macd'):
+                indicators['macd'] = signal.get('macd')
+            
+            # Greeks can be in: signal['indicators']['greeks'], signal['delta'], etc.
+            greeks = {}
+            if isinstance(indicators.get('greeks'), dict):
+                greeks = indicators['greeks']
+            else:
+                # Try top-level fields
+                for greek in ['delta', 'gamma', 'theta', 'vega', 'rho']:
+                    if signal.get(greek) is not None:
+                        greeks[greek] = signal.get(greek)
+            
+            # Format sections
+            indicators_section = cls._format_indicators_section(indicators)
+            greeks_section = cls._format_greeks_section(greeks, symbol)
             news_section = cls._format_news_section(signal)
+            
+            # CRITICAL: Dashboard URL for consumer access (external via Cloudflare Tunnel)
+            # Dashboard runs on port 53056, exposed via Cloudflare Tunnel (primary) with Mullvad fallback
+            # Public URL: https://award-inf-filed-cruz.trycloudflare.com
+            DASHBOARD_URL = "https://award-inf-filed-cruz.trycloudflare.com"  # Public Cloudflare Tunnel URL (free, unlimited bandwidth)
+            dashboard_link = f"📊 <a href='{DASHBOARD_URL}'>View Dashboard</a>"
             
             # Build actionable alert with Telegram HTML formatting
             if has_trading_params:
@@ -795,9 +862,12 @@ class HumanReadableAlertTemplates:
 <b>VOLUME RATIO:</b> {volume_ratio:.1f}x
 <b>LAST PRICE:</b> ₹{last_price:.2f}
 
+{indicators_section}
+{greeks_section}
 {news_section}
 {risk_summary}
 
+{dashboard_link}
 ⏰ <b>Time:</b> {datetime.now().strftime('%H:%M:%S')}
                 """.strip()
             else:
@@ -813,9 +883,12 @@ class HumanReadableAlertTemplates:
 
 {trading_instruction}
 
+{indicators_section}
+{greeks_section}
 {news_section}
 {risk_summary}
 
+{dashboard_link}
 ⏰ <b>Time:</b> {datetime.now().strftime('%H:%M:%S')}
                 """.strip()
             
@@ -891,6 +964,148 @@ class HumanReadableAlertTemplates:
             return ""
         except Exception as e:
             logger.debug(f"Error formatting news context HTML: {e}")
+            return ""
+    
+    @classmethod
+    def _format_indicators_section(cls, indicators: Dict[str, Any]) -> str:
+        """Format technical indicators section for actionable alerts (HTML format for Telegram)."""
+        if not indicators or not isinstance(indicators, dict):
+            return ""
+        
+        try:
+            indicator_lines = []
+            
+            # RSI
+            rsi = indicators.get('rsi')
+            if rsi is not None:
+                try:
+                    rsi_val = float(rsi)
+                    rsi_signal = "🟢" if rsi_val > 70 else "🔴" if rsi_val < 30 else "🟡"
+                    indicator_lines.append(f"<b>RSI:</b> {rsi_val:.1f} {rsi_signal}")
+                except (ValueError, TypeError):
+                    pass
+            
+            # MACD
+            macd = indicators.get('macd')
+            if macd is not None:
+                try:
+                    if isinstance(macd, dict):
+                        macd_val = macd.get('macd', macd.get('value', 0))
+                        signal_val = macd.get('signal', 0)
+                        histogram = macd.get('histogram', 0)
+                        indicator_lines.append(f"<b>MACD:</b> {macd_val:.2f} | Signal: {signal_val:.2f} | Hist: {histogram:.2f}")
+                    else:
+                        indicator_lines.append(f"<b>MACD:</b> {float(macd):.2f}")
+                except (ValueError, TypeError):
+                    pass
+            
+            # EMAs
+            ema_20 = indicators.get('ema_20')
+            ema_50 = indicators.get('ema_50')
+            if ema_20 is not None or ema_50 is not None:
+                ema_parts = []
+                if ema_20 is not None:
+                    try:
+                        ema_parts.append(f"EMA20: {float(ema_20):.2f}")
+                    except (ValueError, TypeError):
+                        pass
+                if ema_50 is not None:
+                    try:
+                        ema_parts.append(f"EMA50: {float(ema_50):.2f}")
+                    except (ValueError, TypeError):
+                        pass
+                if ema_parts:
+                    indicator_lines.append(f"<b>EMAs:</b> {' | '.join(ema_parts)}")
+            
+            # ATR
+            atr = indicators.get('atr')
+            if atr is not None:
+                try:
+                    indicator_lines.append(f"<b>ATR:</b> {float(atr):.2f}")
+                except (ValueError, TypeError):
+                    pass
+            
+            # VWAP
+            vwap = indicators.get('vwap')
+            if vwap is not None:
+                try:
+                    indicator_lines.append(f"<b>VWAP:</b> {float(vwap):.2f}")
+                except (ValueError, TypeError):
+                    pass
+            
+            if indicator_lines:
+                return "<b>📊 INDICATORS:</b>\n" + "\n".join(indicator_lines)
+            return ""
+            
+        except Exception as e:
+            logger.debug(f"Error formatting indicators section: {e}")
+            return ""
+    
+    @classmethod
+    def _format_greeks_section(cls, greeks: Dict[str, Any], symbol: str) -> str:
+        """Format Options Greeks section for actionable alerts (HTML format for Telegram)."""
+        if not greeks or not isinstance(greeks, dict):
+            return ""
+        
+        # Only show Greeks for F&O instruments (options/futures)
+        is_option = any(x in symbol.upper() for x in ['CE', 'PE', 'FUT']) or 'NFO:' in symbol.upper()
+        if not is_option:
+            return ""
+        
+        try:
+            greek_lines = []
+            
+            # Delta
+            delta = greeks.get('delta')
+            if delta is not None:
+                try:
+                    delta_val = float(delta)
+                    greek_lines.append(f"<b>Delta:</b> {delta_val:.3f}")
+                except (ValueError, TypeError):
+                    pass
+            
+            # Gamma
+            gamma = greeks.get('gamma')
+            if gamma is not None:
+                try:
+                    gamma_val = float(gamma)
+                    greek_lines.append(f"<b>Gamma:</b> {gamma_val:.4f}")
+                except (ValueError, TypeError):
+                    pass
+            
+            # Theta
+            theta = greeks.get('theta')
+            if theta is not None:
+                try:
+                    theta_val = float(theta)
+                    greek_lines.append(f"<b>Theta:</b> {theta_val:.2f}")
+                except (ValueError, TypeError):
+                    pass
+            
+            # Vega
+            vega = greeks.get('vega')
+            if vega is not None:
+                try:
+                    vega_val = float(vega)
+                    greek_lines.append(f"<b>Vega:</b> {vega_val:.2f}")
+                except (ValueError, TypeError):
+                    pass
+            
+            # Rho
+            rho = greeks.get('rho')
+            if rho is not None:
+                try:
+                    rho_val = float(rho)
+                    greek_lines.append(f"<b>Rho:</b> {rho_val:.2f}")
+                except (ValueError, TypeError):
+                    pass
+            
+            if greek_lines:
+                return "<b>📈 GREEKS:</b>\n" + "\n".join(greek_lines)
+            return ""
+            
+        except Exception as e:
+            logger.debug(f"Error formatting Greeks section: {e}")
             return ""
     
     @classmethod

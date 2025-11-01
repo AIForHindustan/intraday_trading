@@ -515,6 +515,129 @@ class AlertValidator:
             self.logger.error(f"Error calculating metrics for {symbol}: {e}")
             return {}
     
+    def load_indicators_from_redis(self, symbol: str) -> Dict[str, Any]:
+        """
+        Load technical indicators from Redis for enhanced validation.
+        
+        Redis Storage Schema (from redis_storage.py):
+        - DB 1 (realtime): indicators:{symbol}:{indicator_name}
+        - Format: Simple indicators (RSI, EMA, ATR, VWAP) as string/number
+                  Complex indicators (MACD, BB) as JSON with {'value': {...}, ...}
+        - Fallback DBs: DB 4 and DB 5
+        """
+        indicators = {}
+        try:
+            # Get realtime client (DB 1)
+            redis_db1 = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis_client
+            if not redis_db1:
+                return indicators
+            
+            # Normalize symbol
+            symbol_variants = [
+                symbol,
+                symbol.split(':')[-1] if ':' in symbol else symbol,
+                f"NFO:{symbol.split(':')[-1]}" if ':' not in symbol else symbol,
+            ]
+            
+            # Indicator names (from HybridCalculations)
+            indicator_names = ['rsi', 'atr', 'vwap', 'ema_20', 'ema_50', 'macd', 'bollinger_bands']
+            
+            for variant in symbol_variants:
+                for indicator_name in indicator_names:
+                    redis_key = f"indicators:{variant}:{indicator_name}"
+                    try:
+                        value = redis_db1.get(redis_key)
+                        if value:
+                            # Handle bytes
+                            if isinstance(value, bytes):
+                                value = value.decode('utf-8')
+                            
+                            # Parse JSON for complex indicators
+                            try:
+                                parsed = json.loads(value)
+                                if isinstance(parsed, dict):
+                                    indicators[indicator_name] = parsed.get('value', parsed)
+                                else:
+                                    indicators[indicator_name] = parsed
+                            except (json.JSONDecodeError, TypeError):
+                                # Simple numeric value
+                                try:
+                                    indicators[indicator_name] = float(value)
+                                except (ValueError, TypeError):
+                                    indicators[indicator_name] = value
+                        if indicator_name in indicators:
+                            break  # Found indicator for this variant
+                    except Exception:
+                        continue
+                if indicators:
+                    break  # Found indicators for this variant
+        except Exception as e:
+            logger.debug(f"Error loading indicators from Redis for {symbol}: {e}")
+        
+        return indicators
+    
+    def load_greeks_from_redis(self, symbol: str) -> Dict[str, Any]:
+        """
+        Load Options Greeks from Redis for enhanced validation.
+        
+        Redis Storage Schema (from redis_storage.py):
+        - DB 1 (realtime): indicators:{symbol}:greeks (combined) or indicators:{symbol}:{greek} (individual)
+        - Format: Combined as JSON with {'value': {'delta': ..., ...}, ...}
+                  Individual as float string
+        - Fallback DBs: DB 4 and DB 5
+        """
+        greeks = {}
+        try:
+            # Only for F&O instruments
+            if not any(x in symbol.upper() for x in ['CE', 'PE', 'FUT']):
+                return greeks
+            
+            # Get realtime client (DB 1)
+            redis_db1 = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis_client
+            if not redis_db1:
+                return greeks
+            
+            # Normalize symbol
+            symbol_variants = [
+                symbol,
+                symbol.split(':')[-1] if ':' in symbol else symbol,
+                f"NFO:{symbol.split(':')[-1]}" if ':' not in symbol else symbol,
+            ]
+            
+            for variant in symbol_variants:
+                # Try combined greeks first
+                greeks_key = f"indicators:{variant}:greeks"
+                try:
+                    greeks_data = redis_db1.get(greeks_key)
+                    if greeks_data:
+                        if isinstance(greeks_data, bytes):
+                            greeks_data = greeks_data.decode('utf-8')
+                        parsed = json.loads(greeks_data) if isinstance(greeks_data, str) else greeks_data
+                        if isinstance(parsed, dict):
+                            greeks.update(parsed.get('value', parsed))
+                        break
+                except Exception:
+                    pass
+                
+                # Try individual Greeks
+                for greek_name in ['delta', 'gamma', 'theta', 'vega', 'rho']:
+                    greek_key = f"indicators:{variant}:{greek_name}"
+                    try:
+                        greek_value = redis_db1.get(greek_key)
+                        if greek_value:
+                            if isinstance(greek_value, bytes):
+                                greek_value = greek_value.decode('utf-8')
+                            greeks[greek_name] = float(greek_value)
+                    except Exception:
+                        continue
+                
+                if greeks:
+                    break
+        except Exception as e:
+            logger.debug(f"Error loading Greeks from Redis for {symbol}: {e}")
+        
+        return greeks
+    
     def validate_volume_alert(self, alert_data: Dict) -> ValidationResult:
         """Pure Redis-based validation - completely independent from main system"""
         symbol = alert_data.get('symbol', 'UNKNOWN')
@@ -534,6 +657,11 @@ class AlertValidator:
             last_price = alert_data.get('last_price', 0.0)
             price_change = alert_data.get('price_change', 0.0)
             
+            # ✅ OPTIONAL: Load indicators/Greeks from Redis for enhanced validation
+            # These can be used for additional validation criteria if needed
+            indicators = self.load_indicators_from_redis(symbol)
+            greeks = self.load_greeks_from_redis(symbol)
+            
             # Simple Redis-based validation logic
             confidence_score = self._calculate_redis_based_confidence(
                 alert_data, rolling_metrics, volume_threshold, vix_regime
@@ -547,15 +675,38 @@ class AlertValidator:
             else:
                 self.performance_metrics['validations_failed'] += 1
             
-            # Create reasons
+            # Create reasons (include indicators/Greeks if available)
             reasons = [
                 f"🎯 REDIS-BASED VALIDATION for {symbol} - {alert_type}",
                 f"Volume ratio: {volume_ratio:.2f}x (threshold: {volume_threshold:.2f})",
                 f"VIX regime: {vix_regime}",
                 f"Price change: {price_change:.2f}",
                 f"Confidence: {confidence_score:.3f}",
-                f"📊 DECISION: {'✅ VALID' if is_valid else '❌ REJECTED'}"
             ]
+            
+            # Add indicators if available
+            if indicators:
+                indicator_summary = []
+                if indicators.get('rsi'):
+                    indicator_summary.append(f"RSI: {indicators['rsi']:.1f}")
+                if indicators.get('atr'):
+                    indicator_summary.append(f"ATR: {indicators['atr']:.2f}")
+                if indicators.get('vwap'):
+                    indicator_summary.append(f"VWAP: {indicators['vwap']:.2f}")
+                if indicator_summary:
+                    reasons.append(f"Indicators: {', '.join(indicator_summary)}")
+            
+            # Add Greeks if available
+            if greeks:
+                greek_summary = []
+                if greeks.get('delta'):
+                    greek_summary.append(f"Δ: {greeks['delta']:.3f}")
+                if greeks.get('gamma'):
+                    greek_summary.append(f"Γ: {greeks['gamma']:.4f}")
+                if greek_summary:
+                    reasons.append(f"Greeks: {', '.join(greek_summary)}")
+            
+            reasons.append(f"📊 DECISION: {'✅ VALID' if is_valid else '❌ REJECTED'}")
             
             # Store validation result
             validation_metrics = {

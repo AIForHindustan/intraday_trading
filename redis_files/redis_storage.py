@@ -12,6 +12,13 @@ Volume Baseline Storage:
 - Data: Aggregated averages across multiple trading days
 - Coverage: 288 time buckets (00:00-23:55) for 6,085+ symbols
 - Usage: Pattern detection volume ratio calculations
+
+MIGRATION NOTE: Replace direct redis.Redis(...) calls with get_redis_client(db=N)
+Example:
+  BEFORE: r = redis.Redis(host='localhost', port=6379, db=1)
+  AFTER:  from redis_files.redis_client import get_redis_client
+          r = get_redis_client()  # Uses singleton with RESP3 + retry/backoff
+          # Or for specific DB: r = get_redis_client().get_client(1)
 """
 
 import json
@@ -1181,6 +1188,9 @@ class RedisStorage:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Compile results
+        # Base tasks: rsi(0), ema_5(1), ema_10(2), ema_20(3), ema_50(4), ema_100(5), ema_200(6), 
+        # macd(7), bb(8), atr(9), vwap(10), volume(11), missing_indicators(12), volume_profile(13)
+        base_task_count = 14
         indicator_results = {
             'rsi': results[0] if not isinstance(results[0], Exception) else 50.0,
             # ✅ ALL EMA WINDOWS: Include all EMA periods in cached results
@@ -1194,8 +1204,32 @@ class RedisStorage:
             'bollinger_bands': results[8] if not isinstance(results[8], Exception) else {},
             'atr': results[9] if not isinstance(results[9], Exception) else 0.0,
             'vwap': results[10] if not isinstance(results[10], Exception) else 0.0,
-            'volume': results[11] if not isinstance(results[11], Exception) else {}
+            'volume': results[11] if not isinstance(results[11], Exception) else {},
+            'volume_profile': results[13] if len(results) > 13 and not isinstance(results[13], Exception) else {}
         }
+        
+        # Add F&O Greeks and basic data if option symbol (results at positions after base_task_count)
+        # For options: fno_basic_data is at index base_task_count, greeks at base_task_count + 1
+        if self._is_option_symbol(symbol) and len(results) > base_task_count:
+            fno_idx = base_task_count
+            greeks_idx = base_task_count + 1
+            
+            if len(results) > fno_idx:
+                fno_data = results[fno_idx] if not isinstance(results[fno_idx], Exception) else {}
+                if fno_data:
+                    indicator_results['fno_basic'] = fno_data
+            
+            if len(results) > greeks_idx:
+                greeks_data = results[greeks_idx] if not isinstance(results[greeks_idx], Exception) else {}
+                if greeks_data:
+                    indicator_results['greeks'] = greeks_data
+                    # Also store individual Greeks for easy access
+                    if isinstance(greeks_data, dict):
+                        indicator_results['delta'] = greeks_data.get('delta', 0.0)
+                        indicator_results['gamma'] = greeks_data.get('gamma', 0.0)
+                        indicator_results['theta'] = greeks_data.get('theta', 0.0)
+                        indicator_results['vega'] = greeks_data.get('vega', 0.0)
+                        indicator_results['rho'] = greeks_data.get('rho', 0.0)
         
         # Publish comprehensive indicator summary
         await self.publish_indicator(symbol, 'comprehensive', {
@@ -1222,8 +1256,8 @@ class RedisStorage:
                 for indicator_name, value in indicators.items():
                     redis_key = f"indicators:{symbol}:{indicator_name}"
                     
-                    if isinstance(value, dict):
-                        # Complex indicators (MACD, Bollinger Bands, Volume)
+                    if isinstance(value, dict) and value:  # Non-empty dict
+                        # Complex indicators (MACD, Bollinger Bands, Volume, Volume Profile POC, Greeks)
                         indicator_data = {
                             'value': value,
                             'timestamp': int(time.time() * 1000),
@@ -1231,11 +1265,24 @@ class RedisStorage:
                             'indicator_type': indicator_name
                         }
                         await self.redis.store_by_data_type("analysis_cache", redis_key, json.dumps(indicator_data))
-                    else:
-                        # Simple indicators (RSI, EMA, ATR, VWAP)
+                    elif value is not None and value != {}:  # Simple indicators (RSI, EMA, ATR, VWAP, individual Greeks)
                         await self.redis.store_by_data_type("analysis_cache", redis_key, str(value))
                 
-                logger.info(f"✅ Stored {len(indicators)} indicators in Redis cache for {symbol}")
+                # Additionally store volume profile POC separately for reversal detection
+                if 'volume_profile' in indicators and isinstance(indicators['volume_profile'], dict):
+                    vp_data = indicators['volume_profile']
+                    if vp_data.get('poc_price'):
+                        # Store POC price individually for easy dashboard access
+                        poc_key = f"indicators:{symbol}:poc_price"
+                        await self.redis.store_by_data_type("analysis_cache", poc_key, str(vp_data['poc_price']))
+                    if vp_data.get('value_area_high'):
+                        vah_key = f"indicators:{symbol}:value_area_high"
+                        await self.redis.store_by_data_type("analysis_cache", vah_key, str(vp_data['value_area_high']))
+                    if vp_data.get('value_area_low'):
+                        val_key = f"indicators:{symbol}:value_area_low"
+                        await self.redis.store_by_data_type("analysis_cache", val_key, str(vp_data['value_area_low']))
+                
+                logger.info(f"✅ Stored {len(indicators)} indicators in Redis cache for {symbol} (including volume profile POC and Greeks)")
                 
         except Exception as e:
             logger.error(f"Error publishing indicators for {symbol}: {e}")

@@ -110,15 +110,25 @@ class BaseCrawler(ABC):
                     f"Has store_by_data_type: {hasattr(self.redis_client, 'store_by_data_type')}"
                 )
             else:
-                self.redis_client = redis.Redis(
-                    host=self.config.redis_host,
-                    port=self.config.redis_port,
-                    db=self.config.redis_db,
-                    socket_connect_timeout=5,
-                    socket_timeout=5,
-                    retry_on_timeout=True,
-                    health_check_interval=30,
-                )
+                # Use centralized get_redis_client for better connection management
+                from redis_files.redis_client import get_redis_client
+                try:
+                    # Try to get shared client instance
+                    self.redis_client = get_redis_client()
+                    # If we need a specific DB, use get_client method
+                    if hasattr(self.redis_client, 'get_client'):
+                        self.redis_client = self.redis_client.get_client(self.config.redis_db)
+                except Exception:
+                    # Fallback to direct Redis client if get_redis_client fails
+                    self.redis_client = redis.Redis(
+                        host=self.config.redis_host,
+                        port=self.config.redis_port,
+                        db=self.config.redis_db,
+                        socket_connect_timeout=5,
+                        socket_timeout=5,
+                        retry_on_timeout=True,
+                        health_check_interval=30,
+                    )
                 logger.info("Basic Redis connection established")
                 logger.info(f"Redis client type: {type(self.redis_client).__name__}")
                 logger.info(

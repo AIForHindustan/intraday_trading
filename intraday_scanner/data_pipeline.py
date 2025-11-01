@@ -755,6 +755,19 @@ class DataPipeline:
                                 self.logger.info(f"🔍 DEBUG: Processing {len(patterns)} patterns for {symbol}")
                                 for pattern in patterns:
                                     pattern['symbol'] = symbol
+                                    # CRITICAL: Include all calculated indicators in the pattern payload
+                                    # This ensures indicators are available in alert payload for dashboard
+                                    if indicators and isinstance(indicators, dict):
+                                        # Ensure indicators dict exists in pattern
+                                        if 'indicators' not in pattern or not isinstance(pattern.get('indicators'), dict):
+                                            pattern['indicators'] = {}
+                                        # Merge calculated indicators into pattern
+                                        pattern['indicators'].update(indicators)
+                                        # Also add top-level fields for easy access
+                                        for indicator_key in ['rsi', 'macd', 'ema_5', 'ema_10', 'ema_20', 'ema_50', 'ema_100', 'ema_200', 
+                                                             'atr', 'vwap', 'bollinger_bands', 'volume_profile', 'volume_ratio', 'price_change']:
+                                            if indicator_key in indicators and indicator_key not in pattern:
+                                                pattern[indicator_key] = indicators[indicator_key]
                                     self.logger.info(f"🔍 DEBUG: Calling alert_manager.send_alert for {symbol}: {pattern.get('pattern', 'UNKNOWN')}")
                                     alert_sent = self.alert_manager.send_alert(pattern)
                                     if alert_sent:

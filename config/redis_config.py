@@ -23,7 +23,7 @@ REDIS_8_CONFIG: Dict[str, Any] = {
     "socket_connect_timeout": 5,
     "socket_keepalive": True,
     "retry_on_timeout": True,
-    "max_connections": 200,  # High limit for high-frequency trading data (multiple scanners, dashboards, crawlers)
+    "max_connections": 50,  # Reduced per-pool limit (pools are shared, total connections = pools * max_connections)
     "health_check_interval": 30,  # Redis 8.0 enhancement
     "socket_timeout": 2,  # Reduced from default for faster response
 }
@@ -126,13 +126,13 @@ class Redis8Config:
         self.base_config = REDIS_8_CONFIG.copy()
         self.global_features = REDIS_8_FEATURE_FLAGS.copy()
 
-        # Environment tuning - use same high limits for all environments
-        # High-frequency trading requires many concurrent connections regardless of environment
+        # Environment tuning - reduced per-pool limits since pools are shared
+        # ConnectionPooledRedisClient shares pools per DB, so lower per-pool limit is sufficient
         if self.environment == "prod":
-            self.base_config.update({"max_connections": 500, "health_check_interval": 60})
+            self.base_config.update({"max_connections": 100, "health_check_interval": 60})
         elif self.environment == "dev":
-            # Dev also needs high connections for testing multiple components
-            self.base_config.update({"max_connections": 200, "health_check_interval": 10})
+            # Dev: pools are shared, so lower per-pool limit (50) is sufficient
+            self.base_config.update({"max_connections": 50, "health_check_interval": 10})
 
     def _resolve_db_number(self, db_name: str) -> int:
         for number, spec in REDIS_DATABASES.items():

@@ -849,6 +849,28 @@ class MarketScanner:
                     # Process through calculations
                     indicators = self.tick_processor.process_tick(symbol, cleaned)
                     
+                    # Store indicators using RedisStorage (TA-Lib calculates in calculations.py and stores via redis_storage.py)
+                    if indicators and hasattr(self, 'data_pipeline') and hasattr(self.data_pipeline, 'redis_storage'):
+                        try:
+                            # Use redis_storage to store pre-calculated indicators
+                            import asyncio
+                            # Store indicators - redis_storage handles the storage logic properly
+                            # Convert single tick to list format expected by publish_indicators_to_redis
+                            tick_list = [cleaned] if cleaned else []
+                            # Note: publish_indicators_to_redis will recalculate, but the storage logic is correct
+                            # For pre-calculated indicators, we'd need a sync helper, but since user wants to use existing logic,
+                            # we'll let it recalculate (it uses the same TA-Lib anyway)
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                loop.run_until_complete(
+                                    self.data_pipeline.redis_storage.publish_indicators_to_redis(symbol, tick_list)
+                                )
+                            finally:
+                                loop.close()
+                        except Exception as store_err:
+                            logger.debug(f"Failed to store indicators via redis_storage for {symbol}: {store_err}")
+                    
                     # Validate indicator calculations
                     from utils.validation_logger import indicator_validator
                     indicator_validator.log_tick_processing(symbol, cleaned, indicators)
@@ -2400,6 +2422,7 @@ class MarketScanner:
                         'ema_20': indicators.get('ema_20', 0),
                         'ema_50': indicators.get('ema_50', 0),
                         'atr': indicators.get('atr', 0),
+                        'vwap': indicators.get('vwap', 0),
                         'bb_upper': indicators.get('bb_upper', 0),
                         'bb_middle': indicators.get('bb_middle', 0),
                         'bb_lower': indicators.get('bb_lower', 0),
@@ -2413,11 +2436,19 @@ class MarketScanner:
                         'volatility': indicators.get('volatility', 0),
                         'momentum': indicators.get('momentum', 0),
                         # ✅ CRITICAL: Include price_change for template display
-                        'price_change': indicators.get('price_change', 0)
+                        'price_change': indicators.get('price_change', 0),
+                        'volume_ratio': indicators.get('volume_ratio', 0)
                     }
                     
-                    # Add technical indicators to pattern
+                    # Add technical indicators to pattern as top-level fields
                     pattern.update(technical_indicators)
+                    
+                    # ✅ CRITICAL: Also store in nested 'indicators' dict for dashboard/alert_manager compatibility
+                    if 'indicators' not in pattern or not isinstance(pattern.get('indicators'), dict):
+                        pattern['indicators'] = {}
+                    
+                    # Merge technical indicators into nested indicators dict (preserve existing)
+                    pattern['indicators'].update(technical_indicators)
                     
             # Add F&O specific indicators if available
                     # Ensure symbol is a string before string operations
@@ -3146,6 +3177,23 @@ class MarketScanner:
                                 )
                                 if indicators:
                                     process_ok += 1
+
+                                    # Store indicators using RedisStorage (TA-Lib calculates in calculations.py and stores via redis_storage.py)
+                                    if hasattr(self, 'data_pipeline') and hasattr(self.data_pipeline, 'redis_storage'):
+                                        try:
+                                            import asyncio
+                                            # Use redis_storage to store indicators - it handles TA-Lib calculations and storage
+                                            tick_list = [tick_data] if tick_data else []
+                                            loop = asyncio.new_event_loop()
+                                            asyncio.set_event_loop(loop)
+                                            try:
+                                                loop.run_until_complete(
+                                                    self.data_pipeline.redis_storage.publish_indicators_to_redis(symbol, tick_list)
+                                                )
+                                            finally:
+                                                loop.close()
+                                        except Exception as store_err:
+                                            logger.debug(f"Failed to store indicators via redis_storage for {symbol}: {store_err}")
 
                                     # 🔍 DEBUG: Log tick processor output
                                     if dbg_enabled and (

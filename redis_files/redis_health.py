@@ -1,27 +1,126 @@
 #!/usr/bin/env python3
 """
-Redis Health and Bucket Checks
+Redis Health and Bucket Checks (Enhanced with modern client support)
 
 Usage:
-  .venv/bin/python core/data/redis_health.py --host localhost --port 6379
+  .venv/bin/python redis_files/redis_health.py --host localhost --port 6379
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import sys
 import time
+import os
 from pathlib import Path
+from typing import Any
+
+# Ensure os is available
+import os as _os
 
 # Add project root to path for imports
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-def main():
+def _fmt_bytes(n: int) -> str:
+    """Format bytes to human-readable string"""
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f}{u}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="localhost")
-    parser.add_argument("--port", type=int, default=6379)
+    parser.add_argument("--host", default=os.getenv("REDIS_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("REDIS_PORT", "6379")))
     args = parser.parse_args()
 
+    print("== Redis Health ==")
+    print(f"Target: {args.host}:{args.port} db={os.getenv('REDIS_DB_DEFAULT','0')}")
+    
+    # Try modern health utilities first
+    try:
+        from redis_files.redis_client import (
+            ping_modern,
+            info_sections_modern,
+            role_modern,
+            create_consumer_group_if_needed,
+            xadd_safe,
+            get_redis_client,
+        )
+        
+        ok = ping_modern()
+        print(f"PING: {'OK' if ok else 'FAIL'}")
+        if not ok:
+            return 2
+
+        data = info_sections_modern()
+        mem = data.get("memory", {})
+        clients = data.get("clients", {})
+        keyspace = data.get("keyspace", {})
+        server = data.get("server", {})
+
+        print(f"Redis {server.get('redis_version','?')} mode={server.get('redis_mode','?')} proto={server.get('proto','?')}")
+        used = int(mem.get("used_memory", 0))
+        peak = int(mem.get("used_memory_peak", 0))
+        print(f"Memory used={_fmt_bytes(used)} peak={_fmt_bytes(peak)} clients={clients.get('connected_clients','?')}")
+
+        # Key patterns sanity
+        r0 = get_redis_client()
+        r2 = get_redis_client() if hasattr(get_redis_client(), 'get_client') else r0
+        if hasattr(r2, 'get_client'):
+            r2 = r2.get_client(2)
+        else:
+            r2 = r0
+        
+        # Try to get clients for different DBs
+        try:
+            if hasattr(r0, 'get_client'):
+                r0_db = r0.get_client(0) if hasattr(r0, 'get_client') else r0
+                r2_db = r0.get_client(2) if hasattr(r0, 'get_client') else r0
+                r4_db = r0.get_client(4) if hasattr(r0, 'get_client') else r0
+                r5_db = r0.get_client(5) if hasattr(r0, 'get_client') else r0
+            else:
+                r0_db = r0
+                r2_db = r0
+                r4_db = r0
+                r5_db = r0
+        except:
+            r0_db = r0
+            r2_db = r0
+            r4_db = r0
+            r5_db = r0
+
+        counts = {
+            "db0:session:*": len(r0_db.keys("session:*")) if hasattr(r0_db, 'keys') else 0,
+            "db2:ohlc_latest:*": len(r2_db.keys("ohlc_latest:*")) if hasattr(r2_db, 'keys') else 0,
+            "db4:ticks:*": len(r4_db.keys("ticks:*")) if hasattr(r4_db, 'keys') else 0,
+            "db5:volume_averages:*": len(r5_db.keys("volume_averages:*")) if hasattr(r5_db, 'keys') else 0,
+        }
+        print("Keyspace subset:", json.dumps(counts, indent=2))
+
+        # Streams: create + write a tiny test message (auto-trim)
+        stream = os.getenv("HEALTH_STREAM", "health:smoke")
+        group = os.getenv("HEALTH_GROUP", "ops")
+        create_consumer_group_if_needed(stream, group)
+        xid = xadd_safe(stream, {"ts": int(time.time()), "msg": "ok"}, maxlen=1000)
+        print(f"Stream write ok: {xid}")
+
+        # Role
+        print("ROLE:", role_modern())
+
+        print("OK")
+        return 0
+        
+    except ImportError:
+        # Fallback to legacy health check
+        pass
+    except Exception as e:
+        print(f"Modern health check failed: {e}, falling back to legacy")
+    
+    # Legacy fallback
     try:
         # Use consolidated Redis client
         from redis_files.redis_client import get_redis_client
@@ -34,13 +133,13 @@ def main():
             r = redis.Redis(host=args.host, port=args.port)
         except Exception as e2:
             print(f"redis-py not available: {e2}")
-            sys.exit(1)
+            return 1
     try:
         pong = r.ping()
-        print(f"PING: {pong}")
+        print(f"PING: {'OK' if pong else 'FAIL'}")
     except Exception as e:
         print(f"Cannot connect to Redis at {args.host}:{args.port}: {e}")
-        sys.exit(2)
+        return 2
 
     try:
         mem = r.info(section="memory")
