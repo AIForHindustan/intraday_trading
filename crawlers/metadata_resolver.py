@@ -6,7 +6,7 @@ Metadata Resolver for Crawlers
 Purpose:
 --------
 Centralized metadata resolution for all crawlers that write to disk.
-Provides instrument token to symbol/metadata mapping using the master token_lookup.json.
+Provides instrument token to symbol/metadata mapping using the master token_lookup_enriched.json.
 
 Dependent Scripts:
 -----------------
@@ -20,7 +20,8 @@ Dependent Scripts:
 Important Aspects:
 -----------------
 - Single source of truth for instrument metadata across all crawlers
-- Uses core/data/token_lookup.json (58MB, 231K+ instruments)
+- Uses core/data/token_lookup_enriched.json (expected 250K+ instruments, same as InstrumentMapper)
+- ✅ Updated to use token_lookup_enriched.json for consistency with InstrumentMapper
 - Provides fallback for unknown tokens
 - Thread-safe singleton pattern for performance
 - Caches metadata in memory for fast lookups
@@ -61,11 +62,14 @@ class MetadataResolver:
             self._load_token_mapping()
     
     def _load_token_mapping(self):
-        """Load token mapping from core/data/token_lookup.json"""
+        """Load token mapping from core/data/token_lookup_enriched.json"""
         try:
-            # Point to the master token_lookup.json in core/data
+            # Point to the master token_lookup_enriched.json in core/data
+            # ✅ Updated to use token_lookup_enriched.json (expected 250K+ instruments)
+            # This is the same file used by InstrumentMapper for consistency
+            # Note: If file shows fewer entries, it may need to be regenerated/updated
             project_root = Path(__file__).parent.parent
-            lookup_file = project_root / 'core' / 'data' / 'token_lookup.json'
+            lookup_file = project_root / 'core' / 'data' / 'token_lookup_enriched.json'
             
             if not lookup_file.exists():
                 logger.error(f"❌ Token lookup file not found: {lookup_file}")
@@ -79,14 +83,22 @@ class MetadataResolver:
             for token_str, info in token_data.items():
                 try:
                     token = int(token_str)
+                    # Handle token_lookup_enriched.json structure (same as InstrumentMapper)
+                    key_field = info.get("key", "")
+                    if ":" in key_field:
+                        tradingsymbol = key_field.split(":", 1)[1]
+                    else:
+                        tradingsymbol = info.get("name", "")
+                    
                     self.token_cache[token] = {
-                        'symbol': info.get('name', ''),
+                        'symbol': tradingsymbol or info.get('name', ''),
                         'exchange': info.get('exchange', 'NSE'),
                         'instrument_type': info.get('instrument_type', 'EQ'),
-                        'segment': info.get('segment', ''),
-                        'tradingsymbol': info.get('name', ''),
-                        'key': info.get('key', ''),
-                        'source': info.get('source', 'Zerodha_API')
+                        'segment': info.get('segment') or info.get('source', ''),
+                        'tradingsymbol': tradingsymbol or info.get('name', ''),
+                        'key': key_field,
+                        'source': info.get('source', 'Zerodha_API'),
+                        'name': info.get('name', '')
                     }
                 except (ValueError, TypeError):
                     # Skip non-integer keys (instrument identifiers like MCX:MCXBULLDEX26JAN31800CE)

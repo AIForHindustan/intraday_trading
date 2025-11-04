@@ -59,7 +59,7 @@ class VIXUtils:
                 if self.redis_client:
                     # Get client for realtime DB (where indices are stored)
                     try:
-                        from config.redis_config import get_database_for_data_type
+                        from redis_files.redis_config import get_database_for_data_type
                         indices_db = get_database_for_data_type("equity_prices")  # Indices stored with prices in realtime DB
                         test_client = self.redis_client.get_client(indices_db)
                         if test_client:
@@ -91,7 +91,7 @@ class VIXUtils:
             
             # Get appropriate client for realtime DB (where indices are stored)
             try:
-                from config.redis_config import get_database_for_data_type
+                from redis_files.redis_config import get_database_for_data_type
                 indices_db = get_database_for_data_type("equity_prices")  # Indices stored in realtime DB
                 client = self.redis_client.get_client(indices_db) if hasattr(self.redis_client, 'get_client') else self.redis_client
             except Exception:

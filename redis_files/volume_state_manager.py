@@ -15,16 +15,23 @@ class VolumeStateManager:
     def __init__(self, redis_client: redis.Redis, token_resolver=None):
         # Ensure we use DB 0 (system) for session data and volume state
         # VolumeStateManager stores: volume_state:* (session metadata) and session:* keys
-        if hasattr(redis_client, 'get_client'):
-            self.redis = redis_client.get_client(0)  # DB 0: system (session_data)
-        else:
+        if redis_client and hasattr(redis_client, 'get_client'):
+            try:
+                self.redis = redis_client.get_client(0)  # DB 0: system (session_data)
+            except Exception as e:
+                logger.warning(f"Failed to get Redis client for DB 0: {e}")
+                self.redis = None
+        elif redis_client:
             self.redis = redis_client  # Fallback for raw redis-py clients
+        else:
+            self.redis = None  # No Redis client available
         self.token_resolver = token_resolver
         self.local_cache: Dict[str, Dict] = {}  # instrument -> {last_cumulative, session_date}
         
-        # NEW: Volume Profile Integration
+        # NEW: Volume Profile Integration (only if Redis is available)
         self.volume_profile_manager = None
-        self._initialize_volume_profile_manager()
+        if self.redis is not None:
+            self._initialize_volume_profile_manager()
     
     def _initialize_volume_profile_manager(self):
         """Initialize VolumeProfileManager with proper error handling"""
@@ -49,13 +56,20 @@ class VolumeStateManager:
         state = self.local_cache.get(instrument_token)
         
         if not state:
-            # Try Redis first, then initialize
-            redis_state = self.redis.hgetall(state_key)
-            if redis_state and b'last_cumulative' in redis_state and b'session_date' in redis_state:
-                state = {
-                    'last_cumulative': int(redis_state[b'last_cumulative']),
-                    'session_date': redis_state[b'session_date'].decode()
-                }
+            # Try Redis first, then initialize (only if Redis is available)
+            if self.redis is not None:
+                try:
+                    redis_state = self.redis.hgetall(state_key)
+                    if redis_state and b'last_cumulative' in redis_state and b'session_date' in redis_state:
+                        state = {
+                            'last_cumulative': int(redis_state[b'last_cumulative']),
+                            'session_date': redis_state[b'session_date'].decode()
+                        }
+                    else:
+                        state = {'last_cumulative': None, 'session_date': None}
+                except Exception as e:
+                    logger.debug(f"Failed to get Redis state for {instrument_token}: {e}")
+                    state = {'last_cumulative': None, 'session_date': None}
             else:
                 state = {'last_cumulative': None, 'session_date': None}
             self.local_cache[instrument_token] = state
@@ -82,11 +96,15 @@ class VolumeStateManager:
         # Update state
         state['last_cumulative'] = current_cumulative
         
-        # Persist to Redis (survives process restarts)
-        self.redis.hset(state_key, 'last_cumulative', current_cumulative)
-        self.redis.hset(state_key, 'session_date', current_date)
-        # Set 24-hour TTL to auto-cleanup
-        self.redis.expire(state_key, 86400)
+        # Persist to Redis (survives process restarts) - only if Redis is available
+        if self.redis is not None:
+            try:
+                self.redis.hset(state_key, 'last_cumulative', current_cumulative)
+                self.redis.hset(state_key, 'session_date', current_date)
+                # Set 24-hour TTL to auto-cleanup
+                self.redis.expire(state_key, 86400)
+            except Exception as e:
+                logger.debug(f"Failed to persist state to Redis for {instrument_token}: {e}")
         
         # NEW: Volume Profile Integration
         if self.volume_profile_manager and incremental > 0:
@@ -111,11 +129,15 @@ class VolumeStateManager:
             if self.token_resolver and hasattr(self.token_resolver, 'resolve_token_to_symbol'):
                 return self.token_resolver.resolve_token_to_symbol(instrument_token)
             
-            # Fallback: try to get symbol from Redis session data
-            session_key = f"session:TOKEN_{instrument_token}:{datetime.now().strftime('%Y-%m-%d')}"
-            session_data = self.redis.hgetall(session_key)
-            if session_data and b'tradingsymbol' in session_data:
-                return session_data[b'tradingsymbol'].decode()
+            # Fallback: try to get symbol from Redis session data (only if Redis is available)
+            if self.redis is not None:
+                try:
+                    session_key = f"session:TOKEN_{instrument_token}:{datetime.now().strftime('%Y-%m-%d')}"
+                    session_data = self.redis.hgetall(session_key)
+                    if session_data and b'tradingsymbol' in session_data:
+                        return session_data[b'tradingsymbol'].decode()
+                except Exception as e:
+                    logger.debug(f"Redis symbol lookup failed for token {instrument_token}: {e}")
             
             return None
         except Exception as e:
@@ -125,6 +147,8 @@ class VolumeStateManager:
     def _get_last_price(self, instrument_token: str) -> Optional[float]:
         """Get last price from Redis session data"""
         try:
+            if self.redis is None:
+                return None
             session_key = f"session:TOKEN_{instrument_token}:{datetime.now().strftime('%Y-%m-%d')}"
             session_data = self.redis.hgetall(session_key)
             if session_data and b'last_price' in session_data:
@@ -224,13 +248,42 @@ class VolumeStateManager:
                 'combined_cumulative': ce_volume + pe_volume
             }
 
-# Global instance
-_volume_manager = None
+# Global instance cache (per redis_client)
+_volume_manager_cache: Dict[int, VolumeStateManager] = {}
 
-def get_volume_manager(token_resolver=None) -> VolumeStateManager:
-    """Get global volume manager instance with optional token resolver"""
-    global _volume_manager
-    if _volume_manager is None:
+def get_volume_manager(redis_client=None, token_resolver=None) -> VolumeStateManager:
+    """
+    Get volume manager instance with optional Redis client and token resolver.
+    
+    If redis_client is provided, uses that client (avoids duplicate connections).
+    If not provided, creates a new client using get_redis_client().
+    
+    Uses a cache keyed by redis_client id to avoid creating duplicate instances.
+    """
+    global _volume_manager_cache
+    
+    # If no redis_client provided, get default one
+    if redis_client is None:
         from redis_files.redis_client import get_redis_client
-        _volume_manager = VolumeStateManager(get_redis_client(), token_resolver)
-    return _volume_manager
+        redis_client = get_redis_client()
+    
+    # Create cache key based on redis_client identity
+    # For wrapped clients, use the underlying client
+    actual_client = redis_client
+    if hasattr(redis_client, 'get_client'):
+        try:
+            actual_client = redis_client.get_client(0)  # Get DB 0 client
+        except Exception:
+            actual_client = redis_client
+    
+    cache_key = id(actual_client) if actual_client else 'default'
+    
+    # Return cached instance if available
+    if cache_key in _volume_manager_cache:
+        return _volume_manager_cache[cache_key]
+    
+    # Create new instance with provided client
+    volume_manager = VolumeStateManager(redis_client, token_resolver)
+    _volume_manager_cache[cache_key] = volume_manager
+    
+    return volume_manager

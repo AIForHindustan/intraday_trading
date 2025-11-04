@@ -781,14 +781,9 @@ class RetailAlertFilter:
                 try:
                     has_volume = any(volume_client.scan_iter(match=f"bucket_incremental_volume:bucket:{symbol}:*", count=10))
                     if has_volume:
-                        volume_profile = {
-                            'value_area_high': 0.0,
-                            'value_area_low': 0.0,
-                            'poc_price': 0.0,
-                            'profile_strength': 0.5  # Default moderate strength
-                        }
-                        logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: Created fallback volume profile: {volume_profile}")
-                        return volume_profile
+                        # ✅ FIXED: Return empty dict instead of dummy data - let validation handle missing data
+                        logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: Volume data exists but profile not found - returning empty dict")
+                        return {}
                 except Exception as vol_err:
                     logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: Volume fallback failed: {vol_err}")
 

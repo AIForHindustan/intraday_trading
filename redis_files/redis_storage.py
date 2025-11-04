@@ -31,7 +31,6 @@ from redis_files.redis_client import RobustRedisClient
 from utils.yaml_field_loader import (
     get_field_mapping_manager,
     resolve_session_field,
-    resolve_calculated_field as resolve_indicator_field,
 )
 
 # Import TA-Lib calculations and ICT patterns
@@ -48,7 +47,6 @@ try:
     from patterns.mm_exploitation_strategies import MMExploitationStrategies
     from paper_trading.range_bound_analyzer import RangeBoundAnalyzer
     from patterns.market_maker_trap_detector import MarketMakerTrapDetector
-    from legacy_unused_scripts.premium_collection import PremiumCollectionStrategy
     from patterns.pattern_detector import PatternDetector
     
     # Import pattern registry configuration
@@ -187,7 +185,6 @@ class RedisStorage:
             # Initialize additional pattern detectors
             self.market_maker_trap_detector = MarketMakerTrapDetector(redis_client)
             # Initialize expected move calculator first
-            # from legacy_unused_scripts.utils.expected_move import ExpectedMoveCalculator
             # expected_move_calculator = ExpectedMoveCalculator(redis_client)
             # self.premium_collection_strategy = PremiumCollectionStrategy(redis_client, expected_move_calculator)
             
@@ -274,7 +271,14 @@ class RedisStorage:
         
         # Store in Redis Streams using Zerodha field names in DB 1 (realtime)
         stream_key = f"ticks:{symbol}"
-        realtime_client = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis
+        # Use process-specific client if available
+        try:
+            from redis_files.redis_manager import RedisManager82
+            # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+            realtime_client = RedisManager82.get_client(process_name="redis_storage", db=1)
+        except Exception:
+            # Fallback to existing method
+            realtime_client = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis
         
         # Convert dict to proper stream format
         stream_data = {
@@ -282,325 +286,24 @@ class RedisStorage:
             'timestamp': str(int(time.time() * 1000)),
             'symbol': symbol
         }
-        realtime_client.xadd(stream_key, stream_data)
+        # ✅ FIXED: ALWAYS use maxlen to prevent unbounded stream growth
+        realtime_client.xadd(stream_key, stream_data, maxlen=10000, approximate=True)
     
     async def get_recent_ticks(self, symbol: str, count: int = 100) -> List[dict]:
         """Get recent ticks - already normalized timestamps using Zerodha field names"""
         stream_key = f"ticks:{symbol}"
-        realtime_client = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis
+        # Use process-specific client if available
+        try:
+            from redis_files.redis_manager import RedisManager82
+            # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+            realtime_client = RedisManager82.get_client(process_name="redis_storage", db=1)
+        except Exception:
+            # Fallback to existing method
+            realtime_client = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis
         ticks = realtime_client.xrevrange(stream_key, count=count)
         return [tick_data for tick_id, tick_data in ticks]
     
-    async def store_volume_bucket(self, symbol: str, bucket_data: dict):
-        """Store bucket_incremental_volume buckets with normalized timestamps using Zerodha field names"""
-        # Resolve token to symbol BEFORE storing
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
-        
-        # Switch to DB 5 for cumulative volume data
-        self.redis.select(5)
-        # Use Zerodha timestamp priority for bucket timestamps
-        if 'exchange_timestamp' in bucket_data and bucket_data['exchange_timestamp']:
-            bucket_ts = TimestampNormalizer.to_epoch_ms(bucket_data['exchange_timestamp'])
-        elif 'timestamp_ns' in bucket_data and bucket_data['timestamp_ns']:
-            bucket_ts = TimestampNormalizer.to_epoch_ms(bucket_data['timestamp_ns'])
-        elif 'timestamp' in bucket_data and bucket_data['timestamp']:
-            bucket_ts = TimestampNormalizer.to_epoch_ms(bucket_data['timestamp'])
-        else:
-            bucket_ts = int(time.time() * 1000)  # Current epoch milliseconds
-        
-        bucket_key = f"volume:volume:bucket:{symbol}:{bucket_ts}"
-        
-        # Use Zerodha field names exactly
-        normalized_bucket = {
-            'symbol': symbol,
-            'timestamp': bucket_ts,
-            self.FIELD_LAST_PRICE: bucket_data.get(self.FIELD_LAST_PRICE, 0),
-            self.FIELD_VOLUME: bucket_data.get(self.FIELD_BUCKET_INCREMENTAL_VOLUME, 0),
-            self.FIELD_ZERODHA_CUMULATIVE_VOLUME: bucket_data.get(self.FIELD_ZERODHA_CUMULATIVE_VOLUME, 0),
-            self.FIELD_ZERODHA_LAST_TRADED_QUANTITY: bucket_data.get(self.FIELD_ZERODHA_LAST_TRADED_QUANTITY, 0),
-            self.FIELD_BUCKET_INCREMENTAL_VOLUME: bucket_data.get(self.FIELD_BUCKET_INCREMENTAL_VOLUME, 0),
-            self.FIELD_BUCKET_CUMULATIVE_VOLUME: bucket_data.get(self.FIELD_BUCKET_CUMULATIVE_VOLUME, 0),
-            self.FIELD_HIGH: bucket_data.get(self.FIELD_HIGH, 0),
-            self.FIELD_LOW: bucket_data.get(self.FIELD_LOW, 0),
-            self.FIELD_SESSION_DATE: bucket_data.get(self.FIELD_SESSION_DATE, ''),
-            self.FIELD_UPDATE_COUNT: bucket_data.get(self.FIELD_UPDATE_COUNT, 0),
-            self.FIELD_LAST_UPDATE_TIMESTAMP: bucket_data.get(self.FIELD_LAST_UPDATE_TIMESTAMP, 0)
-        }
-        
-        # Store each field individually since RobustRedisClient doesn't support mapping
-        for field, value in normalized_bucket.items():
-            self.redis.hset(bucket_key, field, value)
-    
-    async def store_session_data(self, symbol: str, session_data: dict):
-        """Store session data using Zerodha field names"""
-        # Resolve token to symbol BEFORE storing
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
-        
-        # Normalize session timestamp
-        if 'last_update_timestamp' in session_data and session_data['last_update_timestamp']:
-            session_ts = TimestampNormalizer.to_epoch_ms(session_data['last_update_timestamp'])
-        else:
-            session_ts = int(time.time() * 1000)
-        
-        session_key = f"session:{symbol}:{session_data.get('session_date', '')}"
-        
-        # Use Zerodha field names exactly
-        normalized_session = {
-            'symbol': symbol,
-            self.FIELD_SESSION_DATE: session_data.get(self.FIELD_SESSION_DATE, ''),
-            self.FIELD_LAST_PRICE: session_data.get(self.FIELD_LAST_PRICE, 0),
-            self.FIELD_VOLUME: session_data.get(self.FIELD_VOLUME, 0),
-            self.FIELD_ZERODHA_CUMULATIVE_VOLUME: session_data.get(self.FIELD_ZERODHA_CUMULATIVE_VOLUME, 0),
-            self.FIELD_ZERODHA_LAST_TRADED_QUANTITY: session_data.get(self.FIELD_ZERODHA_LAST_TRADED_QUANTITY, 0),
-            self.FIELD_BUCKET_CUMULATIVE_VOLUME: session_data.get(self.FIELD_BUCKET_CUMULATIVE_VOLUME, 0),
-            self.FIELD_BUCKET_INCREMENTAL_VOLUME: session_data.get(self.FIELD_BUCKET_INCREMENTAL_VOLUME, 0),
-            self.FIELD_HIGH: session_data.get(self.FIELD_HIGH, 0),
-            self.FIELD_LOW: session_data.get(self.FIELD_LOW, 0),
-            self.FIELD_UPDATE_COUNT: session_data.get(self.FIELD_UPDATE_COUNT, 0),
-            self.FIELD_LAST_UPDATE_TIMESTAMP: session_ts,
-            self.FIELD_FIRST_UPDATE: session_data.get(self.FIELD_FIRST_UPDATE, 0),
-            'first_price': session_data.get('first_price', 0),  # Legacy field
-            'close_price': session_data.get('close_price', 0)   # Legacy field
-        }
-        
-        # Store each field individually since RobustRedisClient doesn't support mapping
-        for field, value in normalized_session.items():
-            self.redis.hset(session_key, field, value)
-    
-    async def store_ohlc_data(self, symbol: str, ohlc_data: dict):
-        """Store OHLC data using Zerodha field names"""
-        # Resolve token to symbol BEFORE storing
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
-        
-        # Normalize OHLC timestamp
-        if 'exchange_timestamp' in ohlc_data and ohlc_data['exchange_timestamp']:
-            ohlc_ts = TimestampNormalizer.to_epoch_ms(ohlc_data['exchange_timestamp'])
-        elif 'timestamp_ns' in ohlc_data and ohlc_data['timestamp_ns']:
-            ohlc_ts = TimestampNormalizer.to_epoch_ms(ohlc_data['timestamp_ns'])
-        elif 'timestamp' in ohlc_data and ohlc_data['timestamp']:
-            ohlc_ts = TimestampNormalizer.to_epoch_ms(ohlc_data['timestamp'])
-        else:
-            ohlc_ts = int(time.time() * 1000)
-        
-        ohlc_key = f"ohlc:{symbol}:{ohlc_ts}"
-        
-        # Use Zerodha field names exactly
-        normalized_ohlc = {
-            'symbol': symbol,
-            'timestamp': ohlc_ts,
-            self.FIELD_LAST_PRICE: ohlc_data.get(self.FIELD_LAST_PRICE, 0),
-            self.FIELD_AVERAGE_PRICE: ohlc_data.get(self.FIELD_AVERAGE_PRICE, 0),
-            self.FIELD_OHLC: ohlc_data.get(self.FIELD_OHLC, {}),
-            self.FIELD_NET_CHANGE: ohlc_data.get(self.FIELD_NET_CHANGE, 0),
-            'mode': ohlc_data.get('mode', 'unknown'),
-            'tradable': ohlc_data.get('tradable', True)
-        }
-        
-        # Store each field individually since RobustRedisClient doesn't support mapping
-        for field, value in normalized_ohlc.items():
-            self.redis.hset(ohlc_key, field, value)
-    
-    async def store_market_depth(self, symbol: str, depth_data: dict):
-        """Store market depth data using Zerodha field names"""
-        # Resolve token to symbol BEFORE storing
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
-        
-        # Normalize depth timestamp
-        if 'exchange_timestamp' in depth_data and depth_data['exchange_timestamp']:
-            depth_ts = TimestampNormalizer.to_epoch_ms(depth_data['exchange_timestamp'])
-        else:
-            depth_ts = int(time.time() * 1000)
-        
-        depth_key = f"depth:{symbol}:{depth_ts}"
-        
-        # Use Zerodha field names exactly
-        normalized_depth = {
-            'symbol': symbol,
-            'timestamp': depth_ts,
-            'depth': depth_data.get('depth', {}),
-            'buy_quantity': depth_data.get('buy_quantity', 0),
-            'sell_quantity': depth_data.get('sell_quantity', 0),
-            'lower_circuit_limit': depth_data.get('lower_circuit_limit', 0),
-            'upper_circuit_limit': depth_data.get('upper_circuit_limit', 0)
-        }
-        
-        # Store each field individually since RobustRedisClient doesn't support mapping
-        for field, value in normalized_depth.items():
-            self.redis.hset(depth_key, field, value)
-    
-    async def store_derivatives_data(self, symbol: str, derivatives_data: dict):
-        """Store derivatives data using Zerodha field names"""
-        # Resolve token to symbol BEFORE storing
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
-        
-        # Normalize derivatives timestamp
-        if 'exchange_timestamp' in derivatives_data and derivatives_data['exchange_timestamp']:
-            deriv_ts = TimestampNormalizer.to_epoch_ms(derivatives_data['exchange_timestamp'])
-        else:
-            deriv_ts = int(time.time() * 1000)
-        
-        deriv_key = f"derivatives:{symbol}:{deriv_ts}"
-        
-        # Use Zerodha field names exactly
-        normalized_derivatives = {
-            'symbol': symbol,
-            'timestamp': deriv_ts,
-            'oi': derivatives_data.get('oi', 0),
-            'oi_day_high': derivatives_data.get('oi_day_high', 0),
-            'oi_day_low': derivatives_data.get('oi_day_low', 0),
-            'strike_price': derivatives_data.get('strike_price', 0),
-            'expiry': derivatives_data.get('expiry', ''),
-            'option_type': derivatives_data.get('option_type', ''),
-            'underlying': derivatives_data.get('underlying', ''),
-            'net_change': derivatives_data.get('net_change', 0)
-        }
-        
-        # Store each field individually since RobustRedisClient doesn't support mapping
-        for field, value in normalized_derivatives.items():
-            self.redis.hset(deriv_key, field, value)
-    
-    async def get_stored_data(self, data_type: str, symbol: str, pattern: str = "*") -> List[dict]:
-        """Get stored data by type and symbol using Zerodha field names"""
-        if data_type == "ticks":
-            return await self.get_recent_ticks(symbol)
-        elif data_type == "bucket_incremental_volume":
-            keys = self.redis.keys(f"volume:volume:bucket:{symbol}:{pattern}")
-            data = []
-            for key in keys:
-                bucket_data = self.redis.hgetall(key)
-                if bucket_data:
-                    data.append(bucket_data)
-            return data
-        elif data_type == "session":
-            keys = self.redis.keys(f"session:{symbol}:{pattern}")
-            data = []
-            for key in keys:
-                session_data = self.redis.hgetall(key)
-                if session_data:
-                    data.append(session_data)
-            return data
-        elif data_type == "ohlc":
-            keys = self.redis.keys(f"ohlc:{symbol}:{pattern}")
-            data = []
-            for key in keys:
-                ohlc_data = self.redis.hgetall(key)
-                if ohlc_data:
-                    data.append(ohlc_data)
-            return data
-        elif data_type == "depth":
-            keys = self.redis.keys(f"depth:{symbol}:{pattern}")
-            data = []
-            for key in keys:
-                depth_data = self.redis.hgetall(key)
-                if depth_data:
-                    data.append(depth_data)
-            return data
-        elif data_type == "derivatives":
-            keys = self.redis.keys(f"derivatives:{symbol}:{pattern}")
-            data = []
-            for key in keys:
-                deriv_data = self.redis.hgetall(key)
-                if deriv_data:
-                    data.append(deriv_data)
-            return data
-        else:
-            return []
-    
-    async def cleanup_old_data(self, data_type: str, symbol: str, older_than_hours: int = 24):
-        """Clean up old data using Zerodha field names"""
-        cutoff_time = int(time.time() * 1000) - (older_than_hours * 3600 * 1000)
-        
-        if data_type == "ticks":
-            # Clean up old tick streams
-            stream_key = f"ticks:{symbol}"
-            # Implementation depends on your Redis stream cleanup strategy
-            pass
-        elif data_type == "bucket_incremental_volume":
-            # Clean up old bucket_incremental_volume buckets
-            keys = self.redis.keys(f"volume:volume:bucket:{symbol}:*")
-            for key in keys:
-                # Extract timestamp from key and check if older than cutoff
-                try:
-                    key_ts = int(key.split(':')[-1])
-                    if key_ts < cutoff_time:
-                        self.redis.delete(key)
-                except (ValueError, IndexError):
-                    continue
-        elif data_type == "session":
-            # Clean up old session data
-            keys = self.redis.keys(f"session:{symbol}:*")
-            for key in keys:
-                session_data = self.redis.hgetall(key)
-                if session_data and 'last_update_timestamp' in session_data:
-                    try:
-                        session_ts = int(session_data['last_update_timestamp'])
-                        if session_ts < cutoff_time:
-                            self.redis.delete(key)
-                    except ValueError:
-                        continue
-        # Similar cleanup for other data types...
-    
-    async def get_data_summary(self, symbol: str) -> dict:
-        """Get data summary for a symbol using Zerodha field names"""
-        summary = {
-            'symbol': symbol,
-            'ticks_count': 0,
-            'volume_buckets_count': 0,
-            'session_data_count': 0,
-            'ohlc_data_count': 0,
-            'depth_data_count': 0,
-            'derivatives_data_count': 0,
-            'last_update': 0
-        }
-        
-        # Count ticks
-        stream_key = f"ticks:{symbol}"
-        ticks_info = self.redis.xinfo_stream(stream_key)
-        summary['ticks_count'] = ticks_info.get('length', 0)
-        
-        # Count bucket_incremental_volume buckets
-        volume_keys = self.redis.keys(f"volume:volume:bucket:{symbol}:*")
-        summary['volume_buckets_count'] = len(volume_keys)
-        
-        # Count session data
-        session_keys = self.redis.keys(f"session:{symbol}:*")
-        summary['session_data_count'] = len(session_keys)
-        
-        # Count OHLC data
-        ohlc_keys = self.redis.keys(f"ohlc:{symbol}:*")
-        summary['ohlc_data_count'] = len(ohlc_keys)
-        
-        # Count depth data
-        depth_keys = self.redis.keys(f"depth:{symbol}:*")
-        summary['depth_data_count'] = len(depth_keys)
-        
-        # Count derivatives data
-        deriv_keys = self.redis.keys(f"derivatives:{symbol}:*")
-        summary['derivatives_data_count'] = len(deriv_keys)
-        
-        # Get last update timestamp
-        if volume_keys:
-            latest_volume_key = max(volume_keys, key=lambda k: int(k.split(':')[-1]) if k.split(':')[-1].isdigit() else 0)
-            summary['last_update'] = int(latest_volume_key.split(':')[-1])
-        
-        return summary
-    
     # ============ Enhanced Indicator Publishing & Pattern Detection ============
-    
-    async def store_tick_with_indicators(self, symbol: str, tick_data: dict):
-        """Store tick data and publish indicators for pattern detection"""
-        # Store original tick data
-        await self.store_tick(symbol, tick_data)
-        
-        # Get recent ticks for indicator calculation
-        recent_ticks = await self.get_recent_ticks(symbol, count=50)
-        
-        if len(recent_ticks) >= 20:  # Minimum data for indicators
-            # Calculate and publish indicators
-            await self.publish_indicators_to_redis(symbol, recent_ticks)
-            
-            # Detect and store patterns
-            await self.detect_and_store_patterns(symbol, recent_ticks)
     
     # ============ TA-Lib Indicator Publishing System ============
     
@@ -622,11 +325,19 @@ class RedisStorage:
             }
             
             # Publish to DB 1 (realtime) for indicators
-            realtime_client = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis
-            realtime_client.xadd(stream_key, message)
+            # Use process-specific client if available
+            try:
+                from redis_files.redis_manager import RedisManager82
+                # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+                realtime_client = RedisManager82.get_client(process_name="redis_storage", db=1)
+            except Exception:
+                # Fallback to existing method
+                realtime_client = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis
+            # ✅ FIXED: ALWAYS use maxlen to prevent unbounded stream growth
+            realtime_client.xadd(stream_key, message, maxlen=5000, approximate=True)
             
             # Also publish to global indicator stream
-            realtime_client.xadd(f"indicators:{indicator_type}:global", message)
+            realtime_client.xadd(f"indicators:{indicator_type}:global", message, maxlen=5000, approximate=True)
             
             logger.debug(f"Published {indicator_type} for {symbol} to {stream_key}")
             
@@ -1287,29 +998,6 @@ class RedisStorage:
         except Exception as e:
             logger.error(f"Error publishing indicators for {symbol}: {e}")
     
-    async def publish_indicators_stream(self, symbol: str, indicators: dict):
-        """Publish indicators to Redis stream for real-time pattern detection"""
-        try:
-            stream_data = {
-                'symbol': symbol,
-                'timestamp': int(time.time() * 1000),
-                'indicators': json.dumps(indicators),
-                'source': 'redis_storage'
-            }
-            
-            # Get realtime client (DB 1) for indicator streams
-            realtime_client = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis
-            
-            # Publish to indicators stream
-            stream_key = f"indicators:{symbol}"
-            realtime_client.xadd(stream_key, stream_data)
-            
-            # Also publish to global indicators stream
-            realtime_client.xadd("indicators:global", stream_data)
-            
-        except Exception as e:
-            logger.error(f"Error publishing indicators stream for {symbol}: {e}")
-    
     async def detect_and_store_patterns(self, symbol: str, tick_data: List[dict]):
         """Detect ICT patterns and store in Redis"""
         if not self.pattern_detectors:
@@ -1376,12 +1064,8 @@ class RedisStorage:
             elif hasattr(detector, 'generate_options_strategies'):
                 # Range bound analyzer for straddle
                 return await self.detect_range_bound_straddle(detector, symbol_data)
-            elif hasattr(detector, 'detect_market_maker_traps'):
-                # Market maker trap detection
-                return await self.detect_market_maker_traps(detector, symbol_data)
-            elif hasattr(detector, 'generate_premium_collection'):
-                # Premium collection strategy
-                return await self.detect_premium_collection(detector, symbol_data)
+            # Note: detect_market_maker_traps and detect_premium_collection are handled by MarketMakerTrapDetector
+            # and PatternDetector classes directly, not via these undefined methods
             elif hasattr(detector, 'detect_patterns'):
                 # Core pattern detector (8 patterns from registry)
                 return await self.detect_core_patterns(detector, symbol_data)
@@ -1467,53 +1151,6 @@ class RedisStorage:
             
         except Exception as e:
             logger.warning(f"Range-bound straddle detection failed: {e}")
-            return []
-    
-    async def detect_kow_signal_straddle(self, detector, symbol_data: dict):
-        """
-        Detect Kow Signal Straddle patterns (4th straddle strategy)
-        """
-        try:
-            symbol = symbol_data.get('symbol', 'UNKNOWN')
-            
-            # Only process NIFTY/BANKNIFTY for straddle strategies
-            if not any(underlying in symbol.upper() for underlying in ["NIFTY", "BANKNIFTY"]):
-                return []
-            
-            # Get indicators for straddle detection
-            indicators = {
-                'symbol': symbol,
-                'last_price': symbol_data.get('last_price', 0),
-                'volume': symbol_data.get('volume', 0),
-                'high': symbol_data.get('high', 0),
-                'low': symbol_data.get('low', 0),
-                'open': symbol_data.get('open', 0),
-                'close': symbol_data.get('close', 0),
-                'timestamp': symbol_data.get('timestamp', 0),
-                'bucket_incremental_volume': symbol_data.get('bucket_incremental_volume', 0),
-                'bucket_cumulative_volume': symbol_data.get('bucket_cumulative_volume', 0)
-            }
-            
-            # Use straddle pattern detection from pattern detector
-            straddle_patterns = detector._detect_straddle_patterns(indicators)
-            
-            if straddle_patterns:
-                # Store straddle patterns with special metadata
-                for pattern in straddle_patterns:
-                    pattern['strategy_name'] = 'kow_signal_straddle'
-                    pattern['strategy_type'] = 'straddle'
-                    pattern['confidence_threshold'] = 0.85
-                    pattern['telegram_routing'] = True
-                
-                await self.store_patterns_in_redis(symbol, straddle_patterns)
-                await self.publish_patterns_stream(symbol, straddle_patterns)
-                
-                logger.info(f"🎯 Kow Signal Straddle detected: {symbol} - {len(straddle_patterns)} patterns")
-            
-            return straddle_patterns
-            
-        except Exception as e:
-            logger.error(f"Kow Signal Straddle detection failed for {symbol}: {e}")
             return []
     
     def calculate_price_volatility(self, prices: List[float]) -> float:
@@ -1631,7 +1268,14 @@ class RedisStorage:
         """Publish patterns to Redis stream for real-time alerts"""
         try:
             # Get realtime client (DB 1) for pattern streams
-            realtime_client = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis
+            # Use process-specific client if available
+            try:
+                from redis_files.redis_manager import RedisManager82
+                # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+                realtime_client = RedisManager82.get_client(process_name="redis_storage", db=1)
+            except Exception:
+                # Fallback to existing method
+                realtime_client = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis
             
             for pattern in patterns:
                 stream_data = {
@@ -1643,10 +1287,11 @@ class RedisStorage:
                 
                 # Publish to pattern stream
                 stream_key = f"patterns:{symbol}"
-                realtime_client.xadd(stream_key, stream_data)
+                # ✅ FIXED: ALWAYS use maxlen to prevent unbounded stream growth
+                realtime_client.xadd(stream_key, stream_data, maxlen=5000, approximate=True)
                 
                 # Also publish to global patterns stream
-                realtime_client.xadd("patterns:global", stream_data)
+                realtime_client.xadd("patterns:global", stream_data, maxlen=5000, approximate=True)
 
                 # Additionally publish compact alert to alerts:stream for SSE
                 try:
@@ -1665,118 +1310,13 @@ class RedisStorage:
                         binary = _oj.dumps(alert_payload)
                     except Exception:
                         binary = json.dumps(alert_payload).encode()
-                    realtime_client.xadd('alerts:stream', { 'data': binary }, maxlen=10000, approximate=True)
+                    # ✅ TIER 1: Keep stream trimmed for performance (last 1k alerts)
+                    realtime_client.xadd('alerts:stream', { 'data': binary }, maxlen=1000, approximate=True)
                 except Exception as _alert_err:
                     logger.debug(f"Alerts stream publish skipped: {_alert_err}")
                 
         except Exception as e:
             logger.error(f"Error publishing patterns stream for {symbol}: {e}")
-    
-    async def subscribe_to_patterns(self, callback):
-        """Subscribe to ICT pattern detections"""
-        async def pattern_consumer():
-            last_id = '0'
-            
-            while True:
-                try:
-                    # Read from patterns stream in DB 1 (realtime) using read_from_stream
-                    messages = self.redis.read_from_stream('patterns:global', count=10, start_id=last_id)
-                    
-                    if messages:
-                        # read_from_stream returns list of (stream_name, [(id, data), ...]) tuples
-                        for stream_name, entries in messages:
-                            for message_id, message_data in entries:
-                                await callback(message_data)
-                                last_id = message_id
-                                
-                except Exception as e:
-                    logger.error(f"Pattern subscription error: {e}")
-                    await asyncio.sleep(1)
-        
-        # Start pattern consumer
-        asyncio.create_task(pattern_consumer())
-    
-    async def subscribe_to_indicators(self, symbol: str, callback):
-        """Subscribe to indicator updates for a specific symbol"""
-        async def indicator_consumer():
-            last_id = '0'
-            stream_key = f"indicators:{symbol}"
-            
-            while True:
-                try:
-                    # Read from indicators stream in DB 1 (realtime) using read_from_stream
-                    messages = self.redis.read_from_stream(stream_key, count=10, start_id=last_id)
-                    
-                    if messages:
-                        # read_from_stream returns list of (stream_name, [(id, data), ...]) tuples
-                        for stream_name, entries in messages:
-                            for message_id, message_data in entries:
-                                await callback(message_data)
-                                last_id = message_id
-                                
-                except Exception as e:
-                    logger.error(f"Indicator subscription error for {symbol}: {e}")
-                    await asyncio.sleep(1)
-        
-        # Start indicator consumer
-        asyncio.create_task(indicator_consumer())
-    
-    async def get_latest_indicators(self, symbol: str) -> dict:
-        """Get latest indicators for a symbol from Redis"""
-        try:
-            indicators = {}
-            
-            # Get all indicator keys for symbol
-            pattern = f"indicators:{symbol}:*"
-            keys = self.redis.keys(pattern)
-            
-            for key in keys:
-                try:
-                    indicator_name = key.split(':')[-1]
-                    indicator_data = self.redis.get(key)
-                    
-                    if indicator_data:
-                        if indicator_data.startswith('{'):
-                            # Complex indicator
-                            data = json.loads(indicator_data)
-                            indicators[indicator_name] = data.get('value', 0)
-                        else:
-                            # Simple indicator
-                            indicators[indicator_name] = float(indicator_data)
-                            
-                except Exception as e:
-                    logger.warning(f"Error getting indicator {key}: {e}")
-            
-            return indicators
-            
-        except Exception as e:
-            logger.error(f"Error getting latest indicators for {symbol}: {e}")
-            return {}
-    
-    async def get_latest_patterns(self, symbol: str) -> List[dict]:
-        """Get latest patterns for a symbol from Redis"""
-        try:
-            patterns = []
-            
-            # Get all pattern keys for symbol
-            pattern = f"patterns:{symbol}:*"
-            keys = self.redis.keys(pattern)
-            
-            for key in keys:
-                try:
-                    pattern_data = self.redis.get(key)
-                    if pattern_data:
-                        data = json.loads(pattern_data)
-                        patterns.append(data)
-                        
-                except Exception as e:
-                    logger.warning(f"Error getting pattern {key}: {e}")
-            
-            return patterns
-            
-        except Exception as e:
-            logger.error(f"Error getting latest patterns for {symbol}: {e}")
-            return []
     
     def get_patterns_from_registry(self, category: str = None) -> List[str]:
         """Get patterns from pattern registry config"""
@@ -1802,25 +1342,6 @@ class RedisStorage:
         
         pattern_configs = self.pattern_registry.get("pattern_configs", {})
         return pattern_configs.get(pattern_name, {})
-    
-    def get_active_categories(self) -> List[str]:
-        """Get list of active pattern categories from registry"""
-        if not self.registry_available:
-            return []
-        
-        categories = self.pattern_registry.get("categories", {})
-        active_categories = []
-        for cat_name, cat_data in categories.items():
-            if cat_data.get("enabled", False):
-                active_categories.append(cat_name)
-        return active_categories
-    
-    def get_registry_metadata(self) -> dict:
-        """Get pattern registry metadata"""
-        if not self.registry_available:
-            return {}
-        
-        return self.pattern_registry.get("metadata", {})
     
     def _resolve_token_to_symbol_for_storage(self, symbol):
         """Resolve token to symbol for Redis storage - delegates to redis client"""

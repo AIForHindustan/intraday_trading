@@ -11,10 +11,7 @@ spec = importlib.util.spec_from_file_location("alert_validator", "/mnt/data/aler
 av = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(av)
 
-# Apply patch
-spec2 = importlib.util.spec_from_file_location("alert_validator_patch", "/mnt/data/alert_validator_patch.py")
-patch = importlib.util.module_from_spec(spec2)
-spec2.loader.exec_module(patch)
+# Patches have been integrated into alert_validator.py - no longer needed
 
 # Instantiate
 validator = av.AlertValidator(config_path=None)

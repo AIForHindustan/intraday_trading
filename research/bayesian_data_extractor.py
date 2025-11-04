@@ -40,6 +40,9 @@ except ImportError:
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Initialize logger early so it can be used in exception handlers
+logger = logging.getLogger(__name__)
+
 # Import validation module
 try:
     from research.bayesian_data_validator import BayesianDataValidator
@@ -51,7 +54,7 @@ except ImportError:
 
 # Import market calendar
 try:
-    from core.utils.market_calendar import MarketCalendar
+    from utils.market_calendar import MarketCalendar
 except ImportError:
     logger.warning("MarketCalendar not available, using basic weekday check")
     class MarketCalendar:
@@ -59,8 +62,6 @@ except ImportError:
             if date is None:
                 date = datetime.now()
             return date.weekday() < 5
-
-logger = logging.getLogger(__name__)
 
 
 class StandaloneBayesianExtractor:
@@ -136,7 +137,7 @@ class StandaloneBayesianExtractor:
             raise
     
     def _create_redis_connections(self) -> Dict[int, redis.Redis]:
-        """Create separate Redis connections for each database"""
+        """Create separate Redis connections for each database using connection pools"""
         clients = {}
         
         extraction_config = self.config.get("extraction", {})
@@ -144,20 +145,21 @@ class StandaloneBayesianExtractor:
         
         for db_num in databases:
             try:
-                extraction_config = self.config.get("extraction", {})
-                client = redis.Redis(
+                # ✅ STANDARDIZED: Use RedisManager82 instead of deprecated get_redis_client_from_pool
+                from redis_files.redis_manager import RedisManager82
+                
+                client = RedisManager82.get_client(
+                    process_name="bayesian_extractor",
+                    db=db_num,
                     host=extraction_config.get("redis_host", "localhost"),
                     port=extraction_config.get("redis_port", 6379),
-                    db=db_num,
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                    socket_timeout=5
+                    decode_responses=True
                 )
                 
                 # Test connection
                 client.ping()
                 clients[db_num] = client
-                logger.info(f"✅ Redis connection established for DB {db_num}")
+                logger.info(f"✅ Redis connection pool established for DB {db_num}")
                 
             except Exception as e:
                 logger.error(f"❌ Failed to connect to Redis DB {db_num}: {e}")

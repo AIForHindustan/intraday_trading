@@ -39,7 +39,7 @@ SCHEDULING:
     - Symbol format: Uses NSE: prefix for OHLC API compatibility
 
 REDIS DATA STORAGE:
-    - ohlc_latest:* - Current OHLC data (36-hour TTL) in DB 1 (realtime)
+    - ohlc_latest:* - Current OHLC data (36-hour TTL) in DB 2 (analytics) ✅ FIXED
     - ohlc_stats:* - 20-day and 55-day averages (24-hour TTL) in DB 2 (analytics)
     - market_data:averages:* - Comprehensive averages data (24-hour TTL) in DB 2 (analytics)
     - Database 2 (analytics): Volume statistics and historical data
@@ -926,10 +926,8 @@ def update_trading_crawler_averages_with_ohlc():
                     if redis_client:
                         normalized_symbol = normalize_symbol(key)
                         try:
-                            # FOLLOW README: DB 5 for cumulative volume (line 162)
-                            # Store volume averages in DB 5 as per README architecture
-                            redis_client.select(5)  # DB 5: Cumulative volume
-                            
+                            # ✅ FIXED: Store volume averages in DB 2 (analytics) per redis_config.py
+                            # Use get_client(2) directly - don't use select() then override with get_client()
                             # Store volume averages in proper format
                             volume_key = f"volume_averages:{normalized_symbol}"
                             volume_data = {
@@ -967,15 +965,15 @@ def update_trading_crawler_averages_with_ohlc():
                                             'date': date_str
                                         }
                                         
-                                        # Store in zset with timestamp as score
-                                        redis_client.zadd(daily_zset_key, {json.dumps(payload): timestamp})
+                                        # Store in zset with timestamp as score (DB 2 analytics)
+                                        redis_client.get_client(2).zadd(daily_zset_key, {json.dumps(payload): timestamp})
                                         
                                     except Exception as date_error:
                                         print(f"⚠️ Date parsing error for {symbol}: {date_error}")
                                         continue
                             
-                            # Set TTL for daily zset (30 days)
-                            redis_client.expire(daily_zset_key, 2592000)  # 30 days
+                            # Set TTL for daily zset (30 days) - DB 2 analytics
+                            redis_client.get_client(2).expire(daily_zset_key, 2592000)  # 30 days
                             
                             # 3. Store in legacy market_data format (for backward compatibility)
                             redis_key = f"market_data:averages:{key}"
@@ -1023,10 +1021,8 @@ def update_trading_crawler_averages_with_ohlc():
                     # Update Redis with current OHLC data - FOLLOW README ARCHITECTURE
                     if redis_client and current_ohlc:
                         try:
-                            # FOLLOW README: DB 2 for price data (line 160)
-                            # Store OHLC data in DB 2 as per README architecture
-                            redis_client.select(2)  # DB 2: Price data
-                            
+                            # ✅ FIXED: Store OHLC data in DB 2 (analytics) per redis_config.py
+                            # Use get_client(2) directly - don't use select() then override with get_client()
                             # Store current OHLC data in proper format with None value handling
                             price_key = f"ohlc_latest:{normalized_symbol}"
                             price_data = {
@@ -1040,7 +1036,7 @@ def update_trading_crawler_averages_with_ohlc():
                                 'updated_at': datetime.now().isoformat(),
                                 'source': 'intraday_crawler'
                             }
-                            # Store each field individually (DB 2 for OHLC data) - convert None to appropriate defaults
+                            # Store each field individually (DB 2 for OHLC analytics data) - convert None to appropriate defaults
                             for field, value in price_data.items():
                                 # Convert None values to appropriate defaults
                                 if value is None:
@@ -1052,8 +1048,8 @@ def update_trading_crawler_averages_with_ohlc():
                                         value = datetime.now().strftime('%Y-%m-%d')
                                     else:
                                         value = ''
-                                redis_client.get_client(1).hset(price_key, field, value)  # realtime DB (prices)
-                            redis_client.get_client(1).expire(price_key, 129600)  # 36 hours
+                                redis_client.get_client(2).hset(price_key, field, value)  # ✅ DB 2: analytics (OHLC data)
+                            redis_client.get_client(2).expire(price_key, 129600)  # 36 hours
                             
                             # 2. Store in daily zset for historical access (if we have a valid date)
                             if current_ohlc.get('date'):

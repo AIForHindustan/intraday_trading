@@ -62,13 +62,22 @@ class IndexDataUpdater:
             self.kite = None
             self.initialized = False
 
-        # Initialize Redis connection using centralized configuration
+        # Initialize Redis connection using process-specific connection pools
         try:
-            from redis_files.redis_client import get_redis_client
-            # Get DB 0 client for system operations
-            self.redis_client = get_redis_client(db=0)
-            # Get DB 1 client for realtime data (news, indices)
-            self.redis_db1 = get_redis_client(db=1, decode_responses=True)
+            # ✅ Use RedisManager82 for process-specific pooled connections
+            from redis_files.redis_manager import RedisManager82
+            
+            # Get process-specific pooled clients for gift_nifty_crawler process
+            self.redis_client = RedisManager82.get_client(
+                process_name="gift_nifty_crawler",
+                db=0,
+                max_connections=2,  # Will be overridden by PROCESS_POOL_CONFIG
+            )
+            self.redis_db1 = RedisManager82.get_client(
+                process_name="gift_nifty_crawler",
+                db=1,
+                max_connections=2,  # Will be overridden by PROCESS_POOL_CONFIG
+            )
             
             # Verify both clients are initialized
             if self.redis_client is None:
@@ -77,7 +86,22 @@ class IndexDataUpdater:
                 raise Exception("Redis DB 1 client is None")
                 
             self.redis_initialized = True
-            logger.info("✅ Redis connected for index data publishing (DB 0 and DB 1)")
+            logger.info("✅ Redis connected for index data publishing using process-specific pools (DB 0 and DB 1)")
+        except ImportError:
+            # Fallback to get_optimized_client if RedisManager82 not available
+            logger.warning("RedisManager82 not available, falling back to get_optimized_client")
+            try:
+                from redis_files.redis_manager import RedisManager82
+                # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+                self.redis_client = RedisManager82.get_client(process_name="gift_nifty_crawler", db=0)
+                self.redis_db1 = RedisManager82.get_client(process_name="gift_nifty_crawler", db=1)
+                self.redis_initialized = True
+                logger.info("✅ Redis connected using get_optimized_client (DB 0 and DB 1)")
+            except Exception as fallback_error:
+                logger.error(f"⚠️ Redis connection fallback failed: {fallback_error}")
+                self.redis_initialized = False
+                self.redis_client = None
+                self.redis_db1 = None
         except Exception as e:
             logger.error(f"⚠️ Redis connection failed: {e}")
             import traceback

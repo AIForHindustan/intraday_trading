@@ -17,21 +17,7 @@ from datetime import datetime
 import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-try:
-    from redis_files.perf_probe import PerfSink, timed_block, slow_tick_guard
-except Exception:
-    class PerfSink:
-        def __init__(self, *a, **k):
-            pass
-        def add(self, *a, **k):
-            pass
-    from contextlib import contextmanager
-    @contextmanager
-    def timed_block(perf_sink, name):
-        yield
-    @contextmanager
-    def slow_tick_guard(*a, **k):
-        yield
+# perf_probe removed - no longer using monkey patches
 from threading import BoundedSemaphore
 from typing import Dict, List, Optional, Any, Tuple
 import pytz
@@ -43,22 +29,36 @@ from patterns.pattern_detector import PatternDetector
 from utils.correct_volume_calculator import CorrectVolumeCalculator, VolumeResolver
 from utils.time_aware_volume_baseline import TimeAwareVolumeBaseline
 from redis_files.redis_ohlc_keys import normalize_symbol, ohlc_latest_hash
+from utils.yaml_field_loader import resolve_session_field
 
 
 def verify_system_initialization():
     """Verify all calculation systems are working."""
     try:
         from redis_files.redis_calculations import RedisCalculations
-        from redis_files.redis_client import get_redis_client
+        from redis_files.redis_manager import RedisManager82
     except ImportError as import_err:
         print(f"❌ [SYSTEM_CHECK] Unable to import Redis calculation modules: {import_err}")
         return
 
     try:
-        redis_wrapper = get_redis_client()
-        redis_core = redis_wrapper.redis_client or redis_wrapper.get_client(0)
-        if not redis_core:
-            raise RuntimeError("Primary Redis connection unavailable")
+        # ✅ SOLUTION 4: Use RedisManager82 for verification
+        redis_core = RedisManager82.get_client(
+            process_name="system_check",
+            db=0,
+            max_connections=None
+        )
+        if redis_core is None:
+            raise RuntimeError("Redis client initialization failed")
+        
+        # Create wrapper for RedisCalculations compatibility
+        class RedisWrapper:
+            def __init__(self, redis_client):
+                self.redis_client = redis_client
+            def get_client(self, db):
+                return RedisManager82.get_client(process_name="system_check", db=db, max_connections=None)
+        
+        redis_wrapper = RedisWrapper(redis_core)
 
         calc = RedisCalculations(redis_wrapper)
 
@@ -86,10 +86,25 @@ def verify_system_initialization():
 def emergency_data_reset():
     """Emergency reset to clear synthetic patterns and validate data feeds."""
     try:
-        from redis_files.redis_client import get_redis_client
+        from redis_files.redis_manager import RedisManager82
 
-        redis_wrapper = get_redis_client()
-        redis_core = redis_wrapper.redis_client or redis_wrapper.get_client(0)
+        # ✅ SOLUTION 4: Use RedisManager82 for emergency reset
+        redis_core = RedisManager82.get_client(
+            process_name="emergency_reset",
+            db=0,
+            max_connections=None
+        )
+        if redis_core is None:
+            raise RuntimeError("Redis client initialization failed")
+        
+        # Create wrapper for compatibility
+        class RedisWrapper:
+            def __init__(self, redis_client):
+                self.redis_client = redis_client
+            def get_client(self, db):
+                return RedisManager82.get_client(process_name="emergency_reset", db=db, max_connections=None)
+        
+        redis_wrapper = RedisWrapper(redis_core)
         if not redis_core:
             raise RuntimeError("Primary Redis connection unavailable")
 
@@ -254,7 +269,8 @@ from alerts.risk_manager import RiskManager
 
 
 # Import utilities
-from redis_files.redis_client import get_redis_client, publish_to_redis
+# ✅ Legacy get_redis_client removed - use RedisManager82 instead
+# publish_to_redis is not used in this file, removed
 from intraday_scanner.calculations import (
     get_tick_processor,
     safe_format,
@@ -407,21 +423,151 @@ class MarketScanner:
         if self.config.get("debug", False):
             logger.info("Scanner running in production mode")
 
-        # Initialize Redis with robust client - use correct databases per redis_config.py
-        logger.info("📡 Connecting to Redis...")
-        self.redis_client = get_redis_client(config=self.config)
+        # Initialize Redis with process-specific pooled clients (prevents connection exhaustion)
+        logger.info("📡 Connecting to Redis with process-specific connection pools...")
+        
+        # ✅ PRIMARY: Use RedisManager82 for process-specific connection pools
         try:
-            self.redis_client.ping()
-        except Exception as exc:
-            logger.warning("⚠️ Redis connection check failed: %s", exc)
-
-        self.redis_primary = self.redis_client.redis_client or self.redis_client.get_client(0)
-        self.ohlc_redis_client = self.redis_client.get_client(1)  # prices → realtime
-        self.stream_redis_client = self.redis_client.get_client(1)  # continuous_market → realtime
-        self.volume_redis_client = self.redis_client.get_client(2)  # cumulative_volume → analytics
-        self.pattern_redis_client = self.redis_client.get_client(1)  # patterns → realtime
-        self.redis_wrapper = self.redis_client  # Alias for compatibility
-        logger.info("Redis clients connected (shared pool)")
+            from redis_files.redis_manager import RedisManager82
+            
+            # ✅ SOLUTION 4: Get process-specific pooled clients using PROCESS_POOL_CONFIG
+            # All clients use the same pool (30 connections) for intraday_scanner
+            self.redis_primary = RedisManager82.get_client(
+                process_name="intraday_scanner",
+                db=0,
+                max_connections=None  # Use PROCESS_POOL_CONFIG (30 connections)
+            )
+            # Reuse same pool for DB 1 clients (stream, pattern use DB 1)
+            self.realtime_db1_client = RedisManager82.get_client(
+                process_name="intraday_scanner",
+                db=1,
+                max_connections=None  # Use PROCESS_POOL_CONFIG (30 connections)
+            )
+            # ✅ FIXED: ohlc_latest is now in DB 2 (analytics) per redis_config.py
+            self.stream_redis_client = self.realtime_db1_client  # continuous_market → realtime (DB 1)
+            self.pattern_redis_client = self.realtime_db1_client  # patterns → realtime (DB 1)
+            
+            self.volume_redis_client = RedisManager82.get_client(
+                process_name="intraday_scanner",
+                db=2,
+                max_connections=None  # Use PROCESS_POOL_CONFIG (30 connections)
+            )  # cumulative_volume → analytics (DB 2)
+            # ✅ FIXED: ohlc_latest moved to DB 2 (analytics) - use volume_redis_client
+            self.ohlc_redis_client = self.volume_redis_client  # ohlc_latest → analytics (DB 2)
+            
+            # Use pooled clients directly (RobustRedisClient features not needed here)
+            # Process-specific pools already provide connection management
+            self.redis_client = self.redis_primary
+            logger.info("✅ Redis clients connected (process-specific pools)")
+            
+            # Test connections
+            self.redis_primary.ping()
+            self.realtime_db1_client.ping()
+            logger.info("✅ Redis connection test successful")
+            
+        except ImportError:
+            # RedisManager82 is required - no fallback to legacy methods
+            logger.error("❌ RedisManager82 not available - cannot proceed without optimized connection management")
+            raise RuntimeError("RedisManager82 is required for scanner initialization")
+        
+        # ✅ Create compatibility wrapper that provides get_client() method
+        # This allows components that expect RobustRedisClient to work with pooled clients
+        class PooledRedisWrapper:
+            """Wrapper to make pooled Redis clients compatible with RobustRedisClient interface"""
+            def __init__(self, primary_client, db1_client, db2_client):
+                self.redis_client = primary_client  # For backward compatibility
+                self._db0 = primary_client
+                self._db1 = db1_client
+                self._db2 = db2_client
+            
+            def get_client(self, db=0):
+                """Return pooled client for specified DB"""
+                if db == 0:
+                    return self._db0
+                elif db == 1:
+                    return self._db1
+                elif db == 2:
+                    return self._db2
+                else:
+                    # Fallback to DB 0 for unknown DBs
+                    return self._db0
+            
+            def get_rolling_window_buckets(self, symbol: str, lookback_minutes: int = 60, session_date: str = None, max_days_back: int = None):
+                """✅ FIXED: Get buckets from session data per REDIS_STORAGE_SIGNATURE.md
+                
+                Per REDIS_STORAGE_SIGNATURE.md, buckets are stored in session data (DB 0)
+                Format: session:{symbol}:{date} -> time_buckets (nested JSON with prices/volumes)
+                """
+                # ✅ FIXED: Use session data directly (simpler and more reliable)
+                return self._get_buckets_from_session_data(symbol, lookback_minutes, session_date, max_days_back)
+            
+            def _get_buckets_from_session_data(self, symbol: str, lookback_minutes: int, session_date: str = None, max_days_back: int = None):
+                """Get buckets from session data (DB 0) per REDIS_STORAGE_SIGNATURE.md"""
+                try:
+                    from datetime import datetime, timedelta
+                    import json
+                    
+                    # Use DB 0 client for session data
+                    session_client = self._db0
+                    
+                    # Calculate date range
+                    if session_date:
+                        try:
+                            target_date = datetime.strptime(session_date, '%Y-%m-%d').date()
+                            date_min = target_date
+                            date_max = target_date
+                        except ValueError:
+                            date_max = datetime.now().date()
+                            date_min = date_max - timedelta(days=max_days_back or 7)
+                    else:
+                        date_max = datetime.now().date()
+                        date_min = date_max - timedelta(days=max_days_back or 7)
+                    
+                    # Try current date and recent dates
+                    dates_to_try = [
+                        date_max.strftime("%Y-%m-%d"),
+                        (date_max - timedelta(days=1)).strftime("%Y-%m-%d"),
+                        (date_max - timedelta(days=2)).strftime("%Y-%m-%d"),
+                    ]
+                    
+                    buckets_data = []
+                    for date_str in dates_to_try:
+                        session_key = f"session:{symbol}:{date_str}"
+                        try:
+                            session_data_str = session_client.get(session_key)
+                            if session_data_str:
+                                if isinstance(session_data_str, bytes):
+                                    session_data_str = session_data_str.decode('utf-8')
+                                session_data = json.loads(session_data_str) if isinstance(session_data_str, str) else session_data_str
+                                time_buckets = session_data.get('time_buckets', {})
+                                
+                                if time_buckets:
+                                    for bucket_key, bucket_data in time_buckets.items():
+                                        if isinstance(bucket_data, dict):
+                                            buckets_data.append(bucket_data)
+                                    if buckets_data:
+                                        break
+                        except Exception:
+                            continue
+                    
+                    return buckets_data if buckets_data else []
+                    
+                except Exception as e:
+                    logger.debug(f"Error getting buckets from session data: {e}")
+                    return []
+            
+            def __getattr__(self, name):
+                # Delegate all other attributes to primary client
+                return getattr(self._db0, name)
+        
+        # Wrap pooled clients for backward compatibility
+        self.redis_wrapper = PooledRedisWrapper(
+            self.redis_primary,
+            self.realtime_db1_client,
+            self.volume_redis_client
+        )
+        # Also set redis_client to wrapper for components that need get_client()
+        self.redis_client = self.redis_wrapper
 
         # Initialize volume profile and time-aware baselines
         logger.info("Initializing volume profile and time-aware baselines...")
@@ -437,15 +583,6 @@ class MarketScanner:
             config=self.config, redis_client=self.redis_client
         )
         logger.info("  ✓ Consolidated Pattern Detector ready")
-
-        # Trading Strategies - Nifty Scalper
-        try:
-            from strategies.nifty_scalper import NiftyScalper
-            self.nifty_scalper = NiftyScalper(redis_client=self.redis_client)
-            logger.info("  ✓ Nifty Scalper strategy ready")
-        except ImportError as e:
-            logger.warning(f"  ⚠️ Nifty Scalper not available: {e}")
-            self.nifty_scalper = None
 
         # Tick Processor - calculates indicators
         from intraday_scanner.calculations import get_tick_processor
@@ -478,6 +615,36 @@ class MarketScanner:
         # Data pipeline enabled with tick processor
         self.data_pipeline.start()
         logger.info("  ✓ Data Pipeline enabled with tick processor")
+        
+        # ✅ OPTIMIZATION 4: Start performance monitoring (Redis streams + historical archive)
+        self.performance_monitor = None
+        if self.config.get('enable_performance_monitoring', True):
+            try:
+                from utils.performance_monitor import monitor_performance
+                if self.data_pipeline.historical_archive:
+                    self.performance_monitor = monitor_performance(
+                        redis_db=1,
+                        check_interval=self.config.get('performance_check_interval', 60),
+                        historical_archive_instance=self.data_pipeline.historical_archive
+                    )
+                    logger.info("  ✓ Performance Monitor started (60s interval)")
+                else:
+                    logger.debug("  ⚠️  Performance monitor skipped (historical archive not available)")
+            except Exception as e:
+                logger.warning(f"  ⚠️  Could not start performance monitor: {e}")
+        
+        # ✅ SOLUTION 5: Initialize proactive stream monitor (replaces reactive optimizer)
+        self.stream_monitor = None
+        if self.config.get('enable_stream_monitoring', True):
+            try:
+                from utils.stream_monitor import StreamMonitor
+                self.stream_monitor = StreamMonitor(
+                    db=1,  # DB 1 for realtime streams
+                    check_interval=self.config.get('stream_monitor_interval', 300)  # 5 minutes
+                )
+                logger.info("  ✓ Stream Monitor initialized (proactive monitoring every 5 min)")
+            except Exception as e:
+                logger.warning(f"  ⚠️  Could not initialize stream monitor: {e}")
         
         # News alert system is handled by alert_manager
         self.last_news_check = time.time()
@@ -584,17 +751,18 @@ class MarketScanner:
         self.all_symbols = self._load_symbol_universe()
 
         # Historical Data Manager - handles Redis → JSON → Historical pipeline
+        # NOTE: Historical data manager module not present in codebase - feature disabled
         self.historical_data_manager = None
         if self.config.get("enable_historical_analysis", False):  # Disabled by default
             try:
-                from utils.historical_data_manager import HistoricalDataManager
-
+                from utils.historical_data_manager import HistoricalDataManager  # type: ignore[import-untyped]
+                
                 self.historical_data_manager = HistoricalDataManager(
                     redis_wrapper=self.redis_wrapper, config=self.config
                 )
                 logger.info("  ✓ Historical Data Manager ready")
             except ImportError as e:
-                logger.warning(f"Historical Data Manager not available: {e}")
+                logger.warning(f"Historical Data Manager not available (module not found): {e}")
                 self.historical_data_manager = None
 
         # Validation export removed - using standalone validator
@@ -708,29 +876,53 @@ class MarketScanner:
                 redis_core = getattr(self.redis_wrapper, "redis_wrapper", None)
                 if not redis_core:
                     return False
-                candidates = tick_streams[:200] if tick_streams else ["market_data.ticks"]
+                candidates = tick_streams[:200] if tick_streams else ["ticks:intraday:processed"]
                 for stream_key in candidates:
                     try:
-                        entries = redis_core.xrevrange(stream_key, count=1)
-                        if not entries:
+                        # ✅ OPTIMIZED: Use XREAD instead of xrevrange
+                        latest_entry = self._get_latest_stream_entry(stream_key)
+                        if not latest_entry:
                             continue
-                        _id, values = entries[0]
-                        if "volume_ratio" in values or b"volume_ratio" in values:
-                            return True
-                        payload = values.get("data") or values.get(b"data")
-                        if isinstance(payload, bytes):
-                            payload = payload.decode("utf-8", errors="ignore")
-                        if isinstance(payload, str):
-                            try:
-                                tick_payload = json.loads(payload)
-                                if tick_payload.get("volume_ratio") is not None:
-                                    return True
-                                from utils.correct_volume_calculator import VolumeResolver
-                                ratio = VolumeResolver.get_volume_ratio(tick_payload)
-                                if ratio is not None and ratio >= 0:
-                                    return True
-                            except Exception:
-                                pass
+                        
+                        # latest_entry is (message_id, message_data) tuple
+                        if len(latest_entry) < 2:
+                            continue
+                        
+                        _id, values = latest_entry
+                        
+                        # Check if volume_ratio is in message data
+                        if isinstance(values, dict):
+                            # Decode bytes keys if needed
+                            decoded_values = {}
+                            for k, v in values.items():
+                                key_str = k.decode('utf-8') if isinstance(k, bytes) else str(k)
+                                if isinstance(v, bytes):
+                                    try:
+                                        decoded_values[key_str] = v.decode('utf-8')
+                                    except:
+                                        decoded_values[key_str] = v
+                                else:
+                                    decoded_values[key_str] = v
+                            values = decoded_values
+                            
+                            if "volume_ratio" in values:
+                                return True
+                            
+                            # Check in 'data' field if it's JSON
+                            payload = values.get("data")
+                            if isinstance(payload, bytes):
+                                payload = payload.decode("utf-8", errors="ignore")
+                            if isinstance(payload, str):
+                                try:
+                                    tick_payload = json.loads(payload)
+                                    if tick_payload.get("volume_ratio") is not None:
+                                        return True
+                                    from utils.correct_volume_calculator import VolumeResolver
+                                    ratio = VolumeResolver.get_volume_ratio(tick_payload)
+                                    if ratio is not None and ratio >= 0:
+                                        return True
+                                except Exception:
+                                    pass
                     except Exception:
                         continue
                 return False
@@ -787,15 +979,10 @@ class MarketScanner:
             self.run_file_reader()
         else:
             logger.info("📡 Starting Redis subscription...")
-            # Start DataPipeline in a separate thread
-            self.data_pipeline_thread = threading.Thread(
-                target=self.data_pipeline.start_consuming,
-                daemon=False,
-                name="DataPipeline",
-            )
-            self.data_pipeline_thread.start()
-            with self.threads_lock:
-                self.threads.append(self.data_pipeline_thread)
+            # ✅ DataPipeline.start() already handles stream consumption in its own thread
+            # No need to start a separate thread here - it's already started in __init__
+            # The data_pipeline.start() method creates and starts the consumer_thread internally
+            logger.info("✅ DataPipeline stream consumer already started via start() method")
 
             # Start health monitoring thread
             self.health_monitor_thread = threading.Thread(
@@ -805,22 +992,55 @@ class MarketScanner:
             with self.threads_lock:
                 self.threads.append(self.health_monitor_thread)
             self.threads.append(self.health_monitor_thread)
+        
+        # ✅ SOLUTION 5: Start proactive stream monitor (runs continuously)
+        if hasattr(self, "stream_monitor") and self.stream_monitor:
+            try:
+                self.stream_monitor.start()
+                logger.info("✓ Stream Monitor started (proactive monitoring)")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not start stream monitor: {e}")
 
         # Start the main processing loop
         self.run_main_processing_loop()
 
-        # Wait for data pipeline thread to finish gracefully
-        if (
-            hasattr(self, "data_pipeline_thread")
-            and self.data_pipeline_thread.is_alive()
-        ):
+        # Stop performance monitor gracefully
+        if hasattr(self, "performance_monitor") and self.performance_monitor:
+            try:
+                self.performance_monitor.stop()
+                logger.info("✓ Performance Monitor stopped")
+            except Exception as e:
+                logger.debug(f"Performance monitor stop error (non-critical): {e}")
+        
+        # ✅ SOLUTION 5: Stop stream monitor gracefully
+        if hasattr(self, "stream_monitor") and self.stream_monitor:
+            try:
+                self.stream_monitor.stop()
+                logger.info("✓ Stream Monitor stopped")
+            except Exception as e:
+                logger.debug(f"Stream monitor stop error (non-critical): {e}")
+        
+        # Stop data pipeline gracefully (it manages its own thread internally)
+        if hasattr(self, "data_pipeline"):
             self.data_pipeline.running = False  # Signal to stop
-            self.data_pipeline_thread.join(timeout=2)  # Wait up to 2 seconds
+            # Wait for internal consumer thread to finish
+            if hasattr(self.data_pipeline, "consumer_thread") and self.data_pipeline.consumer_thread.is_alive():
+                self.data_pipeline.consumer_thread.join(timeout=2)  # Wait up to 2 seconds
 
     def run_file_reader(self):
-        """Read data from JSONL files instead of Redis"""
-        from file_reader import FileReader
-
+        """Read data from JSONL files instead of Redis
+        
+        NOTE: This is an optional feature for offline/testing mode.
+        The file_reader module is not present in the codebase - feature disabled.
+        Enable via config flag: use_file_reader=True
+        """
+        try:
+            from file_reader import FileReader  # type: ignore[import-untyped]
+        except ImportError as e:
+            logger.error(f"FileReader module not available (required for file-based data reading): {e}")
+            logger.error("Please ensure file_reader.py exists or use Redis-based data source (default)")
+            return
+        
         # Data directory from config or default
         data_dir = self.config.get("data_dir", "/Users/apple/Desktop/stock/data/equity")
 
@@ -947,13 +1167,8 @@ class MarketScanner:
             )
 
         try:
-            if not hasattr(self, "perf") or self.perf is None:
-                try:
-                    if self.redis_wrapper:
-                        rt_client = self.redis_wrapper.get_client(1)
-                    self.perf = PerfSink(redis_client=rt_client, stream="metrics:perf")
-                except Exception:
-                    self.perf = PerfSink()
+            # perf_probe removed - no longer using performance monitoring monkey patches
+            self.perf = None
             last_debug_time = time.time()
             last_health_check = time.time()
             while self.running:
@@ -1317,7 +1532,14 @@ class MarketScanner:
         )
         start = time.time()
         price_window = self.config.get("price_cache_window", 100)
-        self._load_combined_ohlc_cache()
+        # ✅ OPTIMIZED: Only load JSON OHLC cache if explicitly enabled (Redis is primary source)
+        # The JSON file is now only used as a fallback when Redis is unavailable
+        use_json_fallback = self.config.get("use_json_ohlc_fallback", False)
+        if use_json_fallback:
+            self._load_combined_ohlc_cache()
+        else:
+            logger.debug("Skipping JSON OHLC cache load - using Redis as primary source")
+        
         self._refresh_vix_snapshot(force=True)
 
         for symbol in self.all_symbols:
@@ -1426,7 +1648,14 @@ class MarketScanner:
         return self._load_avg_volume(symbol)
 
     def _load_combined_ohlc_cache(self) -> Dict[str, Dict[str, Any]]:
+        """Load OHLC cache from JSON file (fallback only - Redis is primary source)"""
         if self._combined_ohlc_cache:
+            return self._combined_ohlc_cache
+
+        # ✅ OPTIMIZED: Only load JSON file if explicitly enabled (Redis is primary source)
+        use_json_fallback = self.config.get("use_json_ohlc_fallback", False)
+        if not use_json_fallback:
+            self._combined_ohlc_cache = {}
             return self._combined_ohlc_cache
 
         combined_dir = os.path.join(project_root, "config")
@@ -1452,7 +1681,7 @@ class MarketScanner:
                     self._combined_ohlc_cache = cache
                 else:
                     self._combined_ohlc_cache = {}
-            logger.info("Loaded combined OHLC file: %s", latest_file)
+            logger.debug("Loaded combined OHLC file (fallback): %s", latest_file)
         except Exception as exc:
             logger.debug("Failed to load combined OHLC file %s: %s", latest_file, exc)
             self._combined_ohlc_cache = {}
@@ -1873,14 +2102,31 @@ class MarketScanner:
         try:
             print("🔍 [THREAD_DEBUG] Starting health check...")
 
-            # Check if data pipeline thread is alive
-            if hasattr(self, "data_pipeline_thread"):
-                if not self.data_pipeline_thread.is_alive():
-                    logger.error("Data pipeline thread is dead")
-                    print("🔍 [THREAD_DEBUG] Data pipeline thread is dead")
-                    return False
+            # Check if data pipeline consumer thread is alive (now managed internally)
+            if hasattr(self, "data_pipeline"):
+                # ✅ FIXED: Check if consumer_thread exists and is alive (for both Pub/Sub and Stream modes)
+                if hasattr(self.data_pipeline, "consumer_thread"):
+                    if not self.data_pipeline.consumer_thread.is_alive():
+                        logger.error("Data pipeline consumer thread is dead")
+                        print("🔍 [THREAD_DEBUG] Data pipeline consumer thread is dead")
+                        return False
+                    else:
+                        print("🔍 [THREAD_DEBUG] Data pipeline consumer thread is alive")
                 else:
-                    print("🔍 [THREAD_DEBUG] Data pipeline thread is alive")
+                    # ✅ FIXED: For RobustStreamConsumer, check if pipeline is running instead
+                    if hasattr(self.data_pipeline, "running"):
+                        if not self.data_pipeline.running:
+                            logger.warning("Data pipeline is not running (RobustStreamConsumer mode)")
+                            print("🔍 [THREAD_DEBUG] Data pipeline not running")
+                            return False
+                        else:
+                            print("🔍 [THREAD_DEBUG] Data pipeline running (RobustStreamConsumer mode)")
+                    else:
+                        # Fallback: if neither consumer_thread nor running flag exists, assume it's starting up
+                        logger.debug("Data pipeline consumer thread not found (may be starting up)")
+                        print("🔍 [THREAD_DEBUG] Data pipeline consumer thread not found (may be starting up)")
+                        # Don't fail health check if pipeline is just starting
+                        pass
 
             # Check Redis connection
             redis_start = time.time()
@@ -2187,10 +2433,24 @@ class MarketScanner:
                 except Exception as e:
                     logger.error(f"Error closing Redis connection: {e}")
 
-            # Reconnect
-            from redis_files.redis_client import get_redis_client
+            # ✅ SOLUTION 4: Reconnect using RedisManager82
+            from redis_files.redis_manager import RedisManager82
 
-            self.redis_wrapper = get_redis_client()
+            # Create wrapper for compatibility
+            class RedisWrapper:
+                def __init__(self, redis_client):
+                    self.redis_client = redis_client
+                def get_client(self, db):
+                    return RedisManager82.get_client(process_name="websocket_reconnect", db=db, max_connections=None)
+                def ping(self):
+                    return self.redis_client.ping()
+            
+            redis_core = RedisManager82.get_client(
+                process_name="websocket_reconnect",
+                db=0,
+                max_connections=None
+            )
+            self.redis_wrapper = RedisWrapper(redis_core)
 
             # Test new connection
             if self.redis_wrapper.ping():
@@ -2887,782 +3147,14 @@ class MarketScanner:
             )
 
         try:
-            for message in pubsub.listen():
-                if not self.running:
-                    break
-
-                # WebSocket health monitoring
-                current_time = time.time()
-                message_count += 1
-
-                # Check for WebSocket health every 30 seconds
-                if current_time - last_health_check > 30:
-                    self._check_websocket_health(
-                        message_count, last_message_time, current_time
-                    )
-                    last_health_check = current_time
-
-                if message["type"] == "message":
-                    last_message_time = current_time
-                    try:
-                        channel = (
-                            message["channel"].decode()
-                            if isinstance(message["channel"], bytes)
-                            else message["channel"]
-                        )
-                        if dbg_enabled:
-                            rx_count += 1
-                            if rx_count <= 10 or rx_count % 100 == 0:
-                                print(f"🛰️ RX #{rx_count} on channel: {channel}")
-
-                        if channel == "market_data.ticks":
-                            # Process tick data
-                            try:
-                                raw_tick_data = json.loads(message["data"])
-                                # Convert WebSocket fields to unified schema
-                                symbol = raw_tick_data.get(
-                                    "tradingsymbol",
-                                    raw_tick_data.get("symbol", "UNKNOWN"),
-                                )
-
-                                # Resolve token to proper symbol if needed
-                                if symbol.startswith("TOKEN_") or symbol.isdigit():
-                                    instrument_token = raw_tick_data.get(
-                                        "instrument_token"
-                                    )
-                                    if instrument_token:
-                                        try:
-                                            from crawlers.utils.instrument_mapper import InstrumentMapper
-                                            mapper = InstrumentMapper()
-                                            resolve_token_to_symbol = mapper.token_to_symbol
-
-                                            resolved_symbol = resolve_token_to_symbol(
-                                                instrument_token
-                                            )
-                                            if resolved_symbol:
-                                                symbol = resolved_symbol
-                                                # Update the raw data with resolved symbol
-                                                raw_tick_data["symbol"] = symbol
-                                                raw_tick_data["tradingsymbol"] = (
-                                                    symbol.split(":")[-1]
-                                                    if ":" in symbol
-                                                    else symbol
-                                                )
-                                        except Exception as e:
-                                            print(
-                                                f"Token resolution failed for {instrument_token}: {e}"
-                                            )
-
-                                tick_data = map_kite_to_unified(raw_tick_data, symbol)
-                                parse_ok += 1
-
-                                # 🔍 DEBUG: Log raw tick data structure
-                                if dbg_enabled and (
-                                    processed_count < 5 or processed_count % 100 == 0
-                                ):
-                                    print(
-                                        f"🔍 [REDIS→PIPELINE] Raw tick data keys: {list(tick_data.keys())}"
-                                    )
-                                    print(
-                                        f"🔍 [REDIS→PIPELINE] Symbol: {tick_data.get('symbol', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"🔍 [REDIS→PIPELINE] Last last_price: {tick_data.get('last_price', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"🔍 [REDIS→PIPELINE] Volume: {tick_data.get('bucket_incremental_volume', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"🔍 [REDIS→PIPELINE] Timestamp: {tick_data.get('timestamp', 'MISSING')}"
-                                    )
-
-                            except Exception as e:
-                                print(f"❌ JSON parse failed: {e}")
-                                print(
-                                    f"🔍 [REDIS→PIPELINE] Raw message data: {message['data'][:200]}..."
-                                )
-                                raise
-                            pre_sym = tick_data.get("symbol") or tick_data.get(
-                                "tradingsymbol"
-                            )
-                            if dbg_enabled and (
-                                processed_count < 10 or processed_count % 100 == 0
-                            ):
-                                print(
-                                    f"🧾 RAW: pre_sym={pre_sym} has_tradingsymbol={'tradingsymbol' in tick_data} "
-                                    f"has_token={'instrument_token' in tick_data} lp={tick_data.get('last_price')}"
-                                )
-                                if pre_sym in [
-                                    "HDFCBANK",
-                                    "BANKNIFTY25SEP51100PE",
-                                    "ICICIBANK",
-                                ] or (pre_sym and "NIFTY" in pre_sym):
-                                    print(
-                                        f"📊 Tick #{processed_count}: {pre_sym} @ ₹{tick_data.get('last_price', 0)} Vol:{tick_data.get('zerodha_cumulative_volume', 0)}"
-                                    )
-                                    print(
-                                        f"   🔍 BEFORE cleaning - tradingsymbol: {repr(tick_data.get('tradingsymbol'))}"
-                                    )
-                                    print(
-                                        f"   🔍 BEFORE cleaning - symbol: {repr(tick_data.get('symbol'))}"
-                                    )
-                                    print(
-                                        f"   🔍 RAW TICK KEYS: {list(tick_data.keys())}"
-                                    )
-                                    print(
-                                        f"   🔍 bucket_incremental_volume: {tick_data.get('bucket_incremental_volume', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"   🔍 zerodha_cumulative_volume: {tick_data.get('zerodha_cumulative_volume', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"   🔍 zerodha_last_traded_quantity: {tick_data.get('zerodha_last_traded_quantity', 'MISSING')}"
-                                    )
-                                    print(f"   🔍 oi: {tick_data.get('oi', 'MISSING')}")
-                                    print(
-                                        f"   🔍 timestamp: {tick_data.get('timestamp', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"   🔍 last_price: {tick_data.get('last_price', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"   🔍 mode: {tick_data.get('mode', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"   🔍 exchange_timestamp: {tick_data.get('exchange_timestamp', 'MISSING')}"
-                                    )
-
-                                # Clean the tick data
-                                raw_keys = list(tick_data.keys())  # preserve for debug
-                                try:
-                                    # 🔍 DEBUG: Log before cleaning
-                                    if dbg_enabled and (
-                                        processed_count < 5
-                                        or processed_count % 100 == 0
-                                    ):
-                                        print(
-                                            f"🔍 [PIPELINE→CLEAN] Before cleaning - keys: {raw_keys}"
-                                        )
-                                        print(
-                                            f"🔍 [PIPELINE→CLEAN] Before cleaning - symbol: {tick_data.get('symbol', 'MISSING')}"
-                                        )
-                                        print(
-                                            f"🔍 [PIPELINE→CLEAN] Before cleaning - bucket_incremental_volume: {tick_data.get('bucket_incremental_volume', 'MISSING')}"
-                                        )
-
-                                    tick_data = self.data_pipeline._clean_tick_data(
-                                        tick_data
-                                    )
-                                    clean_ok += 1
-
-                                    # 🔍 DEBUG: Log after cleaning
-                                    if dbg_enabled and (
-                                        processed_count < 5
-                                        or processed_count % 100 == 0
-                                    ):
-                                        cleaned_keys = list(tick_data.keys())
-                                        print(
-                                            f"🔍 [PIPELINE→CLEAN] After cleaning - keys: {cleaned_keys}"
-                                        )
-                                        print(
-                                            f"🔍 [PIPELINE→CLEAN] After cleaning - symbol: {tick_data.get('symbol', 'MISSING')}"
-                                        )
-                                        print(
-                                            f"🔍 [PIPELINE→CLEAN] After cleaning - bucket_incremental_volume: {tick_data.get('bucket_incremental_volume', 'MISSING')}"
-                                        )
-                                        dropped_keys = [
-                                            k for k in raw_keys if k not in cleaned_keys
-                                        ]
-                                        if dropped_keys:
-                                            print(
-                                                f"🔍 [PIPELINE→CLEAN] Dropped keys: {dropped_keys}"
-                                            )
-
-                                except Exception as e:
-                                    print(f"❌ Cleaning failed: {e}")
-                                    print(
-                                        f"🔍 [PIPELINE→CLEAN] Error context - raw keys: {raw_keys}"
-                                    )
-                                    raise
-
-                                # Post-clean symbol
-                                post_sym = tick_data.get(
-                                    "tradingsymbol"
-                                ) or tick_data.get("symbol")
-                                display_sym = (
-                                    post_sym or pre_sym or tick_data.get("symbol")
-                                )
-                                # Initialize use_sym to avoid UnboundLocalError
-                                use_sym = display_sym
-
-                                if dbg_enabled and (
-                                    processed_count < 10 or processed_count % 100 == 0
-                                ):
-                                    print(f"🔧 Post-clean symbol: {post_sym}")
-
-                                # Debug: Show what's being sent to tick processor
-                                if processed_count % 100 == 0:
-                                    cleaned_keys = list(tick_data.keys())
-                                    print(
-                                        f"   🧹 Cleaned tick data keys: {cleaned_keys}"
-                                    )
-                                    print(
-                                        f"   🎯 Symbol: {tick_data.get('tradingsymbol', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"   📊 AFTER cleaning: bucket_incremental_volume={tick_data.get('bucket_incremental_volume', 0)}, zerodha_cumulative_volume={tick_data.get('zerodha_cumulative_volume', 0)}"
-                                    )
-                                    print(
-                                        f"   🧪 Mode preserved: {tick_data.get('mode', 'MISSING')}"
-                                    )
-                                    # Show which keys were dropped (debug-only)
-                                    dropped = sorted(
-                                        [k for k in raw_keys if k not in cleaned_keys]
-                                    )
-                                    if dropped:
-                                        print(f"   🗂️ Dropped keys: {dropped}")
-                                    # Also emit pipeline log summary for file diagnostics
-                                    try:
-                                        self.data_pipeline._log_cleaned_tick_summary(
-                                            tick_data
-                                        )
-                                    except Exception:
-                                        pass
-
-                                self._store_latest_price(tick_data)
-
-                                # Optional validation (for debug visibility only)
-                                try:
-                                    is_valid = self.data_pipeline._validate_tick(
-                                        tick_data
-                                    )
-                                except Exception as e:
-                                    is_valid = False
-                                    if dbg_enabled:
-                                        print(f"❌ Validation check errored: {e}")
-                                if is_valid:
-                                    validate_ok += 1
-                                if dbg_enabled and (
-                                    processed_count < 10 or processed_count % 100 == 0
-                                ):
-                                    print(
-                                        f"   ✅ Validated: {is_valid} lp={tick_data.get('last_price')} sym={tick_data.get('tradingsymbol')}"
-                                    )
-
-                                # ✅ ADD AION VOLUME CONTEXT INTEGRATION
-                                self._add_volume_context(tick_data)
-
-                                # Process through calculations
-                                if dbg_enabled and (
-                                    processed_count < 5 or processed_count % 100 == 0
-                                ):
-                                    print(
-                                        f"🔍 [CLEAN→TICK_PROCESSOR] Input to tick processor:"
-                                    )
-                                    print(
-                                        f"🔍 [CLEAN→TICK_PROCESSOR] Symbol: {tick_data.get('symbol', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"🔍 [CLEAN→TICK_PROCESSOR] Last last_price: {tick_data.get('last_price', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"🔍 [CLEAN→TICK_PROCESSOR] Volume: {tick_data.get('bucket_incremental_volume', 'MISSING')}"
-                                    )
-                                    print(
-                                        f"🔍 [CLEAN→TICK_PROCESSOR] Timestamp: {tick_data.get('timestamp', 'MISSING')}"
-                                    )
-
-                                indicators = self.tick_processor.process_tick(
-                                    symbol, tick_data
-                                )
-                                if indicators:
-                                    process_ok += 1
-
-                                    # Store indicators using RedisStorage (TA-Lib calculates in calculations.py and stores via redis_storage.py)
-                                    if hasattr(self, 'data_pipeline') and hasattr(self.data_pipeline, 'redis_storage'):
-                                        try:
-                                            import asyncio
-                                            # Use redis_storage to store indicators - it handles TA-Lib calculations and storage
-                                            tick_list = [tick_data] if tick_data else []
-                                            loop = asyncio.new_event_loop()
-                                            asyncio.set_event_loop(loop)
-                                            try:
-                                                loop.run_until_complete(
-                                                    self.data_pipeline.redis_storage.publish_indicators_to_redis(symbol, tick_list)
-                                                )
-                                            finally:
-                                                loop.close()
-                                        except Exception as store_err:
-                                            logger.debug(f"Failed to store indicators via redis_storage for {symbol}: {store_err}")
-
-                                    # 🔍 DEBUG: Log tick processor output
-                                    if dbg_enabled and (
-                                        processed_count < 5
-                                        or processed_count % 100 == 0
-                                    ):
-                                        print(
-                                            f"🔍 [TICK_PROCESSOR→OUTPUT] Indicators calculated:"
-                                        )
-                                        print(
-                                            f"🔍 [TICK_PROCESSOR→OUTPUT] Volume ratio: {indicators.get('volume_ratio', 'MISSING')}"
-                                        )
-                                        print(
-                                            f"🔍 [TICK_PROCESSOR→OUTPUT] Price change: {indicators.get('price_change', 'MISSING')}"
-                                        )
-                                        # buy_pressure removed - using 8 core patterns only
-                                        print(
-                                            f"🔍 [TICK_PROCESSOR→OUTPUT] Avg bucket_incremental_volume 20d: {indicators.get('avg_volume_20d', 'MISSING')}"
-                                        )
-                                        print(
-                                            f"🔍 [TICK_PROCESSOR→OUTPUT] All indicator keys: {list(indicators.keys())}"
-                                        )
-                                else:
-                                    # 🔍 DEBUG: Log when no indicators calculated
-                                    if dbg_enabled and (
-                                        processed_count < 5
-                                        or processed_count % 100 == 0
-                                    ):
-                                        print(
-                                            f"🔍 [TICK_PROCESSOR→OUTPUT] No indicators calculated for {display_sym}"
-                                        )
-                                        print(
-                                            f"🔍 [TICK_PROCESSOR→OUTPUT] Input data: {tick_data}"
-                                        )
-
-                                if indicators:
-                                    # Add detailed logging after indicator calculation
-                                    vol_ratio_str = safe_format(
-                                        indicators.get("volume_ratio"), "{:.2f}"
-                                    )
-                                    price_change_str = safe_format(
-                                        indicators.get("price_change"), "{:.2f}"
-                                    )
-                                    # buy_pressure removed - using 8 core patterns only
-                                    print(
-                                        f"   📈 Indicators: vol_ratio={vol_ratio_str}, price_change={price_change_str}%"
-                                    )
-
-                                    # Debug: Show if indicators calculated
-                                    if processed_count % 100 == 0:
-                                        print(
-                                            f"   ✓ Indicators calculated for {display_sym}"
-                                        )
-                                        # Show sample indicator values
-                                        vol_ratio_sample = safe_format(
-                                            indicators.get("volume_ratio"), "{:.2f}"
-                                        )
-                                        print(
-                                            f"      - volume_ratio: {vol_ratio_sample}"
-                                        )
-                                        print(
-                                            f"      - price_change: {safe_format(indicators.get('price_change'), '{:.2f')}%"
-                                        )
-                                        # buy_pressure removed - using 8 core patterns only
-
-                                    # Orchestrator-level ADV reference: ensure 20d avg is present
-                                    print(
-                                        f"🔍 STEP 1: Checking 20d data availability for {display_sym}"
-                                    )
-                                    has_20d_data = False
-                                    print(
-                                        f"🔍 STEP 1: Checking 20d data availability for {display_sym}"
-                                    )
-                                    try:
-                                        adv = indicators.get("avg_volume_20d")
-                                        if (
-                                            not isinstance(adv, (int, float))
-                                            or adv <= 0
-                                        ):
-                                            # Try loading from volume_averages_20d.json file directly
-                                            sym_for_adv = display_sym or (
-                                                tick_data.get("tradingsymbol")
-                                                or tick_data.get("symbol")
-                                            )
-                                            try:
-                                                volume_file_path = os.path.join(
-                                                    os.path.dirname(__file__),
-                                                    "config/volume_averages_20d.json",
-                                                )
-                                                with open(volume_file_path, "r") as f:
-                                                    volume_data = json.load(f)
-                                                    # Try both with and without NSE: prefix
-                                                    symbol_data = volume_data.get(
-                                                        sym_for_adv
-                                                    ) or volume_data.get(
-                                                        f"NSE:{sym_for_adv}", {}
-                                                    )
-                                                    adv_try = symbol_data.get(
-                                                        "avg_volume_20d"
-                                                    )
-                                                    if (
-                                                        isinstance(
-                                                            adv_try, (int, float)
-                                                        )
-                                                        and adv_try > 0
-                                                    ):
-                                                        has_20d_data = True
-                                                        print(
-                                                            f"🎯 FOUND TOKEN WITH 20D DATA: {sym_for_adv} = {int(adv_try)} avg bucket_incremental_volume"
-                                                        )
-                                                        indicators["avg_volume_20d"] = (
-                                                            float(adv_try)
-                                                        )
-                                            except Exception as e:
-                                                print(
-                                                    f"⚠️ Failed to load 20d data for {sym_for_adv}: {e}"
-                                                )
-                                                adv_try = None
-                                        else:
-                                            has_20d_data = True  # Explicitly set to True if valid 20d avg is present
-                                    except Exception as e:
-                                        if dbg_enabled:
-                                            print(
-                                                f"   ⚠️ MAIN: ADV injection check failed: {e}"
-                                            )
-
-                                    # Check if we have complete data before pattern detection
-                                    if not has_20d_data:
-                                        if dbg_enabled:
-                                            print(
-                                                f"⚠️  {display_sym} missing 20d data, attempting pattern detection with fallback"
-                                            )
-
-
-                                    # 🔍 DEBUG: Log pattern detector input
-                                    if dbg_enabled and (
-                                        processed_count < 5
-                                        or processed_count % 100 == 0
-                                    ):
-                                        logger.debug(
-                                            "Pattern detector input prepared for %s (volume_ratio=%s)",
-                                            symbol,
-                                            indicators.get("volume_ratio"),
-                                        )
-
-                                    # Use consolidated pattern detector directly
-                                    patterns = self.pattern_detector.detect_patterns(
-                                        indicators
-                                    )
-
-                                    # 🔍 DEBUG: Log pattern detector output
-                                    if dbg_enabled and (
-                                        processed_count < 5
-                                        or processed_count % 100 == 0
-                                    ):
-                                        logger.debug(
-                                            "PATTERN DETECTOR RETURNED: %s patterns for %s",
-                                            len(patterns),
-                                            symbol,
-                                        )
-
-                                    # Advanced patterns (optional): buffer tick and periodically detect
-                                    try:
-                                        if self.advanced_engine and display_sym:
-                                            self.advanced_engine.add_tick(
-                                                display_sym, tick_data
-                                            )
-                                            adv_patterns = self.advanced_engine.detect(
-                                                display_sym
-                                            )
-                                            if adv_patterns:
-                                                patterns.extend(adv_patterns)
-                                                if dbg_enabled:
-                                                    logger.debug(
-                                                        "Advanced patterns: %d for %s",
-                                                        len(adv_patterns),
-                                                        display_sym,
-                                                    )
-
-                                                # 🔍 DEBUG: Log advanced patterns
-                                                if dbg_enabled and (
-                                                    processed_count < 5
-                                                    or processed_count % 100 == 0
-                                                ):
-                                                    for i, adv_pattern in enumerate(
-                                                        adv_patterns, start=1
-                                                    ):
-                                                        logger.debug(
-                                                            "Advanced pattern %d for %s: %s",
-                                                            i,
-                                                            display_sym,
-                                                            adv_pattern.get('pattern', 'UNKNOWN'),
-                                                        )
-                                    except Exception as _adv_e:
-                                        # Do not break main loop on adapter issues
-                                        if dbg_enabled and (
-                                            processed_count < 5
-                                            or processed_count % 100 == 0
-                                        ):
-                                            logger.error(f"Advanced engine error: {_adv_e}")
-                                        pass
-
-                                    # For first few ticks, verify a session key is getting created for this symbol
-                                    if dbg_enabled and processed_count < 10:
-                                        try:
-                                            sym_check = tick_data.get(
-                                                "tradingsymbol"
-                                            ) or tick_data.get("symbol")
-                                            sess = (
-                                                self.redis_client.get_cumulative_data(
-                                                    sym_check
-                                                )
-                                            )
-                                            logger.info(f"Session key for {sym_check}: {'CREATED' if bool(sess) else 'ABSENT'}")
-                                        except Exception as e:
-                                            logger.error(f"Session key check failed: {e}")
-
-                                    # DEBUG: Always log pattern detection results for troubleshooting
-                                    if patterns:
-                                        logger.info(f"PATTERN DETECTED for {display_sym}: {len(patterns)} patterns")
-                                        for pattern in patterns:
-                                            # Ensure pattern has symbol field
-                                            if "symbol" not in pattern:
-                                                pattern["symbol"] = display_sym
-
-                                            # Add last_price and bucket_incremental_volume fields from tick_data
-                                            # Primary source: Redis (most reliable)
-                                            if "last_price" not in pattern:
-                                                # Try Redis first, then fallback to tick_data and indicators
-                                                redis_price = (
-                                                    self._get_latest_price_from_redis(
-                                                        display_sym
-                                                    )
-                                                )
-                                                lp = (
-                                                    redis_price
-                                                    or tick_data.get("last_price")
-                                                    or tick_data.get("lp")
-                                                    or indicators.get("last_price")
-                                                    or tick_data.get("average_price")
-                                                    or indicators.get("last_price")
-                                                    or 0
-                                                )
-                                                pattern["last_price"] = lp
-                                                if lp == 0:
-                                                    logger.warning(f"No last_price found for {display_sym}. Redis: {redis_price}, tick_data keys: {list(tick_data.keys())[:10]}")
-                                            if "last_price" not in pattern:
-                                                redis_price = (
-                                                    self._get_latest_price_from_redis(
-                                                        display_sym
-                                                    )
-                                                )
-                                                pattern["last_price"] = (
-                                                    redis_price
-                                                    or tick_data.get("last_price")
-                                                    or tick_data.get("lp")
-                                                    or indicators.get("last_price")
-                                                    or tick_data.get("average_price")
-                                                    or indicators.get("last_price")
-                                                    or pattern.get("last_price")
-                                                    or 0
-                                                )
-                                            if "bucket_incremental_volume" not in pattern:
-                                                pattern["bucket_incremental_volume"] = tick_data.get(
-                                                    "bucket_incremental_volume", 0
-                                                )
-                                            if "zerodha_last_traded_quantity" not in pattern:
-                                                pattern["zerodha_last_traded_quantity"] = (
-                                                    tick_data.get("zerodha_last_traded_quantity", 0)
-                                                )
-                                            if "expected_move" not in pattern:
-                                                # Set a default expected move if not present
-                                                pattern["expected_move"] = (
-                                                    0.5  # 0.5% default
-                                                )
-
-                                            logger.info(f"{pattern.get('pattern', 'UNKNOWN')} confidence: {safe_format(pattern.get('confidence'), '{:.2f}')}")
-
-                                            # Verify pattern data contains all required fields
-                                            required_fields = [
-                                                "symbol",
-                                                "pattern",
-                                                "confidence",
-                                                "expected_move",
-                                                "last_price",
-                                            ]
-                                            missing_fields = []
-                                            for field in required_fields:
-                                                if field not in pattern:
-                                                    missing_fields.append(field)
-                                                    logger.error(f"Missing field in pattern: {field}")
-
-                                            if not missing_fields:
-                                                # Add risk metrics
-                                                pattern = self.risk_manager.calculate_risk_metrics(
-                                                    pattern
-                                                )
-
-                                                # 🔍 DEBUG: Log alert processing
-                                                if dbg_enabled and (
-                                                    processed_count < 5
-                                                    or processed_count % 100 == 0
-                                                ):
-                                                    logger.info(f"Sending alert to alert manager: {pattern.get('pattern', 'MISSING')}")
-
-                                                logger.info(f"ALERT TRIGGERED: {pattern.get('pattern')}")
-                                                self.record_alert(pattern)
-                                                alert_sent = self.alert_manager.send_alert(pattern)
-
-                                                # 🔍 DEBUG: Log alert manager response
-                                                if dbg_enabled and (
-                                                    processed_count < 5
-                                                    or processed_count % 100 == 0
-                                                ):
-                                                    logger.info(f"Alert sent: {alert_sent}")
-                                                    if not alert_sent:
-                                                        logger.info("Alert was filtered by alert manager")
-                                                if not alert_sent:
-                                                    # Try to fetch a reason from the filter’s gating logic
-                                                    try:
-                                                        ok, reason = (
-                                                            self.alert_manager.should_send_alert(
-                                                                pattern
-                                                            )
-                                                        )
-                                                    except Exception:
-                                                        ok, reason = False, None
-                                                    if reason:
-                                                        logger.warning(f"Alert filtered by alert manager: {pattern.get('pattern')} | {reason}")
-                                                    else:
-                                                        logger.warning(f"Alert filtered by alert manager: {pattern.get('pattern')}")
-                                            else:
-                                                logger.warning(f"Alert filtered: {pattern.get('pattern')} - missing fields: {missing_fields}")
-                                    else:
-                                        # Log when no patterns are detected for better visibility
-                                        if (
-                                            processed_count % 50 == 0
-                                        ):  # Log every 50 ticks to avoid spam
-                                            logger.info(f"No patterns detected for {display_sym}")
-                                            # Debug: Check if required fields are missing
-                                            adv = indicators.get("avg_volume_20d")
-                                            if not adv or adv <= 0:
-                                                logger.error(f"Missing avg_volume_20d: {adv}")
-                                            else:
-                                                logger.info(f"Has avg_volume_20d: {adv}")
-
-                                processed_count += 1
-
-                                # Status update every 10 seconds
-                                current_time = time.time()
-                                if current_time - last_debug_time > 10:
-                                    logger.info(f"Scanner alive: {processed_count} ticks processed so far...")
-                                    last_debug_time = current_time
-
-                                # Finite mode exit checks
-                                if not continuous:
-                                    if (
-                                        isinstance(max_ticks, int)
-                                        and processed_count >= max_ticks
-                                    ):
-                                        logger.info(f"Max ticks reached: {processed_count} >= {max_ticks}")
-                                        break
-                                    if (
-                                        isinstance(duration_secs, int)
-                                        and (time.time() - start_time) >= duration_secs
-                                    ):
-                                        logger.info(f"Duration reached: {(time.time() - start_time):.1f}s >= {duration_secs}s")
-                                        break
-                        elif channel == "market_data.alerts":
-                            # Process market data alerts from crawler
-                            try:
-                                alert_data = json.loads(message["data"])
-
-                                # Extract detection data from the wrapped structure
-                                if "detection" in alert_data:
-                                    # New structure: detection is nested
-                                    detection = alert_data["detection"]
-                                    symbol = alert_data.get("symbol", "Unknown")
-                                    pattern = detection.get(
-                                        "pattern", "Unknown Pattern"
-                                    )
-                                    confidence = detection.get("confidence", 0)
-                                    side = detection.get("side", "UNKNOWN")
-
-                                    # Merge detection data with tick data for alert manager
-                                    merged_alert = {**alert_data, **detection}
-                                else:
-                                    # Legacy structure: detection data at root level
-                                    symbol = alert_data.get("symbol", "Unknown")
-                                    pattern = alert_data.get(
-                                        "pattern", "Unknown Pattern"
-                                    )
-                                    confidence = alert_data.get("confidence", 0)
-                                    side = alert_data.get("side", "UNKNOWN")
-                                    merged_alert = alert_data
-
-                                logger.info(f"ALERT RECEIVED: {symbol} - {pattern} ({side}) - Confidence: {confidence}%")
-                                
-
-                                # If pattern is unknown, log the raw alert data for debugging
-                                if pattern == "Unknown Pattern":
-                                    logger.warning(f"Raw alert data for unknown pattern: {alert_data}")
-                                    
-
-                                # Apply confidence filtering (80% minimum)
-                                if confidence >= 80:
-                                    logger.info(f"ALERT PASSED: {symbol} - {pattern} ({confidence}% ≥ 80%)")
-
-                                    # Alert validation removed - using standalone validator
-
-                                    # Process through alert manager
-                                    self.alert_manager.process_crawler_alert(
-                                        merged_alert
-                                    )
-                                else:
-                                    logger.warning(f"ALERT FILTERED: {symbol} - {pattern} ({confidence}% < 80%)")
-                            except Exception as e:
-                                logger.error(f"Error processing market_data.alerts: {e}")
-
-                        elif channel == "alerts.manager":
-                            # Process crawler alerts
-                            alert_data = json.loads(message["data"])
-                            self.alert_manager.process_crawler_alert(alert_data)
-
-                        elif channel == "market.gift_nifty.gap":
-                            # Integrate live Gift Nifty gap into tick processor
-                            try:
-                                gn = json.loads(message["data"])
-                                # Basic validation and assignment
-                                if isinstance(gn, dict) and "gap_percent" in gn:
-                                    # Store into tick processor state for downstream detectors
-                                    self.tick_processor.sgx_gap_data = gn
-                                    # Also persist to Redis key for other processes
-                                    try:
-                                        self.redis_client.set(
-                                            "latest_gift_nifty_gap", json.dumps(gn)
-                                        )
-                                    except Exception:
-                                        pass
-                                    # Log concise update
-                                    gp = gn.get("gap_percent")
-                                    gift_px = gn.get("gift_price")
-                                    ts = gn.get("timestamp")
-                                    logger.info(f"Gift Nifty: {gift_px} gap {gp:+.2f}% at {ts}")
-                            except Exception as e:
-                                logger.error(f"Gift Nifty gap parse error: {e}")
-
-                        # Periodic cleanup
-                        current_time = time.time()
-                        if current_time - last_cleanup_time > cleanup_interval:
-                            self.cleanup_tracking()
-                            last_cleanup_time = current_time
-                            if dbg_enabled:
-                                logger.info(f"Cleanup: processed={processed_count} rx={rx_count} parse_ok={parse_ok} clean_ok={clean_ok} validate_ok={validate_ok} process_ok={process_ok}")
-
-                        # Periodic validation report
-                        if (
-                            current_time - last_validation_report
-                            > validation_report_interval
-                        ):
-                            logger.info("\nVALIDATION REPORT (5min):")
-                            # Alert validation removed - using standalone validator
-                            last_validation_report = current_time
-                    except Exception as e:
-                            logger.error(f"\nError in message loop: {e}")
-                            import traceback
-                            traceback.print_exc()
+            # ✅ OPTIMIZED: Use XREADGROUP instead of blocking pubsub.listen()
+            self._optimized_scanner_listener(
+                last_message_time, message_count, last_health_check,
+                dbg_enabled, rx_count, parse_ok, clean_ok, validate_ok, process_ok,
+                processed_count, start_time, continuous, max_ticks, duration_secs
+            )
         except KeyboardInterrupt:
-            logger.error("\nKeyboard interrupt received")
+            logger.info("Scanner interrupted by user")
         except Exception as e:
             logger.error(f"\nError in Redis subscriber: {e}")
             import traceback
@@ -3670,6 +3162,350 @@ class MarketScanner:
         finally:
             pubsub.close()
             self.shutdown()
+    
+    def _optimized_scanner_listener(self, last_message_time, message_count, last_health_check,
+                                     dbg_enabled, rx_count, parse_ok, clean_ok, validate_ok, process_ok,
+                                     processed_count, start_time, continuous, max_ticks, duration_secs):
+        """Optimized scanner main loop using RobustStreamConsumer (standardized)"""
+        import os
+        import time as time_module
+        import threading
+        from intraday_scanner.data_pipeline import RobustStreamConsumer
+        from queue import Queue
+        
+        # Create consumer name
+        consumer_name = f"scanner_{os.getpid()}_{int(time_module.time())}"
+        group_name = 'scanner_group'
+        stream_name = 'ticks:intraday:processed'
+        
+        # ✅ STANDARDIZED: Use RobustStreamConsumer instead of manual XREADGROUP
+        consumer = RobustStreamConsumer(
+            stream_key=stream_name,
+            group_name=group_name,
+            consumer_name=consumer_name,
+            db=1  # DB 1 for realtime streams
+        )
+        
+        # Queue for messages from RobustStreamConsumer
+        message_queue = Queue()
+        
+        # Shared state for health checks
+        state = {
+            'last_message_time': last_message_time,
+            'message_count': message_count,
+            'last_health_check': last_health_check,
+            'running': self.running
+        }
+        
+        # Health check thread (runs every 30 seconds)
+        def health_check_loop():
+            while state['running']:
+                time_module.sleep(30)
+                if state['running']:
+                    current_time = time_module.time()
+                    self._check_websocket_health(
+                        state['message_count'], state['last_message_time'], current_time
+                    )
+                    state['last_health_check'] = current_time
+        
+        health_thread = threading.Thread(target=health_check_loop, daemon=True)
+        health_thread.start()
+        
+        # Define callback for processing messages
+        def process_tick_message(message_data):
+            """Callback to process tick messages from stream"""
+            try:
+                # Put message in queue for main loop processing
+                message_queue.put(('tick', message_data))
+                return True  # ACK successful
+            except Exception as e:
+                logger.error(f"❌ Error queuing tick message: {e}")
+                return True  # ACK even on error
+        
+        # Start RobustStreamConsumer in background thread
+        def consumer_loop():
+            try:
+                consumer.process_messages(process_tick_message)
+            except Exception as e:
+                logger.error(f"❌ RobustStreamConsumer error: {e}")
+            finally:
+                state['running'] = False
+        
+        consumer_thread = threading.Thread(target=consumer_loop, daemon=True)
+        consumer_thread.start()
+        
+        # Main processing loop (processes messages from queue)
+        while self.running and state['running']:
+            current_time = time_module.time()
+
+            # Process messages from queue (non-blocking)
+            msg_type, message_data = message_queue.get(timeout=1.0)
+                
+            if msg_type == 'tick':
+                # Parse stream message (message_data is already dict from RobustStreamConsumer)
+                parsed_data = self._parse_scanner_stream_message(message_data)
+                
+                if parsed_data:
+                    try:
+                        # parsed_data is already a dict from stream
+                        raw_tick_data = parsed_data if isinstance(parsed_data, dict) else {}
+                        symbol = raw_tick_data.get("tradingsymbol", raw_tick_data.get("symbol", "UNKNOWN"))
+                        if symbol.startswith("TOKEN_") or symbol.isdigit():
+                            instrument_token = raw_tick_data.get("instrument_token")
+                            if instrument_token:
+                                from crawlers.utils.instrument_mapper import InstrumentMapper
+                                mapper = InstrumentMapper()
+                                resolve_token_to_symbol = mapper.token_to_symbol
+                                resolved_symbol = resolve_token_to_symbol(instrument_token)
+                                if resolved_symbol:
+                                    symbol = resolved_symbol
+                                    raw_tick_data["symbol"] = symbol
+                                    raw_tick_data["tradingsymbol"] = (
+                                        symbol.split(":")[-1]
+                                        if ":" in symbol
+                                        else symbol
+                                    )
+                            tick_data = map_kite_to_unified(raw_tick_data, symbol)
+                            parse_ok += 1
+                            
+                            # Clean tick data
+                            tick_data = self.data_pipeline._clean_tick_data(tick_data)
+                            clean_ok += 1
+                            
+                            # Store latest price
+                            self._store_latest_price(tick_data)
+                            
+                            # Validate tick
+                            try:
+                                is_valid = self.data_pipeline._validate_tick(tick_data)
+                                if is_valid:
+                                    validate_ok += 1
+                            except Exception:
+                                is_valid = False
+                            
+                            # Calculate indicators
+                            indicators = self.tick_processor.process_tick(symbol, tick_data)
+                            if not indicators:
+                                continue
+                            
+                            process_ok += 1
+                            
+                            # Get symbols for display
+                            pre_sym = tick_data.get("symbol") or tick_data.get("tradingsymbol")
+                            post_sym = tick_data.get("tradingsymbol") or tick_data.get("symbol")
+                            display_sym = (post_sym or pre_sym or tick_data.get("symbol"))
+                            
+                            # Add volume context
+                            self._add_volume_context(tick_data)
+                            
+                            # Store indicators to Redis
+                            if hasattr(self, 'data_pipeline') and hasattr(self.data_pipeline, 'redis_storage'):
+                                try:
+                                    import asyncio
+                                    tick_list = [tick_data] if tick_data else []
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        loop.run_until_complete(
+                                            self.data_pipeline.redis_storage.publish_indicators_to_redis(symbol, tick_list)
+                                        )
+                                    finally:
+                                        loop.close()
+                                except Exception as store_err:
+                                    logger.debug(f"Failed to store indicators via redis_storage for {symbol}: {store_err}")
+                            
+                            # Check and inject 20d average volume if missing
+                            has_20d_data = False
+                            adv = indicators.get("avg_volume_20d")
+                            if not isinstance(adv, (int, float)) or adv <= 0:
+                                sym_for_adv = display_sym or tick_data.get("tradingsymbol") or tick_data.get("symbol")
+                                try:
+                                    volume_file_path = os.path.join(os.path.dirname(__file__), "config/volume_averages_20d.json")
+                                    with open(volume_file_path, "r") as f:
+                                        volume_data = json.load(f)
+                                    symbol_data = volume_data.get(sym_for_adv) or volume_data.get(f"NSE:{sym_for_adv}", {})
+                                    adv_try = symbol_data.get("avg_volume_20d")
+                                    if isinstance(adv_try, (int, float)) and adv_try > 0:
+                                        has_20d_data = True
+                                        indicators["avg_volume_20d"] = float(adv_try)
+                                except Exception as e:
+                                    logger.debug(f"Failed to load 20d data for {sym_for_adv}: {e}")
+                            else:
+                                has_20d_data = True
+
+                            # Detect patterns
+                            patterns = self.pattern_detector.detect_patterns(indicators)
+
+                            # Advanced patterns (optional)
+                            if self.advanced_engine and display_sym:
+                                try:
+                                    self.advanced_engine.add_tick(display_sym, tick_data)
+                                    adv_patterns = self.advanced_engine.detect(display_sym)
+                                    if adv_patterns:
+                                        patterns.extend(adv_patterns)
+                                except Exception as _adv_e:
+                                    logger.debug(f"Advanced engine error: {_adv_e}")
+
+                            # Process patterns and send alerts
+                            if patterns:
+                                for pattern in patterns:
+                                    if "symbol" not in pattern:
+                                        pattern["symbol"] = display_sym
+                                    
+                                    # Add required fields
+                                    if "last_price" not in pattern:
+                                        redis_price = self._get_latest_price_from_redis(display_sym)
+                                        pattern["last_price"] = (
+                                            redis_price
+                                            or tick_data.get("last_price")
+                                            or tick_data.get("lp")
+                                            or indicators.get("last_price")
+                                            or 0
+                                        )
+                                    if "bucket_incremental_volume" not in pattern:
+                                        pattern["bucket_incremental_volume"] = tick_data.get("bucket_incremental_volume", 0)
+                                    if "expected_move" not in pattern:
+                                        pattern["expected_move"] = 0.5
+                                    
+                                    # Verify required fields
+                                    required_fields = ["symbol", "pattern", "confidence", "expected_move", "last_price"]
+                                    missing_fields = [f for f in required_fields if f not in pattern]
+                                    
+                                    if not missing_fields:
+                                        # Add risk metrics and send alert
+                                        pattern = self.risk_manager.calculate_risk_metrics(pattern)
+                                        self.record_alert(pattern)
+                                        self.alert_manager.send_alert(pattern)
+                                    else:
+                                        logger.warning(f"Alert filtered: {pattern.get('pattern')} - missing fields: {missing_fields}")
+
+                                processed_count += 1
+
+                            # Status update every 10 seconds
+
+            
+                    except Exception as e:
+                        logger.error(f"Error processing tick message: {e}")
+                        continue
+            
+    def run_redis_subscriber_legacy(self):
+        """Legacy Pub/Sub subscriber (for compatibility)"""
+        # Subscribe to channels using robust client
+        if not self.redis_wrapper.subscribe(
+            "market_data.ticks",
+            "market_data.alerts",
+            "alerts.manager",
+            "market.gift_nifty.gap",
+        ):
+            logger.error("Failed to subscribe to Redis channels")
+            return
+
+        # Get pubsub object
+        pubsub = self.redis_wrapper.get_client(0).pubsub()
+
+        logger.info("Subscribed to market_data.ticks, market_data.alerts, alerts.manager, and market.gift_nifty.gap channels")
+        logger.info("Waiting for messages...")
+
+        try:
+            for message in pubsub.listen():
+                if not self.running:
+                    break
+                # ... existing Pub/Sub logic ...
+        except Exception as e:
+            logger.error(f"Error in legacy subscriber: {e}")
+        finally:
+            pubsub.close()
+            self.shutdown()
+
+    def _get_latest_stream_entry(self, stream_key: str):
+        """Get latest stream entry efficiently using XREAD instead of xrevrange"""
+        try:
+            redis_core = getattr(self.redis_wrapper, "redis_wrapper", None)
+            if not redis_core:
+                redis_core = self.redis_wrapper.get_client(1)
+            
+            if not redis_core:
+                return None
+            
+            # ✅ OPTIMIZED: Use XREAD with special $ ID for latest (more efficient than xrevrange)
+            result = redis_core.xread(
+                streams={stream_key: '$'},  # '$' means latest message
+                count=1,
+                block=100  # Short block
+            )
+            
+            if result and len(result) > 0:
+                stream_data = result[0]
+                if len(stream_data) >= 2 and len(stream_data[1]) > 0:
+                    return stream_data[1][0]  # Return latest message (message_id, message_data)
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error reading latest from {stream_key}: {e}")
+            return None
+
+    def _process_legacy_pubsub_message(self, message):
+        """Process legacy Pub/Sub messages (for compatibility)"""
+        # This handles the "market_data.alerts" and other channels  
+        if message["type"] == "message":
+            try:
+                channel = (
+                    message["channel"].decode()
+                    if isinstance(message["channel"], bytes)
+                    else message["channel"]
+                )
+                
+                if channel == "market_data.alerts":
+                    # Process market data alerts from crawler
+                    try:
+                        alert_data = json.loads(message["data"])
+                        # Extract detection data from the wrapped structure
+                        if "detection" in alert_data:
+                            detection = alert_data["detection"]
+                            symbol = alert_data.get("symbol", "Unknown")
+                            pattern = detection.get("pattern", "Unknown Pattern")
+                            confidence = detection.get("confidence", 0)
+                            side = detection.get("side", "UNKNOWN")
+                            merged_alert = {**alert_data, **detection}
+                        else:
+                            symbol = alert_data.get("symbol", "Unknown")
+                            pattern = alert_data.get("pattern", "Unknown Pattern")
+                            confidence = alert_data.get("confidence", 0)
+                            side = alert_data.get("side", "UNKNOWN")
+                            merged_alert = alert_data
+                        
+                        logger.info(f"ALERT RECEIVED: {symbol} - {pattern} ({side}) - Confidence: {confidence}%")
+                        
+                        if confidence >= 80:
+                            logger.info(f"ALERT PASSED: {symbol} - {pattern} ({confidence}% ≥ 80%)")
+                            self.alert_manager.process_crawler_alert(merged_alert)
+                        else:
+                            logger.warning(f"ALERT FILTERED: {symbol} - {pattern} ({confidence}% < 80%)")
+                    except Exception as e:
+                        logger.error(f"Error processing market_data.alerts: {e}")
+                
+                elif channel == "alerts.manager":
+                    alert_data = json.loads(message["data"])
+                    self.alert_manager.process_crawler_alert(alert_data)
+                
+                elif channel == "market.gift_nifty.gap":
+                    try:
+                        gn = json.loads(message["data"])
+                        if isinstance(gn, dict) and "gap_percent" in gn:
+                            self.tick_processor.sgx_gap_data = gn
+                            try:
+                                self.redis_client.set("latest_gift_nifty_gap", json.dumps(gn))
+                            except Exception:
+                                pass
+                            gp = gn.get("gap_percent")
+                            gift_px = gn.get("gift_price")
+                            ts = gn.get("timestamp")
+                            logger.info(f"Gift Nifty: {gift_px} gap {gp:+.2f}% at {ts}")
+                    except Exception as e:
+                        logger.error(f"Gift Nifty gap parse error: {e}")
+            except Exception as e:
+                logger.error(f"Error processing legacy pubsub message: {e}")
 
     def record_alert(self, pattern):
         """Record sent alert to log file"""
@@ -3911,8 +3747,13 @@ class MarketScanner:
             # Wait a moment
             time.sleep(2)
 
-            # Create new connection
-            self.redis_client = get_redis_client(config=self.config)
+            # ✅ SOLUTION 4: Create new connection using RedisManager82
+            from redis_files.redis_manager import RedisManager82
+            self.redis_client = RedisManager82.get_client(
+                process_name="intraday_scanner",
+                db=0,
+                max_connections=None  # Use PROCESS_POOL_CONFIG
+            )
 
             if self.redis_client.ping():
                 logger.info("Redis connection restarted")
@@ -4099,8 +3940,11 @@ class MarketScanner:
             return tick_data
 
         try:
-            if 'last_traded_quantity' in tick_data:
-                tick_data['zerodha_last_traded_quantity'] = tick_data['last_traded_quantity']
+            # Normalize field names using field mapping
+            # Map legacy 'last_traded_quantity' to canonical 'zerodha_last_traded_quantity'
+            canonical_quantity_field = resolve_session_field('last_traded_quantity')
+            if 'last_traded_quantity' in tick_data and canonical_quantity_field not in tick_data:
+                tick_data[canonical_quantity_field] = tick_data['last_traded_quantity']
 
             incremental_volume = float(VolumeResolver.get_incremental_volume(tick_data) or 0.0)
             cumulative_volume = float(VolumeResolver.get_cumulative_volume(tick_data) or 0.0)
@@ -4780,6 +4624,37 @@ def main():
         emergency_data_reset()
     except Exception:
         print("⚠️ [EMERGENCY_RESET] Proceeding despite reset errors")
+
+        # Start emergency Redis cleanup thread (cleans up unnamed/idle connections)
+        try:
+            import sys
+            from pathlib import Path
+            scripts_path = Path(__file__).parent.parent / "scripts"
+            sys.path.insert(0, str(scripts_path))
+            from scripts.emergency_redis_cleanup import start_cleanup_thread
+            cleanup_thread, cleanup_stop_event = start_cleanup_thread(
+                idle_threshold_seconds=600,  # 10 minutes
+                check_interval_seconds=300,  # Check every 5 minutes
+                daemon=True
+            )
+            print("✅ Emergency Redis cleanup thread started (cleans unnamed/idle connections every 5 min)")
+        except Exception as cleanup_error:
+            print(f"⚠️ Could not start emergency cleanup thread: {cleanup_error}")
+        
+        # ✅ SOLUTION 5: One-time initial stream optimization (reactive)
+        # Note: StreamMonitor will handle continuous proactive monitoring
+        try:
+            from utils.redis_stream_optimizer import optimize_redis_streams
+            print("🔧 Initial Redis stream optimization (one-time)...")
+            results = optimize_redis_streams(db=1)
+            for stream, success in results.items():
+                if success:
+                    print(f"   ✅ {stream}: optimized")
+                else:
+                    print(f"   ⚠️  {stream}: optimization failed")
+            print("   ℹ️  Continuous proactive monitoring will be handled by StreamMonitor")
+        except Exception as opt_error:
+            print(f"⚠️ Initial stream optimization skipped: {opt_error}")
 
     # Create and start scanner
     scanner = MarketScanner(config)

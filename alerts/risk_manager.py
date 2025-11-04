@@ -808,12 +808,14 @@ class PremiumRiskManager:
             valid_buckets = 0
             
             for bucket in volume_data:
-                # Try multiple volume field names
+                # Try multiple volume field names (using canonical field names)
+                # Note: 'cumulative_volume' is legacy, canonical is 'volume_traded_for_the_day'
                 volume = (
                     bucket.get('bucket_incremental_volume') or
                     bucket.get('zerodha_cumulative_volume') or
                     bucket.get('volume') or
-                    bucket.get('cumulative_volume') or
+                    bucket.get('volume_traded_for_the_day') or  # Canonical cumulative volume
+                    bucket.get('cumulative_volume') or  # Legacy fallback for backward compatibility
                     0
                 )
                 

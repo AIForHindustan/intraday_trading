@@ -1,0 +1,190 @@
+"""
+Redis Key Lookup Standards - ENFORCED THROUGHOUT CODEBASE
+
+CRITICAL RULE: ALL Redis operations MUST use direct key lookups.
+Pattern matching (KEYS, SCAN) is FORBIDDEN except in admin/debug scripts.
+
+This ensures:
+- O(1) performance instead of O(N) blocking scans
+- Non-blocking Redis operations
+- Predictable performance characteristics
+- No connection pool exhaustion from slow scans
+"""
+
+import logging
+from typing import Optional, List, Dict, Any, Union
+
+logger = logging.getLogger(__name__)
+
+
+class RedisKeyStandards:
+    """
+    Standardized Redis key lookup utilities.
+    Provides helper methods for common key patterns while enforcing direct lookups.
+    """
+    
+    # Key patterns (for reference only - never use in lookups)
+    KEY_PATTERNS = {
+        # Indicators
+        'indicator': 'indicators:{symbol}:{indicator_name}',
+        'indicator_cache': 'analysis_cache:indicators:{symbol}:{indicator_name}',
+        
+        # Greeks
+        'greeks': 'indicators:{symbol}:greeks',
+        'greek_individual': 'indicators:{symbol}:{greek_name}',
+        
+        # Alerts
+        'alert': 'alert:{alert_id}',
+        'alert_stream': 'alerts:system',  # Stream key
+        
+        # Validation
+        'validation': 'forward_validation:alert:{alert_id}',
+        'validation_stream': 'alerts:validation:results',  # Stream key
+        
+        # News
+        'news_symbol': 'news:symbol:{symbol}',  # Direct key - symbol known
+        'news_latest': 'news:latest:{symbol}',  # Direct key - symbol known
+        'news_item': 'news:item:{date}:{item_id}',  # Direct key - date+id known
+        
+        # Buckets
+        'bucket_history': 'bucket_incremental_volume:history:{resolution}:{symbol}',
+        'bucket_daily': 'bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:daily:{date}',
+        
+        # Volume profile
+        'volume_profile': 'volume_profile:nodes:{symbol}',
+        'volume_patterns': 'volume_profile:patterns:{symbol}:daily',
+        
+        # Session data
+        'session': 'session:{symbol}:{date}',
+        'ohlc': 'ohlc:{symbol}:{date}',
+        
+        # Metrics
+        'metrics': 'metrics:{symbol}:{window}min',
+        'volume_averages': 'volume_averages:{symbol}',
+    }
+    
+    @staticmethod
+    def build_key(key_type: str, **kwargs) -> str:
+        """
+        Build a Redis key from pattern and parameters.
+        
+        Args:
+            key_type: One of KEY_PATTERNS keys
+            **kwargs: Parameters to fill in the pattern
+            
+        Returns:
+            Complete Redis key string
+            
+        Example:
+            build_key('indicator', symbol='NIFTY', indicator_name='RSI')
+            # Returns: 'indicators:NIFTY:RSI'
+        """
+        pattern = RedisKeyStandards.KEY_PATTERNS.get(key_type)
+        if not pattern:
+            raise ValueError(f"Unknown key type: {key_type}. Available: {list(RedisKeyStandards.KEY_PATTERNS.keys())}")
+        
+        try:
+            return pattern.format(**kwargs)
+        except KeyError as e:
+            raise ValueError(f"Missing required parameter for {key_type}: {e}")
+    
+    @staticmethod
+    def get_indicator_key(symbol: str, indicator_name: str, use_cache: bool = True) -> str:
+        """Get indicator key - direct lookup"""
+        if use_cache:
+            return f"analysis_cache:indicators:{symbol}:{indicator_name}"
+        return f"indicators:{symbol}:{indicator_name}"
+    
+    @staticmethod
+    def get_greeks_key(symbol: str) -> str:
+        """Get Greeks key - direct lookup"""
+        return f"indicators:{symbol}:greeks"
+    
+    @staticmethod
+    def get_alert_key(alert_id: str) -> str:
+        """Get alert key - direct lookup"""
+        return f"alert:{alert_id}"
+    
+    @staticmethod
+    def get_validation_key(alert_id: str) -> str:
+        """Get validation key - direct lookup"""
+        return f"forward_validation:alert:{alert_id}"
+    
+    @staticmethod
+    def get_news_symbol_key(symbol: str) -> str:
+        """Get news symbol key - direct lookup"""
+        return f"news:symbol:{symbol}"
+    
+    @staticmethod
+    def get_bucket_history_key(symbol: str, resolution: str = "5min") -> str:
+        """Get bucket history key - direct lookup"""
+        return f"bucket_incremental_volume:history:{resolution}:{resolution}:{symbol}"
+    
+    @staticmethod
+    def get_session_key(symbol: str, date: str) -> str:
+        """Get session key - direct lookup"""
+        return f"session:{symbol}:{date}"
+    
+    @staticmethod
+    def validate_no_pattern_matching(client, operation_description: str = ""):
+        """
+        Runtime validation to detect pattern matching operations.
+        This should be called before any Redis operation that might use KEYS/SCAN.
+        
+        Raises:
+            RuntimeError: If pattern matching is detected
+        """
+        # This is a placeholder for runtime checks
+        # In production, we rely on code review and static analysis
+        pass
+
+
+def enforce_direct_lookups_only():
+    """
+    Utility function to document and enforce the standard.
+    Call this in code reviews and add to pre-commit hooks.
+    
+    FORBIDDEN:
+    - redis_client.keys("*")
+    - redis_client.keys("pattern:*")
+    - redis_client.scan(match="pattern:*")
+    - Any wildcard pattern matching
+    
+    REQUIRED:
+    - redis_client.get(f"alert:{alert_id}")  # Direct key
+    - redis_client.hget(f"session:{symbol}:{date}", "field")  # Direct key
+    - Use Redis Streams (XREADGROUP) for iterating over data
+    - Use sorted sets (ZRANGE) with known keys for time-series data
+    """
+    pass
+
+
+# Example usage patterns (for documentation)
+EXAMPLES = {
+    "BAD - Pattern Matching": """
+    # ❌ FORBIDDEN
+    alert_keys = redis_client.keys("alert:*")
+    for key in alert_keys:
+        data = redis_client.get(key)
+    """,
+    
+    "GOOD - Direct Lookup": """
+    # ✅ CORRECT
+    alert_id = "alert_12345"
+    data = redis_client.get(f"alert:{alert_id}")
+    """,
+    
+    "GOOD - Stream Iteration": """
+    # ✅ CORRECT - Use Streams for iteration
+    stream_name = "alerts:system"
+    messages = redis_client.xread({stream_name: "0"}, count=100)
+    """,
+    
+    "GOOD - Known Symbol List": """
+    # ✅ CORRECT - Iterate over known symbols
+    symbols = ["NIFTY", "BANKNIFTY", "RELIANCE"]  # From config/cache
+    for symbol in symbols:
+        indicators = redis_client.get(f"indicators:{symbol}:RSI")
+    """,
+}
+

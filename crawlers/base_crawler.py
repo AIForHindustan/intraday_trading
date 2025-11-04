@@ -1,5 +1,7 @@
 import asyncio
+import atexit
 import logging
+import signal
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -9,18 +11,6 @@ from enum import Enum
 from typing import Dict, List, Optional, Callable, Any
 import redis
 from websocket import WebSocketApp, WebSocketConnectionClosedException
-
-# Import custom Redis client with store_by_data_type method
-try:
-    from redis_files.redis_client import RobustRedisClient
-
-    REDIS_CLIENT_AVAILABLE = True
-except ImportError:
-    REDIS_CLIENT_AVAILABLE = False
-    logger = logging.getLogger(__name__)
-    logger.warning(
-        "RobustRedisClient not available, falling back to basic Redis client"
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -84,66 +74,108 @@ class BaseCrawler(ABC):
         # Initialize components
         self._init_redis()
         self._init_websocket()
+        
+        # Register cleanup handlers for proper connection management
+        self._register_cleanup()
 
         logger.info(f"Initialized {self.config.name} crawler")
 
     def _init_redis(self):
-        """Initialize Redis connection with error handling"""
-        # Skip Redis initialization if redis_host is None (file-writing only crawlers)
+        """Initialize Redis connection - SIMPLIFIED VERSION"""
         if self.config.redis_host is None:
             self.redis_client = None
             logger.info("Redis disabled - file-writing only mode")
             return
-            
+
         try:
-            # Use RobustRedisClient if available, otherwise fall back to basic Redis client
-            if REDIS_CLIENT_AVAILABLE:
-                self.redis_client = RobustRedisClient(
-                    host=self.config.redis_host,
-                    port=self.config.redis_port,
-                    db=self.config.redis_db,
-                    health_check_interval=30,
-                )
-                logger.info("RobustRedisClient connection established")
-                logger.info(f"Redis client type: {type(self.redis_client).__name__}")
-                logger.info(
-                    f"Has store_by_data_type: {hasattr(self.redis_client, 'store_by_data_type')}"
-                )
-            else:
-                # Use centralized get_redis_client for better connection management
-                from redis_files.redis_client import get_redis_client
-                try:
-                    # Try to get shared client instance
-                    self.redis_client = get_redis_client()
-                    # If we need a specific DB, use get_client method
-                    if hasattr(self.redis_client, 'get_client'):
-                        self.redis_client = self.redis_client.get_client(self.config.redis_db)
-                except Exception:
-                    # Fallback to direct Redis client if get_redis_client fails
-                    self.redis_client = redis.Redis(
-                        host=self.config.redis_host,
-                        port=self.config.redis_port,
-                        db=self.config.redis_db,
-                        socket_connect_timeout=5,
-                        socket_timeout=5,
-                        retry_on_timeout=True,
-                        health_check_interval=30,
-                    )
-                logger.info("Basic Redis connection established")
-                logger.info(f"Redis client type: {type(self.redis_client).__name__}")
-                logger.info(
-                    f"Has store_by_data_type: {hasattr(self.redis_client, 'store_by_data_type')}"
-                )
+            # ✅ Use ONLY RedisManager82 - remove all fallbacks
+            from redis_files.redis_manager import RedisManager82
+
+            process_name = "intraday_crawler"  # Fixed name for all crawlers
+            max_connections = 3  # Conservative limit for crawlers
+
+            self.redis_client = RedisManager82.get_client(
+                process_name=process_name,
+                max_connections=max_connections,
+                host=self.config.redis_host,
+                port=self.config.redis_port,
+                db=self.config.redis_db,
+            )
+
+            # ✅ Remove RobustRedisClient wrapping - it creates duplicate connections
+            # ✅ Remove fallback to get_optimized_client
 
             # Test connection
             self.redis_client.ping()
+            logger.info(f"✅ Redis connection established for {process_name}")
+
+        except ImportError:
+            # If RedisManager82 is not available, disable Redis entirely
+            logger.warning("RedisManager82 not available - disabling Redis for crawler")
+            self.redis_client = None
         except Exception as e:
             logger.error(f"Failed to connect to Redis: {e}")
-            raise
+            self.redis_client = None
 
     def _init_websocket(self):
         """Initialize WebSocket client"""
         self.websocket: Optional[WebSocketApp] = None
+    
+    def _register_cleanup(self):
+        """Register cleanup handlers for proper connection pool management"""
+        try:
+            # Register atexit handler
+            atexit.register(self._cleanup_connections)
+            
+            # Register signal handlers for graceful shutdown
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            signal.signal(signal.SIGINT, self._signal_handler)
+            logger.debug(f"Registered cleanup handlers for {self.config.name}")
+        except Exception as e:
+            logger.warning(f"Could not register cleanup handlers: {e}")
+    
+    def _signal_handler(self, signum, frame):
+        """Handle termination signals gracefully"""
+        logger.info(f"Received signal {signum}, cleaning up {self.config.name}...")
+        self._cleanup_connections()
+        # Don't call exit() here - let the normal shutdown process handle it
+    
+    def _cleanup_connections(self):
+        """Cleanup Redis connections and pools for this crawler"""
+        try:
+            # If we're using process-specific pools, cleanup the process pools
+            if hasattr(self, 'redis_client') and self.redis_client:
+                try:
+                    # Try to cleanup via RedisManager82 if available
+                    from redis_files.redis_manager import RedisManager82
+                    
+                    # Determine process name from config
+                    process_name = self.config.name
+                    if "intraday" in process_name.lower():
+                        process_name = "intraday_crawler"
+                    elif "gift" in process_name.lower() or "nifty" in process_name.lower():
+                        process_name = "gift_nifty_crawler"
+                    else:
+                        process_name = f"crawler_{process_name}"
+                    
+                    # Cleanup process-specific pools
+                    RedisManager82.cleanup(process_name=process_name)
+                    logger.info(f"✅ Cleaned up Redis pools for {process_name}")
+                except ImportError:
+                    # RedisManager82 not available, skip cleanup
+                    pass
+                except Exception as cleanup_error:
+                    logger.warning(f"Error during Redis cleanup: {cleanup_error}")
+            
+            # Close WebSocket if open
+            if hasattr(self, 'websocket') and self.websocket:
+                try:
+                    self.websocket.close()
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            logger.warning(f"Error in _cleanup_connections: {e}")
 
     def start(self):
         """Start the crawler with proper thread management"""
@@ -191,6 +223,9 @@ class BaseCrawler(ABC):
 
             # Shutdown executor
             self._executor.shutdown(wait=False)
+            
+            # Cleanup Redis connections
+            self._cleanup_connections()
 
             # Wait for threads to terminate
             threads_to_join = []

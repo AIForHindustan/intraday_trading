@@ -26,6 +26,8 @@ def send_dashboard_link_notification():
 📊 <b>Dashboard is now accessible:</b>
 🔗 <a href="{DASHBOARD_URL}">{DASHBOARD_URL}</a>
 
+⚠️ <b>Note:</b> First visit shows ngrok warning page - click "Visit Site" to proceed. This is normal for free ngrok accounts.
+
 🎯 <b>What's Available:</b>
 • Real-time alerts with indicators (RSI, MACD, EMA, VWAP, ATR)
 • Options Greeks (Delta, Gamma, Theta, Vega, Rho)

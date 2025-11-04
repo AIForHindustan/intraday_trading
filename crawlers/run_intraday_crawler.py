@@ -95,6 +95,9 @@ def main():
         
         # Create and start intraday crawler
         logger.info("🔧 Creating intraday crawler...")
+        
+        # ✅ Add explicit Redis configuration (matches base_crawler.py and redis_config.py)
+        # DB 1 = realtime database (consolidated from DB 4) for tick data, alerts, patterns
         crawler = create_intraday_crawler(
             api_key=api_key,
             access_token=access_token,
@@ -102,6 +105,10 @@ def main():
             instrument_info=instrument_info,
             data_directory="crawlers/raw_data/intraday_data",
             name="intraday_crawler",
+            # ✅ Explicit Redis configuration
+            redis_host="localhost",  # Explicitly set
+            redis_port=6379,
+            redis_db=1,  # DB 1: realtime database for tick data, alerts, patterns (per redis_config.py)
         )
         
         logger.info("🚀 Starting intraday crawler...")

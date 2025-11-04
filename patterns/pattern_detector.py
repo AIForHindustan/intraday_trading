@@ -926,9 +926,14 @@ class PatternDetector(BasePatternDetector):
             return True
         
         # Rule 1: Breakout patterns must be near Value Area boundaries
+        # ✅ FIXED: Use field mapping for volume profile fields
+        from utils.yaml_field_loader import resolve_volume_profile_field
+        vah_field = resolve_volume_profile_field('value_area_high')
+        val_field = resolve_volume_profile_field('value_area_low')
+        
         if pattern_type in ['breakout', 'volume_breakout']:
-            vah = volume_nodes.get('value_area_high')
-            val = volume_nodes.get('value_area_low')
+            vah = volume_nodes.get(vah_field) or volume_nodes.get('value_area_high')
+            val = volume_nodes.get(val_field) or volume_nodes.get('value_area_low')
             if vah and val and vah > 0 and val > 0:
                 if direction == 'BULLISH' and price < vah * 0.98:  # Within 2% of VAH
                     self.logger.debug(f"Breakout validation failed: price {price} < VAH {vah} * 0.98")
@@ -938,8 +943,10 @@ class PatternDetector(BasePatternDetector):
                     return False
         
         # Rule 2: Reversal patterns must be near POC
+        # ✅ FIXED: Use field mapping for volume profile fields
         if pattern_type == 'reversal':
-            poc = volume_nodes.get('poc_price')
+            poc_field = resolve_volume_profile_field('poc_price')
+            poc = volume_nodes.get(poc_field) or volume_nodes.get('poc_price')
             if poc and poc > 0:
                 poc_distance = abs(price - poc) / poc
                 if poc_distance > 0.015:  # More than 1.5% from POC
@@ -1172,7 +1179,11 @@ class PatternDetector(BasePatternDetector):
 
             prices.append(price)
 
-            volume_raw = data.get("volume") or data.get("traded_quantity") or data.get("last_traded_quantity")
+            # Use resolved field names for volume lookup
+            volume_field = self.resolve_session_field("volume")
+            traded_quantity_field = self.resolve_session_field("traded_quantity") if hasattr(self, 'resolve_session_field') else "traded_quantity"
+            last_traded_quantity_field = self.resolve_session_field("last_traded_quantity") if hasattr(self, 'resolve_session_field') else "zerodha_last_traded_quantity"
+            volume_raw = data.get(volume_field) or data.get(traded_quantity_field) or data.get(last_traded_quantity_field)
             try:
                 cumulative_volume += float(volume_raw or 0.0)
             except (TypeError, ValueError):
@@ -1795,9 +1806,15 @@ class PatternDetector(BasePatternDetector):
         if not volume_nodes:
             return None
         
-        poc_price = volume_nodes.get('poc_price', 0)
-        value_area_high = volume_nodes.get('value_area_high', 0)
-        value_area_low = volume_nodes.get('value_area_low', 0)
+        # ✅ FIXED: Use field mapping for volume profile fields (with fallback for backward compatibility)
+        from utils.yaml_field_loader import resolve_volume_profile_field
+        poc_field = resolve_volume_profile_field('poc_price')
+        vah_field = resolve_volume_profile_field('value_area_high')
+        val_field = resolve_volume_profile_field('value_area_low')
+        
+        poc_price = volume_nodes.get(poc_field) or volume_nodes.get('poc_price', 0)
+        value_area_high = volume_nodes.get(vah_field) or volume_nodes.get('value_area_high', 0)
+        value_area_low = volume_nodes.get(val_field) or volume_nodes.get('value_area_low', 0)
         support_levels = volume_nodes.get('support_levels', [])
         resistance_levels = volume_nodes.get('resistance_levels', [])
         
@@ -3357,7 +3374,7 @@ class PatternDetector(BasePatternDetector):
                     "stop_loss": last_price * (0.98 if price_change_pct > 0 else 1.02),
                     "last_price": last_price,
                     "volume_ratio": volume_ratio,
-                    "description": f"Volume spike: {volume_ratio:.1f}x with {price_change_pct:.2%} price move",
+                    "description": f"Volume spike: {volume_ratio:.1f}x with {price_change_pct:.2f}% price move",
                     "pattern_type": "volume",
                     "risk_metrics": self._calculate_risk_metrics(last_price, price_change_pct, volume_ratio),
                     "news_context": {},
@@ -4034,7 +4051,7 @@ class PatternDetector(BasePatternDetector):
                     pattern_type="ict_momentum",
                     confidence=confidence,
                     symbol=symbol,
-                    description=f"ICT Momentum: {price_change:+.2%} with RSI {rsi:.1f}",
+                    description=f"ICT Momentum: {price_change:+.2f}% with RSI {rsi:.1f}",
                     signal=signal,
                     last_price=last_price,
                     volume_ratio=volume_ratio,
@@ -5249,7 +5266,7 @@ class PatternDetector(BasePatternDetector):
         # Reduced logging frequency for performance
         if self.config.get("debug", False) and "volume_ratio" in indicators:
             logger.debug(
-                f"✅ PATTERN DETECTOR: {symbol} - volume_ratio: {volume_ratio:.2f}x, price_change: {price_change:.2%}"
+                f"✅ PATTERN DETECTOR: {symbol} - volume_ratio: {volume_ratio:.2f}x, price_change: {price_change:.2f}%"
             )
 
         # Calculate instrument quality score

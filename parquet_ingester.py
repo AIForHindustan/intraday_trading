@@ -2,9 +2,10 @@
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, date
 
 import pandas as pd
 import pyarrow as pa
@@ -14,6 +15,9 @@ from singleton_db import DatabaseConnectionManager
 from binary_to_parquet.production_binary_converter import ensure_production_schema
 
 logger = logging.getLogger(__name__)
+
+# Semaphore to limit concurrent DuckDB connections (DuckDB has connection limits)
+_db_connection_semaphore = threading.Semaphore(4)  # Max 4 concurrent DB connections
 
 
 def enrich_parquet_with_metadata(df: pd.DataFrame, token_cache: TokenCacheManager) -> pd.DataFrame:
@@ -85,9 +89,17 @@ def map_to_duckdb_schema(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     """Map parquet DataFrame columns to DuckDB schema format."""
     mapped_df = pd.DataFrame()
     
-    # Core instrument identifiers
+    # Core instrument identifiers - check for various possible column names
     if 'instrument_token' in df.columns:
         mapped_df['instrument_token'] = df['instrument_token'].astype('int64')
+    elif 'token' in df.columns:
+        mapped_df['instrument_token'] = pd.to_numeric(df['token'], errors='coerce').fillna(0).astype('int64')
+    elif 'instrument_id' in df.columns:
+        mapped_df['instrument_token'] = pd.to_numeric(df['instrument_id'], errors='coerce').fillna(0).astype('int64')
+    else:
+        # No instrument_token found - return empty DataFrame
+        logger.warning(f"No instrument_token column found in {source_file}. Columns: {list(df.columns)}")
+        return pd.DataFrame()
     
     # Symbol and exchange (prefer token_* enriched columns)
     def get_column(df, *col_names, default=None):
@@ -100,7 +112,43 @@ def map_to_duckdb_schema(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     mapped_df['exchange'] = get_column(df, 'token_exchange', 'exchange').fillna('')
     mapped_df['segment'] = get_column(df, 'token_segment', 'segment').fillna('')
     mapped_df['instrument_type'] = get_column(df, 'token_instrument_type', 'instrument_type').fillna('')
-    mapped_df['expiry'] = get_column(df, 'token_expiry', 'expiry')
+    
+    # Normalize expiry dates to date objects or YYYY-MM-DD strings
+    expiry_col = get_column(df, 'token_expiry', 'expiry')
+    def normalize_expiry_date(expiry_val):
+        if pd.isna(expiry_val) or expiry_val is None:
+            return None
+        if isinstance(expiry_val, date):
+            return expiry_val
+        if isinstance(expiry_val, datetime):
+            return expiry_val.date()
+        if isinstance(expiry_val, str):
+            try:
+                # Try multiple date formats
+                # Format 1: YYYY-MM-DD
+                try:
+                    return datetime.strptime(expiry_val[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    # Format 2: DD-MMM-YYYY (e.g., "29-Dec-2025")
+                    try:
+                        return datetime.strptime(expiry_val, "%d-%b-%Y").date()
+                    except ValueError:
+                        # Format 3: DD/MM/YYYY
+                        try:
+                            return datetime.strptime(expiry_val, "%d/%m/%Y").date()
+                        except ValueError:
+                            # Format 4: YYYYMMDD
+                            try:
+                                if len(expiry_val) >= 8 and expiry_val[:8].isdigit():
+                                    return datetime.strptime(expiry_val[:8], "%Y%m%d").date()
+                                else:
+                                    return None
+                            except ValueError:
+                                return None
+            except Exception:
+                return None
+        return None
+    mapped_df['expiry'] = expiry_col.apply(normalize_expiry_date)
     mapped_df['strike_price'] = pd.to_numeric(get_column(df, 'token_strike_price', 'strike_price', default=None), errors='coerce')
     mapped_df['option_type'] = get_column(df, 'token_option_type', 'option_type')
     mapped_df['lot_size'] = pd.to_numeric(get_column(df, 'token_lot_size', 'lot_size', default=None), errors='coerce')
@@ -135,8 +183,12 @@ def map_to_duckdb_schema(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     mapped_df['timestamp'] = pd.Timestamp.utcnow()
     
     # Price data
-    price_col = 'last_price' if 'last_price' in df.columns else 'last_traded_price'
-    mapped_df['last_price'] = pd.to_numeric(df[price_col] if price_col in df.columns else 0, errors='coerce').fillna(0.0)
+    if 'last_price' in df.columns:
+        mapped_df['last_price'] = pd.to_numeric(df['last_price'], errors='coerce').fillna(0.0)
+    elif 'last_traded_price' in df.columns:
+        mapped_df['last_price'] = pd.to_numeric(df['last_traded_price'], errors='coerce').fillna(0.0)
+    else:
+        mapped_df['last_price'] = 0.0
     
     # OHLC handling
     if 'ohlc' in df.columns and df['ohlc'].notna().any():
@@ -153,23 +205,53 @@ def map_to_duckdb_schema(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
         mapped_df['close_price'] = 0.0
     
     avg_price_col = 'average_traded_price' if 'average_traded_price' in df.columns else 'average_price'
-    mapped_df['average_traded_price'] = pd.to_numeric(df[avg_price_col] if avg_price_col in df.columns else 0, errors='coerce').fillna(0.0)
+    if avg_price_col in df.columns:
+        mapped_df['average_traded_price'] = pd.to_numeric(df[avg_price_col], errors='coerce').fillna(0.0)
+    else:
+        mapped_df['average_traded_price'] = 0.0
     
     # Volume and quantity
-    vol_col = 'volume' if 'volume' in df.columns else 'volume_traded'
-    mapped_df['volume'] = pd.to_numeric(df[vol_col] if vol_col in df.columns else 0, errors='coerce').fillna(0).astype('int64')
+    if 'volume' in df.columns:
+        mapped_df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0).astype('int64')
+    elif 'volume_traded' in df.columns:
+        mapped_df['volume'] = pd.to_numeric(df['volume_traded'], errors='coerce').fillna(0).astype('int64')
+    else:
+        mapped_df['volume'] = 0
     
-    ltd_qty_col = 'last_traded_quantity' if 'last_traded_quantity' in df.columns else 'zerodha_last_traded_quantity'
-    mapped_df['last_traded_quantity'] = pd.to_numeric(df[ltd_qty_col] if ltd_qty_col in df.columns else 0, errors='coerce').fillna(0).astype('int64')
+    if 'last_traded_quantity' in df.columns:
+        mapped_df['last_traded_quantity'] = pd.to_numeric(df['last_traded_quantity'], errors='coerce').fillna(0).astype('int64')
+    elif 'zerodha_last_traded_quantity' in df.columns:
+        mapped_df['last_traded_quantity'] = pd.to_numeric(df['zerodha_last_traded_quantity'], errors='coerce').fillna(0).astype('int64')
+    else:
+        mapped_df['last_traded_quantity'] = 0
     
-    mapped_df['total_buy_quantity'] = pd.to_numeric(df['total_buy_quantity'] if 'total_buy_quantity' in df.columns else 0, errors='coerce').fillna(0).astype('int64')
-    mapped_df['total_sell_quantity'] = pd.to_numeric(df['total_sell_quantity'] if 'total_sell_quantity' in df.columns else 0, errors='coerce').fillna(0).astype('int64')
+    if 'total_buy_quantity' in df.columns:
+        mapped_df['total_buy_quantity'] = pd.to_numeric(df['total_buy_quantity'], errors='coerce').fillna(0).astype('int64')
+    else:
+        mapped_df['total_buy_quantity'] = 0
+    
+    if 'total_sell_quantity' in df.columns:
+        mapped_df['total_sell_quantity'] = pd.to_numeric(df['total_sell_quantity'], errors='coerce').fillna(0).astype('int64')
+    else:
+        mapped_df['total_sell_quantity'] = 0
     
     # Open interest
-    oi_col = 'oi' if 'oi' in df.columns else 'open_interest'
-    mapped_df['open_interest'] = pd.to_numeric(df[oi_col] if oi_col in df.columns else 0, errors='coerce').fillna(0).astype('int64')
-    mapped_df['oi_day_high'] = pd.to_numeric(df['oi_day_high'] if 'oi_day_high' in df.columns else 0, errors='coerce').fillna(0).astype('int64')
-    mapped_df['oi_day_low'] = pd.to_numeric(df['oi_day_low'] if 'oi_day_low' in df.columns else 0, errors='coerce').fillna(0).astype('int64')
+    if 'oi' in df.columns:
+        mapped_df['open_interest'] = pd.to_numeric(df['oi'], errors='coerce').fillna(0).astype('int64')
+    elif 'open_interest' in df.columns:
+        mapped_df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce').fillna(0).astype('int64')
+    else:
+        mapped_df['open_interest'] = 0
+    
+    if 'oi_day_high' in df.columns:
+        mapped_df['oi_day_high'] = pd.to_numeric(df['oi_day_high'], errors='coerce').fillna(0).astype('int64')
+    else:
+        mapped_df['oi_day_high'] = 0
+    
+    if 'oi_day_low' in df.columns:
+        mapped_df['oi_day_low'] = pd.to_numeric(df['oi_day_low'], errors='coerce').fillna(0).astype('int64')
+    else:
+        mapped_df['oi_day_low'] = 0
     
     # Market depth - extract from depth column if available
     for level in range(1, 6):
@@ -183,13 +265,25 @@ def map_to_duckdb_schema(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     # Extract best bid/ask
     if 'best_bid_price' in df.columns:
         mapped_df['bid_1_price'] = pd.to_numeric(df['best_bid_price'], errors='coerce')
-        mapped_df['bid_1_quantity'] = pd.to_numeric(df['best_bid_quantity'] if 'best_bid_quantity' in df.columns else 0, errors='coerce').fillna(0).astype('int64')
-        mapped_df['bid_1_orders'] = pd.to_numeric(df['best_bid_orders'] if 'best_bid_orders' in df.columns else 0, errors='coerce').fillna(0).astype('int32')
+        if 'best_bid_quantity' in df.columns:
+            mapped_df['bid_1_quantity'] = pd.to_numeric(df['best_bid_quantity'], errors='coerce').fillna(0).astype('int64')
+        else:
+            mapped_df['bid_1_quantity'] = 0
+        if 'best_bid_orders' in df.columns:
+            mapped_df['bid_1_orders'] = pd.to_numeric(df['best_bid_orders'], errors='coerce').fillna(0).astype('int32')
+        else:
+            mapped_df['bid_1_orders'] = 0
     
     if 'best_ask_price' in df.columns:
         mapped_df['ask_1_price'] = pd.to_numeric(df['best_ask_price'], errors='coerce')
-        mapped_df['ask_1_quantity'] = pd.to_numeric(df['best_ask_quantity'] if 'best_ask_quantity' in df.columns else 0, errors='coerce').fillna(0).astype('int64')
-        mapped_df['ask_1_orders'] = pd.to_numeric(df['best_ask_orders'] if 'best_ask_orders' in df.columns else 0, errors='coerce').fillna(0).astype('int32')
+        if 'best_ask_quantity' in df.columns:
+            mapped_df['ask_1_quantity'] = pd.to_numeric(df['best_ask_quantity'], errors='coerce').fillna(0).astype('int64')
+        else:
+            mapped_df['ask_1_quantity'] = 0
+        if 'best_ask_orders' in df.columns:
+            mapped_df['ask_1_orders'] = pd.to_numeric(df['best_ask_orders'], errors='coerce').fillna(0).astype('int32')
+        else:
+            mapped_df['ask_1_orders'] = 0
     
     # Metadata fields
     mapped_df['packet_type'] = df['mode'] if 'mode' in df.columns else 'full'
@@ -239,13 +333,44 @@ def ingest_parquet_file(file_path: Path, db_path: str, token_cache: Optional[Tok
         missing_cols = [col for col in required_cols if col not in mapped_df.columns]
         if missing_cols:
             logger.warning(f"Missing required columns in {file_path}: {missing_cols}")
+            return {
+                "success": False,
+                "error": f"Missing required columns: {missing_cols}",
+                "row_count": 0,
+                "original_rows": original_rows
+            }
         
-        # Filter rows with valid instrument_token
-        mapped_df = mapped_df[mapped_df['instrument_token'] > 0].copy()
+        # Filter rows with valid instrument_token (skip if no instrument_token column)
+        if 'instrument_token' in mapped_df.columns:
+            mapped_df = mapped_df[mapped_df['instrument_token'] > 0].copy()
+        else:
+            logger.warning(f"No instrument_token column in mapped_df for {file_path}")
+            return {
+                "success": False,
+                "error": "No instrument_token column after mapping",
+                "row_count": 0,
+                "original_rows": original_rows
+            }
+        
+        # ✅ Filter out rows with UNKNOWN symbols - these lack proper metadata
+        if 'symbol' in mapped_df.columns:
+            before_filter = len(mapped_df)
+            # Filter out: NULL, empty, or UNKNOWN_* symbols
+            mapped_df = mapped_df[
+                mapped_df['symbol'].notna() & 
+                (mapped_df['symbol'] != '') & 
+                (~mapped_df['symbol'].astype(str).str.startswith('UNKNOWN', na=False))
+            ].copy()
+            filtered_out = before_filter - len(mapped_df)
+            if filtered_out > 0:
+                logger.warning(f"Filtered out {filtered_out:,} rows with UNKNOWN/missing symbols from {file_path.name}")
+        
         valid_rows = len(mapped_df)
         
         # Insert into DuckDB
-        with DatabaseConnectionManager.connection_scope(db_path) as conn:
+        # Create a new connection per thread (DuckDB connections are not thread-safe)
+        conn = duckdb.connect(db_path)
+        try:
             ensure_production_schema(conn)
             
             # Convert to Arrow table for efficient insertion
@@ -265,7 +390,12 @@ def ingest_parquet_file(file_path: Path, db_path: str, token_cache: Optional[Tok
                 
                 logger.info(f"Ingested {valid_rows}/{original_rows} rows from {file_path.name}")
             finally:
-                conn.unregister(view_name)
+                try:
+                    conn.unregister(view_name)
+                except Exception:
+                    pass  # Ignore errors when unregistering
+        finally:
+            conn.close()
         
         return {
             "row_count": valid_rows,

@@ -12,6 +12,7 @@ import pandas as pd
 
 from crawlers.base_crawler import BaseCrawler, CrawlerConfig
 from crawlers.websocket_message_parser import ZerodhaWebSocketMessageParser
+from crawlers.bulletproof_parser import BulletproofZerodhaParser, ParserHealthMonitor
 from config.utils.timestamp_normalizer import TimestampNormalizer
 from crawlers.metadata_resolver import metadata_resolver
 from utils.yaml_field_loader import (
@@ -117,10 +118,12 @@ class IntradayCrawler(BaseCrawler):
 
         super().__init__(config)
 
-        # Initialize parser for full mode data (after redis_client is available)
-        self.parser = ZerodhaWebSocketMessageParser(instrument_info)
-        if getattr(self, "redis_client", None):
-            self.parser.redis_client = self.redis_client
+        # ✅ BULLETPROOF PARSER: Initialize robust parser with health monitoring
+        # Pass redis_client to constructor so volume_calculator is properly initialized
+        self.parser = BulletproofZerodhaParser(instrument_info, self.redis_client)
+        
+        # Add health monitoring
+        self.health_monitor = ParserHealthMonitor(self.parser)
         
         # Initialize Redis storage layer
         from redis_files.redis_storage import RedisStorage
@@ -207,16 +210,19 @@ class IntradayCrawler(BaseCrawler):
     def _process_binary_message(self, binary_data: bytes):
         """Process binary WebSocket message containing tick data"""
         try:
-            # Parse the binary message using our parser
-            ticks = self.parser.parse_websocket_message(binary_data)
+            # ✅ BULLETPROOF PARSER: Use health-monitored parsing
+            ticks = self.health_monitor.monitor_parse_health(binary_data)
 
             if not ticks:
                 logger.debug("No ticks parsed from binary message")
                 return
 
-            # Process each tick for intraday trading
+            # Process each validated tick for intraday trading
             for tick in ticks:
-                self._process_intraday_tick(tick)
+                if self._validate_tick(tick):
+                    self._process_intraday_tick(tick)
+                else:
+                    logger.warning(f"Invalid tick: {tick.get('symbol', 'unknown')}")
 
             # Log processing stats for monitoring
             if (
@@ -238,6 +244,27 @@ class IntradayCrawler(BaseCrawler):
                 )
             else:
                 logger.error(f"Error processing binary message: {e}")
+            # Don't crash - continue processing
+    
+    def _validate_tick(self, tick: Dict) -> bool:
+        """Validate tick data before processing"""
+        required_fields = ['symbol', 'instrument_token', 'last_price']
+        
+        for field in required_fields:
+            if not tick.get(field):
+                return False
+        
+        # Validate price is reasonable
+        price = tick.get('last_price')
+        if price is None or price <= 0 or price > 1000000:  # Adjust based on your instruments
+            return False
+        
+        # Validate symbol is not unknown
+        symbol = tick.get('symbol', '')
+        if not symbol or symbol.startswith('UNKNOWN_'):
+            return False
+            
+        return True
 
     def _process_intraday_tick(self, tick_data: Dict[str, Any]):
         """Process individual tick data for intraday trading"""
@@ -360,8 +387,37 @@ class IntradayCrawler(BaseCrawler):
                 }
 
                 # Append to Redis Stream in DB 1 (realtime)
-                realtime_client = self.redis_client.get_client(1) if hasattr(self.redis_client, 'get_client') else self.redis_client
-                realtime_client.xadd(stream_key, fields)
+                # ✅ FIXED: Use process-specific client or get DB 1 client properly
+                try:
+                    from redis_files.redis_manager import RedisManager82
+                    # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+                    realtime_client = RedisManager82.get_client(process_name="intraday_crawler", db=1)
+                except Exception:
+                    # Fallback: If self.redis_client is already on DB 1, use it directly
+                    # Otherwise, try to get a client for DB 1
+                    if hasattr(self.redis_client, 'get_client'):
+                        realtime_client = self.redis_client.get_client(1)
+                    elif hasattr(self.redis_client, 'connection_pool'):
+                        # Plain Redis client - check if it's on the right DB
+                        if self.config.redis_db == 1:
+                            realtime_client = self.redis_client
+                        else:
+                            # Need to create a new client for DB 1
+                            from redis_files.redis_manager import RedisManager82
+                            realtime_client = RedisManager82.get_client(
+                                process_name="intraday_crawler",
+                                db=1,
+                                max_connections=3
+                            )
+                    else:
+                        realtime_client = self.redis_client
+                
+                if not realtime_client:
+                    logger.warning(f"⚠️ No Redis client available for publishing to {stream_key}")
+                    return
+                
+                # ✅ TIER 1: Keep stream trimmed for performance (last 10k ticks)
+                realtime_client.xadd(stream_key, fields, maxlen=10000, approximate=True)
 
         except Exception as e:
             logger.error(f"Error publishing to binary stream: {e}")
@@ -378,10 +434,17 @@ class IntradayCrawler(BaseCrawler):
             processed_tick = {k: v for k, v in tick_data.items() if k != "raw_data"}
 
             # Get realtime client (DB 1) for pub/sub publishing
-            if hasattr(self.redis_client, 'get_client'):
-                realtime_client = self.redis_client.get_client(1)
-            else:
-                realtime_client = self.redis_client
+            # Use process-specific client if available, otherwise use wrapper's get_client
+            try:
+                from redis_files.redis_manager import RedisManager82
+                # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+                realtime_client = RedisManager82.get_client(process_name="intraday_scanner", db=1)
+            except Exception:
+                # Fallback to existing method
+                if hasattr(self.redis_client, 'get_client'):
+                    realtime_client = self.redis_client.get_client(1)
+                else:
+                    realtime_client = self.redis_client
             
             if not realtime_client:
                 logger.warning("⚠️ Realtime client not available, skipping publish")
@@ -513,10 +576,40 @@ class IntradayCrawler(BaseCrawler):
                     intraday_tick[key] = ""
 
             # Store as a Redis Stream entry (JSON blob for compactness) in DB 1 (realtime)
-            realtime_client = self.redis_client.get_client(1) if hasattr(self.redis_client, 'get_client') else self.redis_client
+            # ✅ FIXED: Get proper Redis client for DB 1
+            try:
+                from redis_files.redis_manager import RedisManager82
+                # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+                realtime_client = RedisManager82.get_client(process_name="intraday_crawler", db=1)
+            except Exception:
+                # Fallback: If self.redis_client is already on DB 1, use it directly
+                if hasattr(self.redis_client, 'get_client'):
+                    realtime_client = self.redis_client.get_client(1)
+                elif hasattr(self.redis_client, 'connection_pool'):
+                    # Plain Redis client - check if it's on the right DB
+                    if self.config.redis_db == 1:
+                        realtime_client = self.redis_client
+                    else:
+                        # Need to create a new client for DB 1
+                        from redis_files.redis_manager import RedisManager82
+                        realtime_client = RedisManager82.get_client(
+                            process_name="intraday_crawler",
+                            db=1,
+                            max_connections=3
+                        )
+                else:
+                    realtime_client = self.redis_client
+            
+            if not realtime_client:
+                logger.warning(f"⚠️ No Redis client available for publishing to {stream_key}")
+                return
+            
+            # ✅ TIER 1: Keep stream trimmed for performance (last 5k processed ticks)
             realtime_client.xadd(
                 stream_key,
                 {"data": json.dumps(intraday_tick, default=str)},
+                maxlen=5000,
+                approximate=True
             )
 
         except Exception as e:
@@ -570,7 +663,7 @@ class IntradayCrawler(BaseCrawler):
 
         try:
             if not hasattr(self, "_historical_baseline_helper"):
-                from utils.historical_volume_baseline import HistoricalVolumeBaseline
+                from utils.time_aware_volume_baseline import HistoricalVolumeBaseline
 
                 self._historical_baseline_helper = HistoricalVolumeBaseline(
                     self.redis_client

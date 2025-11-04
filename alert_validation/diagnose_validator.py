@@ -24,7 +24,7 @@ def test_price_resolution():
     """Test price resolution for various symbols."""
     try:
         from alert_validation.alert_validator import AlertValidator
-        import alert_validation.alert_validator_patch  # Apply patches
+        # Patches have been integrated into alert_validator.py - no longer needed
         
         logger.info("🧪 Testing AlertValidator price resolution...")
         
@@ -54,7 +54,7 @@ def test_bucket_metrics():
     """Test bucket metrics calculation."""
     try:
         from alert_validation.alert_validator import AlertValidator
-        import alert_validation.alert_validator_patch  # Apply patches
+        # Patches have been integrated into alert_validator.py - no longer needed
         
         logger.info("🧪 Testing AlertValidator bucket metrics...")
         
@@ -87,7 +87,7 @@ def test_validation_process():
     """Test the complete validation process."""
     try:
         from alert_validation.alert_validator import AlertValidator
-        import alert_validation.alert_validator_patch  # Apply patches
+        # Patches have been integrated into alert_validator.py - no longer needed
         
         logger.info("🧪 Testing complete validation process...")
         

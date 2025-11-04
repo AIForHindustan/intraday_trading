@@ -26,6 +26,8 @@ from config.utils.timestamp_normalizer import TimestampNormalizer
 
 # Chart visualization imports
 try:
+    import matplotlib
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     from matplotlib.figure import Figure
@@ -86,7 +88,13 @@ class AlertStream:
             "rolling_windows": json.dumps(rolling_data.get("rolling_windows", {})),
         }
 
-        redis_core = getattr(self.redis, "redis_client", None) or self.redis.get_client(0)
+        # ✅ CONSISTENCY: Use RedisManager82 for direct client access
+        from redis_files.redis_manager import RedisManager82
+        redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
+            process_name="alert_validator",
+            db=0,
+            max_connections=None
+        )
         if redis_core:
             pipe = redis_core.pipeline()
             pipe.hset(metadata_key, mapping=metadata_payload)
@@ -152,7 +160,13 @@ class AlertStream:
         return f"{self.alert_metadata_prefix}:{alert_id}"
 
     def _load_metadata(self, alert_id: str) -> Optional[Dict]:
-        redis_core = getattr(self.redis, "redis_client", None) or self.redis.get_client(0)
+        # ✅ CONSISTENCY: Use RedisManager82 for direct client access
+        from redis_files.redis_manager import RedisManager82
+        redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
+            process_name="alert_validator",
+            db=0,
+            max_connections=None
+        )
         if not redis_core:
             return None
         metadata = redis_core.hgetall(self._metadata_key(alert_id))
@@ -202,7 +216,13 @@ class AlertStream:
         }
 
     def _update_performance_stats_sync(self, result_payload: Dict, metadata: Dict) -> None:
-        redis_core = getattr(self.redis, "redis_client", None) or self.redis.get_client(0)
+        # ✅ CONSISTENCY: Use RedisManager82 for direct client access
+        from redis_files.redis_manager import RedisManager82
+        redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
+            process_name="alert_validator",
+            db=0,
+            max_connections=None
+        )
         if not redis_core:
             return
 
@@ -256,7 +276,13 @@ class AlertStream:
         }
         
         try:
-            redis_core = getattr(self.redis, "redis_client", None) or self.redis.get_client(0)
+            # ✅ CONSISTENCY: Use RedisManager82 for direct client access
+            from redis_files.redis_manager import RedisManager82
+            redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
+                process_name="alert_validator",
+                db=0,
+                max_connections=None
+            )
             if not redis_core:
                 return rolling_data
             
@@ -337,8 +363,18 @@ class AlertStream:
             rolling_windows = json.loads(metadata.get("rolling_windows", "{}"))
             if rolling_windows:
                 windows = list(rolling_windows.keys())
-                confidences = [rolling_windows[w].get("confidence", 0.0) for w in windows]
-                signal_strengths = [rolling_windows[w].get("signal_strength", 0.0) for w in windows]
+                # ✅ FIX: Handle case where rolling_windows[w] might be an int/dict
+                confidences = []
+                signal_strengths = []
+                for w in windows:
+                    window_data = rolling_windows[w]
+                    if isinstance(window_data, dict):
+                        confidences.append(window_data.get("confidence", 0.0))
+                        signal_strengths.append(window_data.get("signal_strength", 0.0))
+                    else:
+                        # If window_data is not a dict (e.g., int/float), use defaults
+                        confidences.append(0.0)
+                        signal_strengths.append(0.0)
                 
                 x = range(len(windows))
                 ax2.plot(x, confidences, 'o-', label='Confidence', color='blue')
@@ -402,8 +438,14 @@ Rolling Windows Analysis:"""
         try:
             rolling_windows = json.loads(metadata.get("rolling_windows", "{}"))
             for window, data in rolling_windows.items():
-                confidence = data.get("confidence", 0.0)
-                signal_strength = data.get("signal_strength", 0.0)
+                # ✅ FIX: Handle case where data might be an int/dict
+                if isinstance(data, dict):
+                    confidence = data.get("confidence", 0.0)
+                    signal_strength = data.get("signal_strength", 0.0)
+                else:
+                    # If data is not a dict (e.g., int/float), use defaults
+                    confidence = 0.0
+                    signal_strength = 0.0
                 result_text += f"\n{window}: Confidence={confidence:.2f}, Signal={signal_strength:.2f}"
         except:
             result_text += "\nRolling windows data not available"
@@ -416,7 +458,13 @@ Rolling Windows Analysis:"""
     def get_performance_summary(self) -> Dict:
         """Get comprehensive performance summary with rolling windows data."""
         try:
-            redis_core = getattr(self.redis, "redis_client", None) or self.redis.get_client(0)
+            # ✅ CONSISTENCY: Use RedisManager82 for direct client access
+            from redis_files.redis_manager import RedisManager82
+            redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
+                process_name="alert_validator",
+                db=0,
+                max_connections=None
+            )
             if not redis_core:
                 return {}
             

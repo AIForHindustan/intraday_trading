@@ -22,7 +22,7 @@ def check_redis_health(host="localhost", port=6379):
     from redis_files.redis_health import main as health_main
     import sys
     # Use centralized Redis configuration
-    from config.redis_config import get_redis_config
+    from redis_files.redis_config import get_redis_config
     redis_config = get_redis_config()
     host = redis_config.get("host", host)
     port = redis_config.get("port", port)

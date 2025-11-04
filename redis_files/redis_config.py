@@ -9,7 +9,11 @@ and feature flags (client tracking, RedisJSON readiness).
 from __future__ import annotations
 
 import os
+import time
+import threading
 from typing import Any, Dict, Optional
+import redis
+from redis.connection import ConnectionPool
 
 # ---------------------------------------------------------------------------
 # Base connection configuration (Redis 8.x)
@@ -108,7 +112,8 @@ REDIS_DATABASES: Dict[int, Dict[str, Any]] = {
             "commodity_prices",
             # Premarket (from DB 3)
             "premarket_trades",
-            "incremental_volume",
+            "bucket_incremental_volume",  # Canonical field name (replaces legacy "incremental_volume")
+            "incremental_volume",  # Legacy identifier - kept for backward compatibility
             "opening_data",
             # Continuous market / ticks (from DB 4)
             "5s_ticks",
@@ -156,6 +161,17 @@ REDIS_DATABASES: Dict[int, Dict[str, Any]] = {
         ],
         "client_tracking": True,  # ideal for local cache invalidation
         "use_json": False,
+    },
+    # Indicators and Greeks cache (DB 5)
+    # Per user requirement: indicators and Greeks stored in DB 5
+    5: {
+        "name": "indicators_cache_db",
+        "ttl": 300,  # 5 minutes to match calculation cache
+        "data_types": [
+            "indicators_cache",  # Primary storage for indicators and Greeks
+        ],
+        "client_tracking": False,
+        "use_json": True,
     },
 }
 
@@ -277,6 +293,55 @@ def apply_redis_low_latency_optimizations(redis_client) -> bool:
     """
     config = Redis8Config()
     return config.apply_low_latency_optimizations(redis_client)
+
+
+# ---------------------------------------------------------------------------
+# Connection Pool Configuration - Process-Specific Pools
+# ---------------------------------------------------------------------------
+
+# Process-specific pool size configurations (prevents over-allocation)
+# ✅ SOLUTION 4: Increased pool sizes to prevent connection exhaustion
+# 
+# IMPORTANT: RedisManager82.get_client() will automatically use PROCESS_POOL_CONFIG values
+# if available, so these values override any hardcoded max_connections parameter.
+# 
+# Pool sizes are optimized for high-throughput processes:
+# - High-frequency processes (scanner, crawler) get larger pools
+# - Moderate processes (consumers, validators) get moderate pools
+# - Low-frequency processes (dashboard, cleanup) get smaller pools
+PROCESS_POOL_CONFIG: Dict[str, int] = {
+    # ✅ SOLUTION 4: Increased for high-throughput processes
+    "intraday_scanner": 30,      # Main scanner needs more connections for high-frequency processing
+    "intraday_crawler": 15,      # Crawler needs dedicated pool for high-frequency publishing
+    "stream_consumer": 10,       # Stream consumers need dedicated connections
+    "data_pipeline": 10,         # Data pipeline consumer group
+    "dashboard": 8,              # Dashboard needs fewer (mostly read operations)
+    "validator": 10,            # Moderate needs (validation processing)
+    "alert_validator": 10,       # Alert validator consumer
+    "cleanup": 3,                # Maintenance tasks (minimal connections)
+    "monitor": 3,                # Stream monitor (proactive monitoring)
+    "ngrok": 5,                  # Minimal needs (tunnel management)
+    # Legacy/fallback values
+    "crawler": 15,               # Generic crawler pool size (matches intraday_crawler)
+    "gift_nifty_crawler": 2,     # Index updater needs minimal connections (30s intervals)
+    "gift_nifty_gap": 2,         # Alias for gift_nifty_crawler (backward compatibility)
+    "default": 10,               # Default for unknown processes
+}
+
+# ⚠️ DEPRECATED FUNCTIONS REMOVED:
+# - create_process_specific_pool() -> Use RedisManager82.get_client()
+# - get_redis_connection_pool() -> Use RedisManager82.get_client()
+# - get_redis_client_from_pool() -> Use RedisManager82.get_client()
+#
+# Migration guide:
+# - Old: get_redis_client_from_pool(db=1)
+# - New: RedisManager82.get_client(process_name="your_process", db=1)
+
+
+# ---------------------------------------------------------------------------
+# Redis Optimization Examples (REMOVED - move to documentation if needed)
+# ---------------------------------------------------------------------------
+# optimize_redis_usage_examples() removed - contained examples only
 
 
 class RedisConfig(Redis8Config):

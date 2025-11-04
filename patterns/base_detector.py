@@ -228,12 +228,20 @@ class BasePatternDetector:
     def get_profile_data(self) -> Dict[str, Any]:
         """Get volume profile data (required for _find_support_resistance)"""
         # This is a fallback implementation - child classes should override
+        # ✅ Match signature with VolumeProfileManager.get_profile_data() (includes price_volume_distribution)
         return {
             'poc_price': 0.0,
+            'poc_volume': 0.0,
             'value_area_high': 0.0,
             'value_area_low': 0.0,
+            'total_volume': 0,
+            'price_levels': 0,
+            'profile_range': 0.0,
+            'exchange_timestamp': '',
+            'calculation_method': 'fallback',
             'support_levels': [],
-            'resistance_levels': []
+            'resistance_levels': [],
+            'price_volume_distribution': {}  # ✅ Include empty bins dict for consistency
         }
 
     def get_stats(self) -> Dict[str, Any]:

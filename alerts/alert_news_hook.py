@@ -35,7 +35,9 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from redis_files.redis_client import get_redis_client, create_consumer_group_if_needed, xreadgroup_blocking
+from redis_files.redis_client import get_redis_client, create_consumer_group_if_needed
+# ✅ STANDARDIZED: xreadgroup_blocking removed - use RobustStreamConsumer instead
+from intraday_scanner.data_pipeline import RobustStreamConsumer
 from alerts.notifiers import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -248,15 +250,15 @@ class NewsEventConsumer:
             # Reclaim stale pending messages first
             reclaimed = self._reclaim_pending()
             
-            # Read messages from stream
-            # xreadgroup_blocking signature: (group, consumer, streams, count, block_ms)
+            # ✅ STANDARDIZED: Use direct xreadgroup instead of deprecated xreadgroup_blocking
+            # Read messages from stream using direct Redis client
             try:
-                messages = xreadgroup_blocking(
-                    self.group_name,          # group (first param)
-                    self.consumer_name,       # consumer (second param)
-                    {self.stream_name: ">"},  # streams dict: {stream_name: ">"} (third param)
+                messages = self.redis_client.xreadgroup(
+                    groupname=self.group_name,
+                    consumername=self.consumer_name,
+                    streams={self.stream_name: ">"},  # New messages only
                     count=BATCH_SIZE,
-                    block_ms=BLOCK_MS
+                    block=BLOCK_MS
                 )
             except Exception as e:
                 # If stream doesn't exist yet, return empty

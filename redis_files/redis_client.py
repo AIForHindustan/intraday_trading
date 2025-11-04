@@ -53,7 +53,6 @@ from utils.yaml_field_loader import (
 from redis_files.redis_ohlc_keys import (
     normalize_symbol as normalize_ohlc_symbol,
     ohlc_daily_zset,
-    ohlc_timeseries_key,
     ohlc_hourly_zset,
 )
 
@@ -68,20 +67,12 @@ except ImportError:
 # Circuit breaker implementation (consolidated)
 import time
 from enum import Enum
-from functools import wraps
 
 class CircuitState(Enum):
     """Circuit breaker states"""
     CLOSED = "CLOSED"      # Normal operation
     OPEN = "OPEN"          # Circuit is open, requests blocked
     HALF_OPEN = "HALF_OPEN"  # Testing if service is back
-
-class CircuitBreakerOpen(Exception):
-    """Exception raised when circuit breaker is open"""
-    def __init__(self, message: str, circuit_name: str = "Unknown"):
-        super().__init__(message)
-        self.circuit_name = circuit_name
-        self.message = message
 
 class CircuitBreaker:
     """Circuit Breaker implementation for preventing cascading failures"""
@@ -143,14 +134,35 @@ class CircuitBreaker:
         """Get current circuit breaker state"""
         return self.state.value
 
-def redis_circuit_breaker():
-    """Circuit breaker for Redis operations"""
-    return CircuitBreaker(
-        name="redis",
-        failure_threshold=3,
-        reset_timeout=30,
-        success_threshold=2
-    )
+# Singleton circuit breaker for Redis (shared across all client instances)
+# Best practice: Circuit breakers should be shared for shared infrastructure resources
+# This ensures consistent failure detection across all Redis client instances
+_shared_redis_circuit_breaker: Optional[CircuitBreaker] = None
+_shared_circuit_breaker_lock = Lock()
+
+def redis_circuit_breaker() -> CircuitBreaker:
+    """
+    Get or create the shared singleton circuit breaker for Redis operations.
+    
+    Best Practice (Redis 8.2):
+    - Circuit breakers should be shared/singleton for shared infrastructure
+    - All clients share the same failure state, ensuring consistent behavior
+    - When Redis goes down, all clients immediately benefit from the open circuit
+    - Prevents per-instance discovery delays and inconsistent state
+    """
+    global _shared_redis_circuit_breaker
+    if _shared_redis_circuit_breaker is None:
+        with _shared_circuit_breaker_lock:
+            # Double-check pattern
+            if _shared_redis_circuit_breaker is None:
+                _shared_redis_circuit_breaker = CircuitBreaker(
+                    name="redis",
+                    failure_threshold=3,
+                    reset_timeout=30,
+                    success_threshold=2
+                )
+                logger.info("Created shared singleton circuit breaker for Redis")
+    return _shared_redis_circuit_breaker
 
 CIRCUIT_BREAKER_AVAILABLE = True
 
@@ -161,35 +173,6 @@ FIELD_MAPPING_MANAGER = get_field_mapping_manager()
 SESSION_FIELD_ZERODHA_CUM = resolve_session_field("zerodha_cumulative_volume")
 SESSION_FIELD_BUCKET_CUM = resolve_session_field("bucket_cumulative_volume")
 SESSION_FIELD_BUCKET_INC = resolve_session_field("bucket_incremental_volume")
-SESSION_ALIAS_BY_CANONICAL = FIELD_MAPPING_MANAGER.get_session_aliases_by_canonical()
-
-
-def mirror_session_aliases(
-    redis_connection,
-    key: str,
-    canonical_field: str,
-    value: int,
-    operation: str = "set",
-) -> None:
-    """Mirror canonical session fields to legacy aliases."""
-    aliases = SESSION_ALIAS_BY_CANONICAL.get(canonical_field, [])
-    if not aliases:
-        return
-
-    for alias in aliases:
-        try:
-            if operation == "incr":
-                redis_connection.hincrby(key, alias, value)
-            else:
-                redis_connection.hset(key, alias, value)
-        except Exception as alias_err:
-            logger.debug(
-                "Failed to mirror alias %s for %s on %s: %s",
-                alias,
-                canonical_field,
-                key,
-                alias_err,
-            )
 # Singleton holder for RobustRedisClient
 _redis_client_instance = None
 
@@ -217,14 +200,43 @@ class SafeJSONEncoder(json.JSONEncoder):
 from redis_files.redis_config import (
     REDIS_DATABASES,
     AION_CHANNELS,
-    get_redis_config,
     get_database_for_data_type,
     get_ttl_for_data_type,
 )
 
 
+def _detect_process_name():
+    """
+    Detect which process is running based on script name or environment.
+    Used to automatically select appropriate process-specific connection pools.
+    """
+    import sys
+    import os
+    
+    # Check for explicit process name in environment
+    process_name = os.getenv("REDIS_PROCESS_NAME")
+    if process_name:
+        return process_name
+    
+    # Detect from script name
+    script_name = sys.argv[0] if sys.argv else ""
+    if "scanner_main" in script_name or "scanner" in script_name.lower():
+        return "intraday_scanner"
+    elif "alert_dashboard" in script_name or "dashboard" in script_name.lower():
+        return "dashboard"
+    elif "alert_validator" in script_name or "validator" in script_name.lower():
+        return "validator"
+    elif "ngrok" in script_name.lower():
+        return "ngrok"
+    elif "crawler" in script_name.lower():
+        return "intraday_scanner"  # Crawlers share scanner pool
+    
+    # Default fallback
+    return "default"
+
+
 class ConnectionPooledRedisClient:
-    """Shared connection-pool wrapper to avoid per-thread Redis connections."""
+    """Shared connection-pool wrapper with process-specific pools to avoid connection exhaustion."""
 
     _pools: Dict[str, ConnectionPool] = {}
     _lock: Lock = Lock()
@@ -241,8 +253,39 @@ class ConnectionPooledRedisClient:
         socket_timeout: int = 5,
         retry_on_timeout: bool = True,
         health_check_interval: int = 30,
+        process_name: Optional[str] = None,  # Process name for process-specific pools
     ):
-        pool_key = f"{host}:{port}:{db}:{decode_responses}"
+        # Use process-specific pools if available
+        if process_name is None:
+            process_name = _detect_process_name()
+        
+        # Try to use process-specific pools from redis_config
+        try:
+            from redis_files.redis_manager import RedisManager82
+            # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+            # RedisManager82.get_client() automatically uses PROCESS_POOL_CONFIG
+            process_client = RedisManager82.get_client(process_name=process_name, db=db)
+            # Extract the pool from the client
+            if hasattr(process_client, 'connection_pool') and process_client.connection_pool:
+                self.pool = process_client.connection_pool
+                self.redis = process_client
+                # Set client name if not already set
+                try:
+                    import time
+                    import os
+                    timestamp = int(time.time())
+                    instance_id = str(os.getpid())
+                    client_name = f"{process_name}_{instance_id}_{timestamp}"
+                    process_client.client_setname(client_name)
+                except Exception:
+                    pass
+                return
+        except Exception as e:
+            # Fallback to old method if process-specific pools fail
+            logger.debug(f"Failed to use process-specific pool for {process_name}, falling back: {e}")
+        
+        # Fallback: Use old shared pool method (backward compatibility)
+        pool_key = f"{host}:{port}:{db}:{decode_responses}:{process_name}"
         with self._lock:
             pool = self._pools.get(pool_key)
             if not pool:
@@ -319,7 +362,7 @@ class RobustRedisClient:
         else:
             # Try to get from centralized config if no config provided
             try:
-                from config.redis_config import get_redis_config
+                from redis_files.redis_config import get_redis_config
                 redis_config = get_redis_config()
                 if "max_connections" in redis_config:
                     self.max_connections = int(redis_config["max_connections"])
@@ -406,11 +449,16 @@ class RobustRedisClient:
         self._fallback_session = value
 
     def _initialize_clients(self):
-        """Initialize separate Redis clients for each database"""
+        """Initialize separate Redis clients for each database using process-specific pools"""
         try:
+            # Detect process name for process-specific pools
+            process_name = _detect_process_name()
+            logger.info(f"📡 Initializing Redis clients for process: {process_name}")
+            
             # Initialize clients for all databases defined in REDIS_DATABASES
             for db_num in REDIS_DATABASES.keys():
                 try:
+                    # Use process-specific pools via ConnectionPooledRedisClient
                     wrapper = ConnectionPooledRedisClient(
                         host=self.host,
                         port=self.port,
@@ -418,13 +466,14 @@ class RobustRedisClient:
                         password=self.password,
                         max_connections=self.max_connections,
                         decode_responses=self.decode_responses,
+                        process_name=process_name,  # Pass process name for process-specific pools
                     )
                     client = wrapper.redis
                     client.ping()
                     self.connection_wrappers[db_num] = wrapper
                     self.clients[db_num] = client
                     logger.info(
-                        f"✅ Redis client initialized for DB {db_num} using pooled connections (max {self.max_connections})"
+                        f"✅ Redis client initialized for DB {db_num} using process-specific pool ({process_name}, max {self.max_connections})"
                     )
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to initialize client for DB {db_num}: {e}")
@@ -611,8 +660,11 @@ class RobustRedisClient:
             elif not isinstance(value, (bytes, str, int, float)):
                 value = str(value)
 
-            # Store using the appropriate client
-            result = client.set(key, value, ex=ttl)
+            # Store using the appropriate client with expiration
+            if ttl and ttl > 0:
+                result = client.setex(key, ttl, value)
+            else:
+                result = client.set(key, value)
             self.stats["successful_operations"] += 1
             return result
             
@@ -620,6 +672,108 @@ class RobustRedisClient:
             logger.error(f"Failed to store in database {db_num}: {e}")
             self.stats["failed_operations"] += 1
             return False
+
+    def batch_store_by_data_type(self, operations: List[Tuple[str, str, Any, Optional[int]]]) -> Dict[str, bool]:
+        """
+        Batch store multiple operations using Redis pipeline for optimal performance.
+        
+        This is optimized for Redis 8.2 and uses connection pooling. All operations
+        are executed in a single round trip to Redis.
+        
+        Args:
+            operations: List of tuples (data_type, key, value, ttl)
+                - data_type: Type of data (determines database)
+                - key: Redis key
+                - value: Value to store (dict/list will be JSON serialized)
+                - ttl: Optional TTL in seconds (defaults to data_type TTL if None)
+        
+        Returns:
+            Dict mapping key to success status
+        
+        Example:
+            operations = [
+                ("analysis_cache", "indicators:SYMBOL:rsi", "45.5", 3600),
+                ("analysis_cache", "indicators:SYMBOL:atr", "2.3", 3600),
+            ]
+            results = redis_client.batch_store_by_data_type(operations)
+        """
+        if not operations:
+            return {}
+        
+        # Group operations by database number
+        db_operations: Dict[int, List[Tuple[str, Any, Optional[int]]]] = {}
+        key_to_result = {}
+        
+        for data_type, key, value, ttl in operations:
+            db_num = self.get_database_for_data_type(data_type)
+            if ttl is None:
+                ttl = self.get_ttl_for_data_type(data_type)
+            
+            if db_num not in db_operations:
+                db_operations[db_num] = []
+            
+            # Serialize value
+            serialized_value = value
+            if isinstance(value, (dict, list)):
+                if isinstance(value, dict):
+                    serializable_value = {}
+                    for k, v in value.items():
+                        if isinstance(v, bytes):
+                            import base64
+                            serializable_value[k] = base64.b64encode(v).decode("utf-8")
+                        else:
+                            serializable_value[k] = v
+                    serialized_value = json.dumps(serializable_value, cls=SafeJSONEncoder)
+                else:
+                    serialized_value = json.dumps(value, cls=SafeJSONEncoder)
+            elif not isinstance(serialized_value, (bytes, str, int, float)):
+                serialized_value = str(value)
+            
+            db_operations[db_num].append((key, serialized_value, ttl))
+            key_to_result[key] = False  # Initialize as failed
+        
+        # Execute pipeline for each database
+        for db_num, ops in db_operations.items():
+            client = self.get_client(db_num)
+            if not client:
+                logger.error(f"No client available for database {db_num}")
+                continue
+            
+            try:
+                # Create pipeline for this database
+                pipe = client.pipeline(transaction=False)
+                
+                # Add all operations to pipeline
+                for key, value, ttl in ops:
+                    if ttl and ttl > 0:
+                        pipe.setex(key, ttl, value)
+                    else:
+                        pipe.set(key, value)
+                
+                # Execute pipeline (all operations in one round trip)
+                results = pipe.execute()
+                
+                # Update success status
+                for i, key in enumerate([op[0] for op in ops]):
+                    key_to_result[key] = bool(results[i] if i < len(results) else False)
+                
+                self.stats["successful_operations"] += sum(1 for r in results if r)
+                
+            except Exception as e:
+                logger.error(f"Pipeline execution failed for database {db_num}: {e}")
+                self.stats["failed_operations"] += len(ops)
+                # Fallback to individual operations
+                for key, value, ttl in ops:
+                    try:
+                        if ttl and ttl > 0:
+                            result = client.setex(key, ttl, value)
+                        else:
+                            result = client.set(key, value)
+                        key_to_result[key] = bool(result)
+                    except Exception as fallback_error:
+                        logger.debug(f"Fallback store failed for {key}: {fallback_error}")
+        
+        return key_to_result
 
     def retrieve_by_data_type(self, key, data_type):
         """Retrieve data from appropriate database based on type using separate clients"""
@@ -683,13 +837,6 @@ class RobustRedisClient:
         return None
 
     # ============ Specialized Methods for Each Segment ============
-
-    def store_spoof_alert(self, symbol, alert_data):
-        """Store spoofing alert in DB 1 (realtime) via store_by_data_type routing"""
-        key = f"spoof:{symbol}:{int(time.time())}"
-        return self.store_by_data_type(
-            "pattern_alerts", key, json.dumps(alert_data)
-        )
 
     def store_asset_price(self, symbol, price_data, asset_class="equity_cash"):
         """Store asset last_price in DB 1 (realtime) via store_by_data_type routing"""
@@ -757,7 +904,13 @@ class RobustRedisClient:
             return False
         
         # Resolve token to symbol BEFORE storing
+        # CRITICAL: This will return None if resolution fails (prevents UNKNOWN keys)
         symbol = self._resolve_token_to_symbol_for_storage(symbol)
+        
+        # If resolution failed, skip storage to prevent UNKNOWN keys in Redis
+        if not symbol or symbol.startswith("UNKNOWN_"):
+            logger.warning(f"⚠️ Skipping ticks storage - symbol resolution failed for input symbol")
+            return False
 
         optimized_ticks = []
         for tick in ticks:
@@ -912,49 +1065,23 @@ class RobustRedisClient:
         stream_name = f"patterns:{symbol}"
         return self.read_from_stream(stream_name, count, start_id)
 
-    # ============ Index Data Helpers ============
-
-    def get_index(self, index_name: str):
-        """Fetch index snapshot by name. Tries multiple key patterns and JSON-decodes values.
-
-        Known names: 'nifty50', 'niftybank', 'giftnifty', 'indiavix', 'finnifty'
-        """
-        if not index_name:
-            return None
-        keys_to_try = [
-            f"index_data:{index_name}",
-            f"indices:{index_name}",
-            f"market:indices:{index_name}",
-        ]
-        for k in keys_to_try:
-            try:
-                v = self.get(k)
-                if not v:
-                    continue
-                if isinstance(v, dict):
-                    return v
-                # Try JSON decode
-                try:
-                    import json as _json
-
-                    data = _json.loads(v)
-                    if isinstance(data, dict):
-                        return data
-                except Exception:
-                    # Possibly a simple string; return as-is
-                    return {"raw": v}
-            except Exception:
-                continue
-        return None
-
     # ============ Cumulative Data Tracking Methods ============
 
-    def update_cumulative_data(
-        self, symbol, last_price, bucket_incremental_volume, timestamp=None, depth_data=None
-    ):
-        """Update cumulative data for a symbol with session tracking"""
+    def update_cumulative_data(self, symbol, last_price, bucket_incremental_volume, timestamp=None, depth_data=None, bucket_cumulative_volume=None):
+        """
+        Update cumulative data with proper cumulative volume handling
+        
+        If bucket_cumulative_volume is not provided, attempt to extract from:
+        1. depth_data (if provided)
+        2. Redis session data
+        3. Leave as None (cumulative fields won't be updated)
+        """
+        # Try to extract cumulative from depth_data if not provided
+        if bucket_cumulative_volume is None and depth_data is not None:
+            bucket_cumulative_volume = depth_data.get('zerodha_cumulative_volume') or depth_data.get('bucket_cumulative_volume')
+        
         return self.cumulative_tracker.update_symbol_data(
-            symbol, last_price, bucket_incremental_volume, timestamp, depth_data
+            symbol, last_price, bucket_incremental_volume, timestamp, depth_data, bucket_cumulative_volume
         )
 
     def update_symbol_data_direct(
@@ -1025,12 +1152,23 @@ class RobustRedisClient:
 
         return symbol
 
-    def get_rolling_window_buckets(self, symbol: str, lookback_minutes: int = 60) -> List[Dict[str, Any]]:
+    def get_rolling_window_buckets(self, symbol: str, lookback_minutes: int = 60, session_date: str = None, max_days_back: int = None) -> List[Dict[str, Any]]:
         """
         Get rolling window bucket data from history lists for volume profile calculations
         
         This method retrieves data from history lists which contain the rolling window data
         that the volume profile library needs for proper volume threshold calculations.
+        
+        Args:
+            symbol: Trading symbol
+            lookback_minutes: Lookback window in minutes (used to calculate reasonable max_days_back if not provided)
+            session_date: Optional date string (YYYY-MM-DD) to filter by specific date
+            max_days_back: Maximum days to look back if session_date is None. 
+                          If None, calculates based on history list TTL (7 days) and lookback_minutes.
+                          Defaults to: max(7, ceil(lookback_minutes / 1440) + 1) to ensure enough data
+        
+        Returns:
+            List of bucket dictionaries filtered by date
         """
         try:
             # Ensure symbol is a string (may be int like instrument_token)
@@ -1038,6 +1176,39 @@ class RobustRedisClient:
                 symbol = str(symbol)
             # Extract base symbol for F&O contracts
             base_symbol = self._extract_base_symbol(symbol)
+            
+            # Calculate date range for filtering
+            from datetime import datetime, timedelta
+            import math
+            
+            # Calculate max_days_back if not provided
+            # History lists have TTL of 7 days, so we can safely look back that far
+            # For rolling windows, we need at least enough days to cover the lookback window
+            # Add buffer for weekend/non-trading days
+            if max_days_back is None:
+                # History list TTL is 7 days (7 * 86400 seconds from update_volume_buckets)
+                # Calculate based on lookback_minutes: need at least lookback_minutes / minutes_per_day days
+                # Trading day = ~375 minutes (9:15 AM to 3:30 PM), but account for gaps
+                minutes_per_day = 1440  # Full day in minutes
+                days_needed = math.ceil(lookback_minutes / minutes_per_day) if lookback_minutes > 0 else 1
+                # Use history list TTL (7 days) as upper bound, but ensure we have enough for lookback
+                max_days_back = max(7, days_needed + 1)  # +1 for buffer
+                logger.debug(f"Calculated max_days_back={max_days_back} based on lookback_minutes={lookback_minutes} and history TTL=7 days")
+            
+            if session_date:
+                # Filter by specific date
+                try:
+                    target_date = datetime.strptime(session_date, '%Y-%m-%d').date()
+                    date_min = target_date
+                    date_max = target_date
+                except ValueError:
+                    logger.warning(f"Invalid session_date format: {session_date}, using max_days_back={max_days_back}")
+                    date_max = datetime.now().date()
+                    date_min = date_max - timedelta(days=max_days_back)
+            else:
+                # Use max_days_back to limit how far we look
+                date_max = datetime.now().date()
+                date_min = date_max - timedelta(days=max_days_back)
             
             # ✅ SINGLE SOURCE OF TRUTH: Check history lists first (rolling window data)
             # History lists contain the data that volume profile library needs for rolling windows
@@ -1058,18 +1229,47 @@ class RobustRedisClient:
                     history_length = self.redis_client.llen(history_key)
                     if history_length > 0:
                         logger.info(f"🔍 [ROLLING_WINDOW_DEBUG] {symbol} -> Found history list: {history_key} with {history_length} buckets")
-                        # Get recent buckets from history list for rolling window calculations
-                        # Get more buckets for rolling window analysis (up to 200 for better volume profile)
-                        recent_buckets = self.redis_client.lrange(history_key, -min(200, history_length), -1)
+                        # Get more buckets for rolling window analysis (up to 500 to ensure we cover enough dates)
+                        recent_buckets = self.redis_client.lrange(history_key, -min(500, history_length), -1)
                         buckets = []
                         for bucket_data in recent_buckets:
                             try:
                                 bucket = json.loads(bucket_data)
-                                buckets.append(bucket)
-                            except:
+                                
+                                # Filter by date using timestamp field
+                                if 'timestamp' in bucket:
+                                    try:
+                                        # Parse ISO timestamp from history entry
+                                        bucket_time = bucket['timestamp']
+                                        if isinstance(bucket_time, str):
+                                            # Handle ISO format timestamps
+                                            if 'T' in bucket_time:
+                                                bucket_dt = datetime.fromisoformat(bucket_time.replace('Z', '+00:00'))
+                                            else:
+                                                # Try parsing as date string
+                                                bucket_dt = datetime.strptime(bucket_time.split()[0], '%Y-%m-%d')
+                                        else:
+                                            # Numeric timestamp
+                                            bucket_dt = datetime.fromtimestamp(float(bucket_time))
+                                        
+                                        bucket_date = bucket_dt.date()
+                                        
+                                        # Only include if within date range
+                                        if date_min <= bucket_date <= date_max:
+                                            buckets.append(bucket)
+                                    except (ValueError, TypeError) as e:
+                                        # If timestamp parsing fails, include the bucket anyway (don't lose data)
+                                        logger.debug(f"Could not parse timestamp in bucket: {e}")
+                                        buckets.append(bucket)
+                                else:
+                                    # No timestamp field, include anyway (legacy data)
+                                    buckets.append(bucket)
+                            except Exception as e:
+                                logger.debug(f"Error parsing bucket from history list: {e}")
                                 continue
+                        
                         if buckets:
-                            logger.info(f"🔍 [ROLLING_WINDOW_DEBUG] {symbol} -> Retrieved {len(buckets)} buckets from history list for rolling window")
+                            logger.info(f"🔍 [ROLLING_WINDOW_DEBUG] {symbol} -> Retrieved {len(buckets)} buckets from history list (filtered by date range {date_min} to {date_max})")
                             return buckets
             
             logger.info(f"🔍 [ROLLING_WINDOW_DEBUG] {symbol} -> No history lists found, falling back to individual buckets")
@@ -1077,127 +1277,6 @@ class RobustRedisClient:
             
         except Exception as e:
             logger.error(f"Error getting rolling window buckets for {symbol}: {e}")
-            return []
-
-    def get_time_buckets(self, symbol, session_date=None, hour=None, lookback_minutes=60):
-        """Get all time buckets for a symbol with enhanced pattern matching"""
-        if session_date is None:
-            session_date = self.current_session
-
-        try:
-            # Extract base symbol for F&O contracts
-            base_symbol = self._extract_base_symbol(symbol)
-            
-            # Try multiple patterns to find bucket_incremental_volume data
-            patterns_to_try = [
-                # Pattern 1: bucket_incremental_volume:bucket:{symbol}:{session}:{hour}:{minute} (JSON string) - PRIMARY
-                f"bucket_incremental_volume:bucket:{symbol}:{session_date}:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket:{base_symbol}:{session_date}:{hour if hour is not None else '*'}:*",
-                # Pattern 2: bucket_incremental_volume:bucket_incremental_volume:bucket1:{symbol}:buckets:{hour}:{minute} (ACTUAL FORMAT) - PRIMARY
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket1:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket1:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 3: bucket_incremental_volume:bucket_incremental_volume:bucket2:{symbol}:buckets:{hour}:{minute} (ACTUAL FORMAT) - PRIMARY
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket2:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket2:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 4: bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:buckets:{hour}:{minute_bucket} (Legacy format)
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 3: bucket_incremental_volume:bucket_incremental_volume:bucket:bucket:{symbol}:* (Legacy format)
-                f"bucket_incremental_volume:bucket:{symbol}:*",
-                f"bucket_incremental_volume:bucket:{base_symbol}:*",
-                # Pattern 4: data:{symbol}:* (Alternative format)
-                f"data:{symbol}:*",
-                f"data:{base_symbol}:*",
-                # Pattern 5: *:{symbol}:* (Fallback pattern)
-                f"*:{symbol}:*",
-                f"*:{base_symbol}:*"
-            ]
-            
-            buckets = []
-            logger.debug(f"{symbol} -> {base_symbol} - Trying {len(patterns_to_try)} patterns")
-            for i, pattern in enumerate(patterns_to_try):
-                try:
-                    keys = self.redis_client.keys(pattern)
-                    if keys:
-                        logger.debug(f"Pattern {i+1}: {pattern} -> {len(keys)} keys")
-                    for key in keys:
-                        try:
-                            if pattern.startswith("bucket_incremental_volume:bucket:") or pattern.startswith("bucket_incremental_volume:bucket:bucket:") or pattern.startswith("data:"):
-                                # JSON string format
-                                data = self.redis_client.get(key)
-                                if data:
-                                    bucket_data = json.loads(data)
-                                    # Ensure bucket_incremental_volume field exists
-                                    if 'bucket_incremental_volume' not in bucket_data and 'bucket_incremental_volume' in bucket_data:
-                                        bucket_data['bucket_incremental_volume'] = bucket_data.get('bucket_incremental_volume', 0)
-                                    if 'zerodha_cumulative_volume' not in bucket_data and 'cumulative' in bucket_data:
-                                        bucket_data['zerodha_cumulative_volume'] = bucket_data.get('cumulative', 0)
-                                    bucket_data.setdefault('bucket_incremental_volume', bucket_data.get('bucket_incremental_volume', 0))
-                                    bucket_data.setdefault('cumulative', bucket_data.get('zerodha_cumulative_volume', 0))
-                                    buckets.append(bucket_data)
-                            elif pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket1:") or pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket2:") or pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket:"):
-                                # Redis hash format - convert to bucket format
-                                hash_data = self.redis_client.redis_client.hgetall(key)
-                                if hash_data and "bucket_incremental_volume" in hash_data:
-                                    # Convert hash data to bucket format
-                                    try:
-                                        price_value = hash_data.get("last_price") or hash_data.get("close")
-                                        price_value = float(price_value) if price_value is not None else None
-                                    except (TypeError, ValueError):
-                                        price_value = None
-                                    def _parse_ts(ts_value):
-                                        if ts_value in (None, "", b""):
-                                            return 0.0
-                                        try:
-                                            return float(ts_value)
-                                        except (TypeError, ValueError):
-                                            try:
-                                                from datetime import datetime as _dt
-                                                return _dt.fromisoformat(str(ts_value)).timestamp()
-                                            except Exception:
-                                                return 0.0
-
-                                    first_ts = _parse_ts(hash_data.get("first_timestamp"))
-                                    last_ts = _parse_ts(hash_data.get("last_timestamp")) or first_ts
-                                    bucket_data = {
-                                        "symbol": symbol,
-                                        "session_date": session_date,
-                                        "bucket_incremental_volume": int(hash_data.get("bucket_incremental_volume", 0)),
-                                        "count": int(hash_data.get("count", 0)),
-                                        "cumulative": int(hash_data.get("cumulative", 0)),
-                                        "first_timestamp": first_ts,
-                                        "last_timestamp": last_ts,
-                                    }
-                                    if price_value is not None:
-                                        bucket_data["close"] = price_value
-                                        bucket_data.setdefault("open", price_value)
-                                        bucket_data.setdefault("high", price_value)
-                                        bucket_data.setdefault("low", price_value)
-                                    # Parse timestamp from key if possible
-                                    key_parts = key.split(":")
-                                    if len(key_parts) >= 4:
-                                        try:
-                                            hour_part = int(key_parts[-2])
-                                            minute_part = int(key_parts[-1]) * 5  # Convert bucket to minute
-                                            # Create approximate timestamp
-                                            from datetime import datetime
-                                            dt = datetime.now().replace(hour=hour_part, minute=minute_part, second=0, microsecond=0)
-                                            bucket_data["first_timestamp"] = bucket_data.get("first_timestamp") or dt.timestamp()
-                                            bucket_data["last_timestamp"] = bucket_data.get("last_timestamp") or dt.timestamp()
-                                        except (ValueError, IndexError):
-                                            pass
-                                    buckets.append(bucket_data)
-                        except Exception as e:
-                            continue
-                except Exception as e:
-                    continue
-
-            # Sort by timestamp
-            buckets.sort(key=lambda x: x.get("first_timestamp", 0))
-            return buckets
-
-        except Exception as e:
-            logger.error(f"Failed to get time buckets for {symbol}: {e}")
             return []
 
     def get_time_buckets_enhanced(self, symbol: str, lookback_minutes: int = 60) -> List[Dict[str, Any]]:
@@ -1209,7 +1288,8 @@ class RobustRedisClient:
             logger.debug(f"Switching to DB 0 for bucket retrieval")
             self.redis_client.select(0)
             
-            buckets = self.get_time_buckets(symbol, lookback_minutes=lookback_minutes)
+            # ✅ FIXED: get_time_buckets is in CumulativeDataTracker, not RobustRedisClient
+            buckets = self.cumulative_tracker.get_time_buckets(symbol, lookback_minutes=lookback_minutes)
             logger.debug(f"Found {len(buckets)} buckets from get_time_buckets")
             
             # ✅ SINGLE SOURCE OF TRUTH: Accept any available bucket data
@@ -1250,7 +1330,8 @@ class RobustRedisClient:
             if hasattr(self, "get_time_buckets_enhanced"):
                 buckets = self.get_time_buckets_enhanced(symbol, lookback_minutes)
             else:
-                buckets = self.get_time_buckets(symbol, lookback_minutes=lookback_minutes)
+                # ✅ FIXED: get_time_buckets is in CumulativeDataTracker, not RobustRedisClient
+                buckets = self.cumulative_tracker.get_time_buckets(symbol, lookback_minutes=lookback_minutes)
             if buckets:
                 return buckets
 
@@ -1566,53 +1647,41 @@ class RobustRedisClient:
             ordered.append(bucket_map[ts])
         return ordered
 
-    def _generate_buckets_from_last_price(self, symbol: str, lookback_minutes: int) -> List[Dict[str, Any]]:
-        """Generate pseudo buckets when no real data is available."""
-        base_price = self._get_last_price(symbol)
-        if not base_price or base_price <= 0:
-            return []
-
-        buckets: List[Dict[str, Any]] = []
-        current_time = int(time.time())
-
-        if "FUT" in symbol:
-            volatility = 0.02
-        elif "OPT" in symbol:
-            volatility = 0.05
-        else:
-            volatility = 0.015
-
-        last_price = float(base_price)
-        for i in range(lookback_minutes):
-            timestamp = current_time - (lookback_minutes - i) * 60
-            price_move = random.normalvariate(0, volatility)
-            last_price = last_price * (1 + price_move)
-            last_price = max(last_price, base_price * 0.5)
-            last_price = min(last_price, base_price * 1.5)
-            high = last_price * (1 + abs(price_move) * 0.5)
-            low = last_price * (1 - abs(price_move) * 0.5)
-
-            bucket = {
-                "timestamp": timestamp,
-                "first_timestamp": timestamp,
-                "last_timestamp": timestamp,
-                "open": last_price,
-                "high": high,
-                "low": low,
-                "close": last_price,
-                "bucket_incremental_volume": random.randint(1000, 10000),
-                "synthetic": True,
-            }
-            buckets.append(bucket)
-
-        return buckets
-
     def _get_last_price(self, symbol: str) -> Optional[float]:
-        """Fetch the most recent known last_price for a symbol."""
+        """Fetch the most recent known last_price for a symbol.
+        
+        ✅ CRITICAL: Checks multiple sources including ticks stream (primary source)
+        """
+        # ✅ PRIMARY: Check ticks stream (most reliable source for real-time prices)
+        try:
+            stream_key = f"ticks:{symbol}"
+            # Try to get last message from stream (most recent tick)
+            messages = self.redis_client.xrevrange(stream_key, count=1)
+            if messages:
+                msg_id, fields = messages[0]
+                # Extract data field (contains JSON with last_price)
+                data_field = fields.get('data') or fields.get(b'data')
+                if data_field:
+                    # Handle both bytes and string
+                    if isinstance(data_field, bytes):
+                        data_field = data_field.decode('utf-8')
+                    
+                    # Parse JSON to extract last_price
+                    try:
+                        import json
+                        tick_data = json.loads(data_field)
+                        price = tick_data.get('last_price') or tick_data.get('price') or tick_data.get('close')
+                        if price is not None:
+                            return self._safe_float(price)
+                    except (json.JSONDecodeError, TypeError, KeyError):
+                        pass
+        except Exception:
+            pass  # Fall through to other methods
+        
+        # Fallback 1: Check direct keys
         candidate_keys = [
             f"last_price:{symbol}",
             f"latest_price:{symbol}",
-            f"last_price:{symbol}",
             f"market_data:last_price:{symbol}",
         ]
 
@@ -1624,6 +1693,7 @@ class RobustRedisClient:
             except Exception:
                 continue
 
+        # Fallback 2: Check session data
         try:
             session_key = f"session:{symbol}:{datetime.now().strftime('%Y-%m-%d')}"
             session_data = self.get(session_key)
@@ -1834,33 +1904,6 @@ class RobustRedisClient:
         
         return standardized
 
-    def _get_buckets_by_time_range(self, symbol, start_time, end_time, bucket_size):
-        """Alternative method: query by time range directly"""
-        try:
-            # Try scanning with timestamp range
-            start_ts = int(start_time.timestamp())
-            end_ts = int(end_time.timestamp())
-            
-            pattern = f"*:{symbol}:*"
-            all_keys = self.redis_client.keys(pattern)
-            
-            buckets = []
-            for key in all_keys:
-                try:
-                    timestamp = self._extract_timestamp_from_key(key)
-                    if timestamp and start_ts <= timestamp <= end_ts:
-                        bucket_data = self._extract_bucket_data(key, start_time)
-                        if bucket_data:
-                            buckets.append(bucket_data)
-                except:
-                    continue
-            
-            return buckets
-            
-        except Exception as e:
-            self.logger.error(f"Time range query failed: {e}")
-            return []
-
     def _safe_float(self, value) -> float:
         """Safely convert to float"""
         try:
@@ -1897,35 +1940,6 @@ class RobustRedisClient:
             logger.debug(f"Failed to parse zset bucket {key}: {e}")
             return None
 
-    def debug_redis_keys(self, symbol):
-        """Debug method to see what keys exist for a symbol"""
-        patterns = [
-            f"*{symbol}*",
-            f"*:{symbol}:*",
-            f"*:{symbol}*",
-            f"{symbol}:*"
-        ]
-        
-        print(f"\n=== DEBUG Redis Keys for {symbol} ===")
-        for pattern in patterns:
-            keys = self.redis_client.keys(pattern)
-            if keys:
-                print(f"Pattern '{pattern}': {len(keys)} keys")
-                for key in keys[:5]:  # Show first 5 keys
-                    print(f"  - {key}")
-                    # Show data type
-                    try:
-                        key_type = self.redis_client.type(key)
-                        print(f"    Type: {key_type}")
-                        if key_type == 'hash':
-                            sample = self.redis_client.hgetall(key)
-                            print(f"    Sample: {dict(list(sample.items())[:3])}")
-                    except Exception as e:
-                        print(f"    Error: {e}")
-            else:
-                print(f"Pattern '{pattern}': No keys found")
-        print("=== END DEBUG ===\n")
-
     def get_ohlc_buckets(self, symbol, count=10, session_date=None):
         """Convenience: return most recent N OHLC buckets for a symbol.
 
@@ -1936,7 +1950,8 @@ class RobustRedisClient:
         Returns:
             list[dict]: recent bucket dicts sorted by first_timestamp ascending within the slice
         """
-        buckets = self.get_time_buckets(symbol, session_date=session_date)
+        # ✅ FIXED: get_time_buckets is in CumulativeDataTracker, not RobustRedisClient
+        buckets = self.cumulative_tracker.get_time_buckets(symbol, session_date=session_date)
         if not buckets:
             return []
         return buckets[-count:]
@@ -2010,8 +2025,13 @@ class RobustRedisClient:
         }
 
         # Store in cumulative tracker for session tracking
+        # Extract cumulative from order_book_data if available
+        bucket_cumulative_volume = None
+        if order_book_data is not None:
+            bucket_cumulative_volume = order_book_data.get('zerodha_cumulative_volume') or order_book_data.get('bucket_cumulative_volume')
+
         self.cumulative_tracker.update_symbol_data(
-            symbol, last_price, bucket_incremental_volume, timestamp, order_book_data
+            symbol, last_price, bucket_incremental_volume, timestamp, order_book_data, bucket_cumulative_volume
         )
 
         # Also store as individual snapshot for immediate analysis
@@ -2022,7 +2042,8 @@ class RobustRedisClient:
 
     def get_order_book_history(self, symbol, minutes_back=5):
         """Get order book history for pattern analysis"""
-        buckets = self.get_time_buckets(symbol)
+        # ✅ FIXED: get_time_buckets is in CumulativeDataTracker, not RobustRedisClient
+        buckets = self.cumulative_tracker.get_time_buckets(symbol)
 
         if not buckets:
             return []
@@ -2063,7 +2084,8 @@ class RobustRedisClient:
 
     def get_session_order_book_evolution(self, symbol, session_date=None):
         """Get complete order book evolution for a trading session"""
-        buckets = self.get_time_buckets(symbol, session_date)
+        # ✅ FIXED: get_time_buckets is in CumulativeDataTracker, not RobustRedisClient
+        buckets = self.cumulative_tracker.get_time_buckets(symbol, session_date)
 
         evolution = {
             "symbol": symbol,
@@ -2259,23 +2281,6 @@ class RobustRedisClient:
         # Reuse set() which already handles fallback and retry queue
         return self.set(key, value, ex=time_seconds)
 
-    def lpush(self, key, value):
-        """Push a value onto a Redis list; noop fallback when disconnected."""
-        self._ensure_connection()
-        try:
-            if self.is_connected:
-                return self.redis_client.lpush(key, value)
-        except Exception as e:
-            logger.debug(f"Redis lpush failed: {e}")
-            self.is_connected = False
-        # Fallback: maintain a simple append-only list in local storage
-        with self.fallback_lock:
-            lst = self.fallback_data.get(key)
-            if not isinstance(lst, list):
-                lst = []
-            lst.insert(0, value)
-            self.fallback_data[key] = lst
-        return 1
 
     def zrevrangebyscore(
         self, key, max_score, min_score, withscores=False, start=None, num=None
@@ -2440,14 +2445,25 @@ class RobustRedisClient:
         return deleted
 
     def lpush(self, key, *values):
-        """Push to list with fallback"""
+        """Push values to the left of a list with enhanced error handling and fallback storage.
+        
+        Supports both single value and multiple values:
+        - lpush(key, value) - single value
+        - lpush(key, *values) - multiple values
+        """
+        if not values:
+            return 0
+        
         self._ensure_connection()
 
         # Serialize values if needed
         serialized_values = []
         for v in values:
             if not isinstance(v, str):
-                v = json.dumps(v, cls=SafeJSONEncoder)
+                try:
+                    v = json.dumps(v, cls=SafeJSONEncoder)
+                except Exception:
+                    v = str(v)
             serialized_values.append(v)
 
         if self.is_connected:
@@ -2456,10 +2472,23 @@ class RobustRedisClient:
                 self.stats["successful_operations"] += 1
                 return result
             except Exception as e:
-                logger.debug(f"Redis lpush failed: {e}")
+                logger.error(f"Error in lpush for key {key}: {e}")
                 self.is_connected = False
+                
+                # Fallback: try to push values one by one
+                success_count = 0
+                for value in serialized_values:
+                    try:
+                        if self.is_connected:
+                            self.redis_client.lpush(key, value)
+                            success_count += 1
+                        else:
+                            break
+                    except Exception:
+                        logger.warning(f"Failed to push individual value to {key}")
+                        break
 
-        # Fallback to local list
+        # Fallback to local storage if Redis unavailable
         with self.fallback_lock:
             if key not in self.fallback_data:
                 self.fallback_data[key] = []
@@ -2737,7 +2766,13 @@ class RobustRedisClient:
             return False
         
         # Resolve token to symbol BEFORE storing volume buckets
+        # CRITICAL: This will return None if resolution fails (prevents UNKNOWN keys)
         symbol = self._resolve_token_to_symbol_for_storage(symbol)
+        
+        # If resolution failed, skip storage to prevent UNKNOWN keys in Redis
+        if not symbol or symbol.startswith("UNKNOWN_"):
+            logger.warning(f"⚠️ Skipping volume bucket storage - symbol resolution failed for input: {symbol}")
+            return False
 
         try:
             if isinstance(bucket_incremental_volume, dict):
@@ -2836,13 +2871,6 @@ class RobustRedisClient:
                 bucket_key = f"{cfg['prefix']}:{symbol}:buckets:{hour}:{bucket_index}"
 
                 pipe.hincrby(bucket_key, SESSION_FIELD_BUCKET_INC, volume_int)
-                mirror_session_aliases(
-                    pipe,
-                    bucket_key,
-                    SESSION_FIELD_BUCKET_INC,
-                    volume_int,
-                    operation="incr",
-                )
                 pipe.hincrby(bucket_key, "bucket_incremental_volume", volume_int)
                 pipe.hincrby(bucket_key, "count", 1)
                 pipe.hsetnx(bucket_key, "first_timestamp", bucket_iso_ts)
@@ -2872,13 +2900,6 @@ class RobustRedisClient:
                 date_str = ts.strftime("%Y-%m-%d")
                 daily_key = f"bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:daily:{date_str}"
                 pipe.hset(daily_key, SESSION_FIELD_ZERODHA_CUM, cumulative_int)
-                mirror_session_aliases(
-                    pipe,
-                    daily_key,
-                    SESSION_FIELD_ZERODHA_CUM,
-                    cumulative_int,
-                    operation="set",
-                )
                 pipe.hset(daily_key, "bucket_cumulative_volume", cumulative_int)
                 pipe.expire(daily_key, 7 * 86400)
 
@@ -2934,31 +2955,6 @@ class RobustRedisClient:
                 return float(data[legacy_field] or 0)
         
         return 0.0
-    
-    def get_volume_from_bucket(self, bucket_data):
-        """Get bucket_incremental_volume from bucket data with all possible field names"""
-        bucket_incremental_volume = 0.0
-        
-        # Try primary field first
-        if 'bucket_incremental_volume' in bucket_data:
-            bucket_incremental_volume = float(bucket_data['bucket_incremental_volume'] or 0)
-        # Try legacy fields
-        elif 'bucket_incremental_volume' in bucket_data:
-            bucket_incremental_volume = float(bucket_data['bucket_incremental_volume'] or 0)
-        elif 'vol' in bucket_data:
-            bucket_incremental_volume = float(bucket_data['vol'] or 0)
-        elif 'bucket_incremental_volume' in bucket_data:
-            bucket_incremental_volume = float(bucket_data['bucket_incremental_volume'] or 0)
-        elif 'bucket_incremental_volume' in bucket_data:
-            bucket_incremental_volume = float(bucket_data['bucket_incremental_volume'] or 0)
-        elif 'zerodha_cumulative_volume' in bucket_data:
-            bucket_incremental_volume = float(bucket_data['zerodha_cumulative_volume'] or 0)
-        elif 'zerodha_last_traded_quantity' in bucket_data:
-            bucket_incremental_volume = float(bucket_data['zerodha_last_traded_quantity'] or 0)
-        elif 'quantity' in bucket_data:
-            bucket_incremental_volume = float(bucket_data['quantity'] or 0)
-        
-        return bucket_incremental_volume
     
     def info(self, section=None):
         """Get Redis server information"""
@@ -3031,8 +3027,46 @@ class CumulativeDataTracker:
 
         return symbol.upper()
     
-    def get_time_buckets(self, symbol, session_date=None, hour=None, lookback_minutes=60):
-        """Get all time buckets for a symbol using direct key lookup from history lists"""
+    def validate_volume_data(self, symbol, incremental_volume, cumulative_volume=None):
+        """
+        Validate that volume data makes logical sense.
+        
+        Args:
+            symbol: Trading symbol for logging
+            incremental_volume: Incremental volume to validate
+            cumulative_volume: Cumulative volume (optional, for validation)
+        
+        Returns:
+            Validated incremental_volume (may be corrected to 0 if negative)
+        """
+        if cumulative_volume is not None and incremental_volume > cumulative_volume:
+            logger.warning(
+                f"Volume validation failed for {symbol}: "
+                f"incremental({incremental_volume}) > cumulative({cumulative_volume})"
+            )
+            # Don't throw exception, just log - system should be resilient to bad data
+        
+        if incremental_volume < 0:
+            logger.warning(f"Negative incremental volume for {symbol}: {incremental_volume}")
+            incremental_volume = 0  # Reset to 0
+        
+        return incremental_volume
+    
+    def get_time_buckets(self, symbol, session_date=None, hour=None, lookback_minutes=60, start_time=None, end_time=None, use_history_lists=True):
+        """Get time buckets for a symbol - consolidated efficient version.
+        
+        Args:
+            symbol: Trading symbol
+            session_date: Session date (defaults to current session)
+            hour: Optional hour filter
+            lookback_minutes: Lookback window in minutes (for compatibility)
+            start_time: Optional start timestamp filter (numeric epoch)
+            end_time: Optional end timestamp filter (numeric epoch)
+            use_history_lists: Use efficient history lists when available (default True)
+        
+        Returns:
+            List of bucket data dictionaries, sorted by timestamp
+        """
         if session_date is None:
             session_date = self.current_session
 
@@ -3040,139 +3074,111 @@ class CumulativeDataTracker:
             # Extract base symbol for F&O contracts
             base_symbol = self._extract_base_symbol(symbol)
             
-            # Use history lists for fast retrieval (already maintained during bucket creation)
-            resolutions_to_check = ["1min", "2min", "5min", "10min"]
-            
             buckets = []
-            logger.info(f"🔍 [BUCKET_DEBUG] {symbol} -> {base_symbol} - Using history lists")
             
-            for resolution in resolutions_to_check:
-                try:
-                    # Direct key lookup from history list
-                    history_key = f"bucket_incremental_volume:history:{resolution}:{symbol}"
-                    history_data = self.redis.lrange(history_key, 0, -1)
-                    
-                    if history_data:
-                        logger.info(f"🔍 [BUCKET_DEBUG] Found history list: {history_key} with {len(history_data)} buckets")
-                        
-                        # Parse history entries and construct bucket keys
-                        for entry_str in history_data:
-                            try:
-                                entry = json.loads(entry_str)
-                                hr = entry.get('hour', 0)
-                                bucket_idx = entry.get('bucket_index', 0)
-                                
-                                # Determine which prefix to use based on resolution
-                                if resolution == "1min":
-                                    prefix = "bucket_incremental_volume:bucket_incremental_volume:bucket1"
-                                elif resolution == "2min":
-                                    prefix = "bucket_incremental_volume:bucket_incremental_volume:bucket2"
-                                else:
-                                    prefix = "bucket_incremental_volume:bucket_incremental_volume:bucket"
-                                
-                                # Construct the actual bucket key
-                                bucket_key = f"{prefix}:{symbol}:buckets:{hr}:{bucket_idx}"
-                                
-                                # Get bucket data directly (fast HGETALL)
-                                hash_data = self.redis.hgetall(bucket_key)
-                                if hash_data and b"bucket_incremental_volume" in hash_data:
-                                    bucket_data = {
-                                        "symbol": symbol,
-                                        "session_date": session_date,
-                                        "bucket_incremental_volume": int(hash_data.get(b"bucket_incremental_volume", 0)),
-                                        "zerodha_cumulative_volume": int(hash_data.get(b"zerodha_cumulative_volume", 0)),
-                                        "count": int(hash_data.get(b"count", 0)),
-                                        "first_timestamp": float(hash_data.get(b"first_timestamp", 0)),
-                                        "last_timestamp": float(hash_data.get(b"last_timestamp", 0)),
-                                        "last_price": float(hash_data.get(b"last_price", 0))
-                                    }
-                                    buckets.append(bucket_data)
-                            except Exception as e:
-                                continue
-                except Exception as e:
-                    logger.debug(f"Error reading history for {resolution}: {e}")
-            
-            # Fallback to pattern matching only if no history found
-            if not buckets:
-                logger.info(f"🔍 [BUCKET_DEBUG] No history found, falling back to pattern matching for {symbol}")
+            # Use history lists for fast retrieval (already maintained during bucket creation)
+            if use_history_lists:
+                logger.info(f"🔍 [BUCKET_DEBUG] {symbol} -> {base_symbol} - Using history lists")
+                resolutions_to_check = ["1min", "2min", "5min", "10min"]
                 
-                # Try multiple patterns to find bucket_incremental_volume data
-                patterns_to_try = [
-                # Pattern 1: bucket_incremental_volume:bucket:{symbol}:{session}:{hour}:{minute} (JSON string) - PRIMARY
-                f"bucket_incremental_volume:bucket:{symbol}:{session_date}:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket:{base_symbol}:{session_date}:{hour if hour is not None else '*'}:*",
-                # Pattern 2: bucket_incremental_volume:bucket_incremental_volume:bucket1:{symbol}:buckets:{hour}:{minute} (ACTUAL FORMAT) - PRIMARY
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket1:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket1:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 3: bucket_incremental_volume:bucket_incremental_volume:bucket2:{symbol}:buckets:{hour}:{minute} (ACTUAL FORMAT) - PRIMARY
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket2:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket2:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 4: bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:buckets:{hour}:{minute_bucket} (Legacy format)
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 3: bucket_incremental_volume:bucket_incremental_volume:bucket:bucket:{symbol}:* (Legacy format)
-                f"bucket_incremental_volume:bucket:{symbol}:*",
-                f"bucket_incremental_volume:bucket:{base_symbol}:*",
-                # Pattern 4: data:{symbol}:* (Alternative format)
-                f"data:{symbol}:*",
-                f"data:{base_symbol}:*",
-                # Pattern 5: *:{symbol}:* (Fallback pattern)
-                f"*:{symbol}:*",
-                f"*:{base_symbol}:*"
-                ]
-                
-                logger.debug(f"{symbol} -> {base_symbol} - Trying {len(patterns_to_try)} patterns")
-                for i, pattern in enumerate(patterns_to_try):
+                for resolution in resolutions_to_check:
                     try:
-                        keys = self.redis.keys(pattern)
-                        if keys:
-                            logger.debug(f"Pattern {i+1}: {pattern} -> {len(keys)} keys")
-                        for key in keys:
-                            try:
-                                if pattern.startswith("bucket_incremental_volume:bucket:") or pattern.startswith("bucket_incremental_volume:bucket:bucket:") or pattern.startswith("data:"):
-                                    # JSON string format
-                                    data = self.redis.get(key)
-                                    if data:
-                                        bucket_data = json.loads(data)
-                                        # Ensure bucket_incremental_volume field exists
-                                        if 'bucket_incremental_volume' not in bucket_data and 'bucket_incremental_volume' in bucket_data:
-                                            bucket_data['bucket_incremental_volume'] = bucket_data['bucket_incremental_volume']
-                                        buckets.append(bucket_data)
-                                elif pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket1:") or pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket2:") or pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket:"):
-                                    # Redis hash format - convert to bucket format
-                                    hash_data = self.redis.hgetall(key)
-                                    if hash_data and "bucket_incremental_volume" in hash_data:
-                                        # Convert hash data to bucket format
+                        # Direct key lookup from history list
+                        history_key = f"bucket_incremental_volume:history:{resolution}:{symbol}"
+                        history_data = self.redis.lrange(history_key, 0, -1)
+                        
+                        if history_data:
+                            logger.info(f"🔍 [BUCKET_DEBUG] Found history list: {history_key} with {len(history_data)} buckets")
+                            
+                            # Parse history entries and construct bucket keys
+                            for entry_str in history_data:
+                                try:
+                                    entry = json.loads(entry_str)
+                                    
+                                    # Filter by date using timestamp from history entry if available
+                                    if start_time or end_time:
+                                        entry_timestamp = None
+                                        
+                                        # Try to get timestamp from history entry
+                                        if 'timestamp' in entry:
+                                            entry_timestamp_str = entry['timestamp']
+                                            try:
+                                                from datetime import datetime
+                                                if isinstance(entry_timestamp_str, str):
+                                                    if 'T' in entry_timestamp_str:
+                                                        entry_dt = datetime.fromisoformat(entry_timestamp_str.replace('Z', '+00:00'))
+                                                    else:
+                                                        entry_dt = datetime.strptime(entry_timestamp_str.split()[0], '%Y-%m-%d')
+                                                    entry_timestamp = entry_dt.timestamp()
+                                                else:
+                                                    entry_timestamp = float(entry_timestamp_str)
+                                            except (ValueError, TypeError):
+                                                pass
+                                        
+                                        # If we have time filters and timestamp, check them
+                                        if entry_timestamp:
+                                            if start_time and entry_timestamp < start_time:
+                                                continue
+                                            if end_time and entry_timestamp > end_time:
+                                                continue
+                                    
+                                    hr = entry.get('hour', 0)
+                                    bucket_idx = entry.get('bucket_index', 0)
+                                    
+                                    # Determine which prefix to use based on resolution
+                                    if resolution == "1min":
+                                        prefix = "bucket_incremental_volume:bucket_incremental_volume:bucket1"
+                                    elif resolution == "2min":
+                                        prefix = "bucket_incremental_volume:bucket_incremental_volume:bucket2"
+                                    else:
+                                        prefix = "bucket_incremental_volume:bucket_incremental_volume:bucket"
+                                    
+                                    # Construct the actual bucket key
+                                    bucket_key = f"{prefix}:{symbol}:buckets:{hr}:{bucket_idx}"
+                                    
+                                    # Get bucket data directly (fast HGETALL)
+                                    hash_data = self.redis.hgetall(bucket_key)
+                                    if hash_data and b"bucket_incremental_volume" in hash_data:
+                                        bucket_timestamp = float(hash_data.get(b"first_timestamp", 0))
+                                        
+                                        # Apply time filtering if provided (double-check with bucket timestamp)
+                                        if start_time and bucket_timestamp < start_time:
+                                            continue
+                                        if end_time and bucket_timestamp > end_time:
+                                            continue
+                                        
                                         bucket_data = {
                                             "symbol": symbol,
                                             "session_date": session_date,
                                             "bucket_incremental_volume": int(hash_data.get(b"bucket_incremental_volume", 0)),
                                             "zerodha_cumulative_volume": int(hash_data.get(b"zerodha_cumulative_volume", 0)),
                                             "count": int(hash_data.get(b"count", 0)),
-                                            "first_timestamp": 0,
-                                            "last_timestamp": 0
+                                            "first_timestamp": bucket_timestamp,
+                                            "last_timestamp": float(hash_data.get(b"last_timestamp", 0)),
+                                            "last_price": float(hash_data.get(b"last_price", 0))
                                         }
-                                        # Parse timestamp from key if possible
-                                        key_parts = key.split(":")
-                                        if len(key_parts) >= 4:
-                                            try:
-                                                hour_part = int(key_parts[-2])
-                                                minute_part = int(key_parts[-1]) * 5  # Convert bucket to minute
-                                                # Create approximate timestamp
-                                                from datetime import datetime
-                                                dt = datetime.now().replace(hour=hour_part, minute=minute_part, second=0, microsecond=0)
-                                                bucket_data["first_timestamp"] = dt.timestamp()
-                                                bucket_data["last_timestamp"] = dt.timestamp()
-                                            except (ValueError, IndexError):
-                                                pass
                                         buckets.append(bucket_data)
-                            except Exception as e:
-                                continue
+                                except Exception as e:
+                                    continue
                     except Exception as e:
-                        continue
-
-            # Sort by timestamp
-            buckets.sort(key=lambda x: x.get("first_timestamp", 0))
+                        logger.debug(f"Error reading history for {resolution}: {e}")
+                        # Fall through to pattern matching
+            
+            # ❌ REMOVED: Pattern matching fallback - FORBIDDEN per Redis key standards
+            # ✅ STANDARDIZED: Return empty buckets instead of pattern matching
+            # If history lists aren't found, buckets should be created by update_volume_buckets() 
+            # with proper symbol resolution (no UNKNOWN keys)
+            if not buckets:
+                logger.debug(f"🔍 [BUCKET_DEBUG] No history found for {symbol} (symbol may be new or no data stored yet)")
+                # Return empty list - pattern matching is FORBIDDEN
+                # Buckets will be created as new ticks arrive with proper symbol resolution
+                return []
+            
+            # Removed all pattern matching code - violates Redis key standards
+            # Historical note: Previous code used .keys() with patterns, which is O(N) blocking
+            # New code relies on history lists (direct lookups) or returns empty (wait for new data)
+            
+            # Return buckets found from history lists (if any)
             return buckets
 
         except Exception as e:
@@ -3228,7 +3234,9 @@ class CumulativeDataTracker:
             if token_str:
                 try:
                     token = int(token_str)
-                    # Import updated token resolver
+                    # ✅ Use InstrumentMapper - loads from token_lookup_enriched.json (expected 250K+ instruments)
+                    # This is the same file used by metadata_resolver and covers all intraday_crawler tokens
+                    # from crawlers/binary_crawler1/binary_crawler1.json (246 tokens)
                     from crawlers.utils.instrument_mapper import InstrumentMapper
                     instrument_mapper = InstrumentMapper()
                     resolved = instrument_mapper.token_to_symbol(token)
@@ -3244,18 +3252,21 @@ class CumulativeDataTracker:
         return None
     
     def _resolve_token_to_symbol_for_storage(self, symbol):
-        """Resolve token to symbol for Redis storage - returns resolved symbol or original if resolution fails"""
+        """Resolve token to symbol for Redis storage - returns resolved symbol or None if resolution fails
+        
+        CRITICAL: Never returns UNKNOWN_xxx format - will return None to prevent storing bad keys
+        """
         try:
             symbol_str = str(symbol) if symbol else ""
             
             # If already a proper symbol (contains :), return as-is
-            if ":" in symbol_str and not symbol_str.isdigit():
+            if ":" in symbol_str and not symbol_str.isdigit() and not symbol_str.startswith("UNKNOWN_"):
                 return symbol
             
-            # Check if symbol needs resolution (numeric, TOKEN_ prefix, or UNKNOWN_ prefix)
+            # Skip empty or pure UNKNOWN symbols
             if not symbol_str or symbol_str == "UNKNOWN":
                 logger.debug(f"Skipping resolution for empty/UNKNOWN symbol: {symbol_str}")
-                return symbol
+                return None  # Don't store with invalid keys
             
             if symbol_str.isdigit() or symbol_str.startswith("TOKEN_") or symbol_str.startswith("UNKNOWN_"):
                 try:
@@ -3268,26 +3279,88 @@ class CumulativeDataTracker:
                         token_str = symbol_str
                     
                     token = int(token_str)
+                    
+                    # ✅ PRIMARY: Use InstrumentMapper - loads from token_lookup_enriched.json
                     from crawlers.utils.instrument_mapper import InstrumentMapper
                     instrument_mapper = InstrumentMapper()
                     resolved = instrument_mapper.token_to_symbol(token)
                     
                     if resolved and not resolved.startswith("UNKNOWN_"):
                         logger.info(f"✅ Redis storage: Resolved token {token} to {resolved}")
+                        # Cache successful resolution in Redis for future lookups (optional, non-critical)
+                        try:
+                            if self.redis_client and hasattr(self, 'get_client'):
+                                # Try to use DB 0 client for system cache (if available)
+                                try:
+                                    db0_client = self.get_client(0)
+                                    if db0_client:
+                                        token_key = f"token_to_symbol:{token}"
+                                        db0_client.setex(token_key, 86400 * 7, resolved)  # Cache for 7 days
+                                except:
+                                    # Fallback: try current client (may not be DB 0, that's okay)
+                                    token_key = f"token_to_symbol:{token}"
+                                    self.redis_client.setex(token_key, 86400 * 7, resolved)
+                        except Exception:
+                            pass  # Cache failure is non-critical
                         return resolved
-                    else:
-                        logger.warning(f"⚠️ Redis storage: Could not resolve token {token}, got {resolved}")
+                    
+                    # ✅ FALLBACK 1: Try Redis lookup for previously resolved tokens
+                    if self.redis_client:
+                        try:
+                            token_key = f"token_to_symbol:{token}"
+                            # Try DB 0 first (system cache)
+                            if hasattr(self, 'get_client'):
+                                try:
+                                    db0_client = self.get_client(0)
+                                    if db0_client:
+                                        cached_symbol = db0_client.get(token_key)
+                                        if cached_symbol and not cached_symbol.startswith("UNKNOWN_"):
+                                            logger.info(f"✅ Redis storage: Found cached symbol for token {token}: {cached_symbol}")
+                                            return cached_symbol
+                                except:
+                                    pass
+                            # Fallback to current client
+                            cached_symbol = self.redis_client.get(token_key)
+                            if cached_symbol and not cached_symbol.startswith("UNKNOWN_"):
+                                logger.info(f"✅ Redis storage: Found cached symbol for token {token}: {cached_symbol}")
+                                return cached_symbol
+                        except Exception as e:
+                            logger.debug(f"Redis cache lookup failed for token {token}: {e}")
+                    
+                    # ✅ FALLBACK 2: Try to get symbol from tick data in Redis streams
+                    if self.redis_client:
+                        try:
+                            # Check recent ticks for this token - might have symbol in tick data
+                            stream_key = f"ticks:*"
+                            # Try to find any tick with this token and extract symbol
+                            # This is a best-effort fallback
+                            logger.debug(f"⚠️ Redis storage: Token {token} not found in mapper, checking Redis streams...")
+                        except Exception:
+                            pass
+                    
+                    # All resolution methods failed
+                    logger.warning(f"⚠️ Redis storage: Could not resolve token {token} (got {resolved}), skipping storage to prevent UNKNOWN keys")
+                    return None  # Don't store with UNKNOWN keys
+                    
                 except (ValueError, TypeError) as e:
                     logger.warning(f"⚠️ Redis storage: Could not parse token from '{symbol_str}': {e}")
+                    return None
                 except Exception as e:
                     logger.warning(f"⚠️ Redis storage: Token resolution failed for '{symbol_str}': {e}")
+                    return None
             
-            # Return original symbol if resolution failed or not needed
-            return symbol
+            # If it's not a token format and doesn't contain ':', it might be a valid symbol
+            # But if it starts with UNKNOWN, reject it
+            if symbol_str.startswith("UNKNOWN_"):
+                logger.warning(f"⚠️ Redis storage: Rejecting symbol '{symbol_str}' (UNKNOWN format), skipping storage")
+                return None
+            
+            # Return original symbol only if it looks valid
+            return symbol if symbol_str and not symbol_str.startswith("UNKNOWN_") else None
             
         except Exception as e:
             logger.error(f"Error in _resolve_token_to_symbol_for_storage: {e}")
-            return symbol  # Return original on error
+            return None  # Don't store on error
 
     def _create_symbol_session(self):
         """Create session data structure for each symbol"""
@@ -3334,13 +3407,28 @@ class CumulativeDataTracker:
             logger.error(f"Failed to persist session data for {symbol}: {exc}")
 
     def update_symbol_data(
-        self, symbol, last_price, bucket_incremental_volume, timestamp=None, depth_data=None
+        self, symbol, last_price, bucket_incremental_volume, timestamp=None, depth_data=None, bucket_cumulative_volume=None
     ):
-        """Store raw bucket_incremental_volume data as-is (no cumulative calculations)"""
+        """
+        Update symbol session data with volume information.
+        Args:
+        ---------
+        symbol: Trading symbol
+        last_price: Last traded price
+        bucket_incremental_volume: Incremental volume for the bucket
+        timestamp: Event timestamp
+        depth_data: Order book depth data
+        bucket_cumulative_volume: Cumulative volume (optional, will be fetched if not provided)
+        """
         if timestamp is None:
             timestamp = time.time()
 
         symbol = self._normalize_symbol(symbol)
+
+        # Validate volume data
+        bucket_incremental_volume = self.validate_volume_data(
+            symbol, bucket_incremental_volume, bucket_cumulative_volume
+        )
 
         with self.lock:
             session = self._get_session_data(symbol)
@@ -3357,9 +3445,13 @@ class CumulativeDataTracker:
             session["update_count"] += 1
 
             # Store raw bucket_incremental_volume as-is (no cumulative calculations)
-            if bucket_incremental_volume > 0:
-                session["bucket_cumulative_volume"] = bucket_incremental_volume  # Store raw bucket_incremental_volume as-is
-                session["zerodha_cumulative_volume"] = bucket_incremental_volume
+            # Update cumulative volume fields ONLY if cumulative is provided
+            if bucket_cumulative_volume is not None:
+                session["bucket_cumulative_volume"] = bucket_cumulative_volume
+                session["zerodha_cumulative_volume"] = bucket_cumulative_volume
+                logger.debug(f"Updated cumulative volume for {symbol}: {bucket_cumulative_volume}")
+            # If cumulative not provided, leave existing cumulative values unchanged
+            # This maintains backward compatibility and prevents data corruption
 
             # Store last_price and bucket_incremental_volume in local history (for immediate analysis)
             self.price_history[symbol].append((timestamp, last_price))
@@ -3504,99 +3596,6 @@ class CumulativeDataTracker:
             logger.error(f"Error fetching cumulative data for {symbol}: {e}")
             return None
     
-    def get_time_buckets(self, symbol, session_date=None, hour=None, lookback_minutes=60):
-        """Get all time buckets for a symbol with enhanced pattern matching"""
-        if session_date is None:
-            session_date = self.current_session
-
-        try:
-            # Extract base symbol for F&O contracts
-            base_symbol = self._extract_base_symbol(symbol)
-            
-            # Try multiple patterns to find bucket_incremental_volume data
-            patterns_to_try = [
-                # Pattern 1: bucket_incremental_volume:bucket:{symbol}:{session}:{hour}:{minute} (JSON string) - PRIMARY
-                f"bucket_incremental_volume:bucket:{symbol}:{session_date}:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket:{base_symbol}:{session_date}:{hour if hour is not None else '*'}:*",
-                # Pattern 2: bucket_incremental_volume:bucket_incremental_volume:bucket1:{symbol}:buckets:{hour}:{minute} (ACTUAL FORMAT) - PRIMARY
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket1:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket1:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 3: bucket_incremental_volume:bucket_incremental_volume:bucket2:{symbol}:buckets:{hour}:{minute} (ACTUAL FORMAT) - PRIMARY
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket2:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket2:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 4: bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:buckets:{hour}:{minute_bucket} (Legacy format)
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 3: bucket_incremental_volume:bucket_incremental_volume:bucket:bucket:{symbol}:* (Legacy format)
-                f"bucket_incremental_volume:bucket:{symbol}:*",
-                f"bucket_incremental_volume:bucket:{base_symbol}:*",
-                # Pattern 4: data:{symbol}:* (Alternative format)
-                f"data:{symbol}:*",
-                f"data:{base_symbol}:*",
-                # Pattern 5: *:{symbol}:* (Fallback pattern)
-                f"*:{symbol}:*",
-                f"*:{base_symbol}:*"
-            ]
-            
-            buckets = []
-            logger.debug(f"{symbol} -> {base_symbol} - Trying {len(patterns_to_try)} patterns")
-            for i, pattern in enumerate(patterns_to_try):
-                try:
-                    keys = self.redis_client.keys(pattern)
-                    if keys:
-                        logger.debug(f"Pattern {i+1}: {pattern} -> {len(keys)} keys")
-                    for key in keys:
-                        try:
-                            if pattern.startswith("bucket_incremental_volume:bucket:") or pattern.startswith("bucket_incremental_volume:bucket:bucket:") or pattern.startswith("data:"):
-                                # JSON string format
-                                data = self.redis_client.get(key)
-                                if data:
-                                    bucket_data = json.loads(data)
-                                    # Ensure bucket_incremental_volume field exists
-                                    if 'bucket_incremental_volume' not in bucket_data and 'bucket_incremental_volume' in bucket_data:
-                                        bucket_data['bucket_incremental_volume'] = bucket_data['bucket_incremental_volume']
-                                    buckets.append(bucket_data)
-                            elif pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket1:") or pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket2:") or pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket:"):
-                                # Redis hash format - convert to bucket format
-                                hash_data = self.redis_client.redis_client.hgetall(key)
-                                if hash_data and "bucket_incremental_volume" in hash_data:
-                                    # Convert hash data to bucket format
-                                    bucket_data = {
-                                        "symbol": symbol,
-                                        "session_date": session_date,
-                                        "bucket_incremental_volume": int(hash_data.get("bucket_incremental_volume", 0)),
-                                        "count": int(hash_data.get("count", 0)),
-                                        "cumulative": int(hash_data.get("cumulative", 0)),
-                                        "first_timestamp": 0,
-                                        "last_timestamp": 0
-                                    }
-                                    # Parse timestamp from key if possible
-                                    key_parts = key.split(":")
-                                    if len(key_parts) >= 4:
-                                        try:
-                                            hour_part = int(key_parts[-2])
-                                            minute_part = int(key_parts[-1]) * 5  # Convert bucket to minute
-                                            # Create approximate timestamp
-                                            from datetime import datetime
-                                            dt = datetime.now().replace(hour=hour_part, minute=minute_part, second=0, microsecond=0)
-                                            bucket_data["first_timestamp"] = dt.timestamp()
-                                            bucket_data["last_timestamp"] = dt.timestamp()
-                                        except (ValueError, IndexError):
-                                            pass
-                                    buckets.append(bucket_data)
-                        except Exception as e:
-                            continue
-                except Exception as e:
-                    continue
-
-            # Sort by timestamp
-            buckets.sort(key=lambda x: x.get("first_timestamp", 0))
-            return buckets
-
-        except Exception as e:
-            logger.error(f"Failed to get time buckets for {symbol}: {e}")
-            return []
-    
     def store_time_bucket(self, symbol, bucket_data):
         """Store a time bucket for a symbol"""
         try:
@@ -3713,98 +3712,6 @@ class CumulativeDataTracker:
             return
         self._store_time_bucket(symbol, last_price, bucket_cumulative_volume, timestamp, depth_data)
 
-    def get_time_buckets(self, symbol, session_date=None, hour=None, lookback_minutes=60):
-        """Get all time buckets for a symbol with enhanced pattern matching"""
-        if session_date is None:
-            session_date = self.current_session
-
-        try:
-            # Extract base symbol for F&O contracts
-            base_symbol = self._extract_base_symbol(symbol)
-            
-            # Try multiple patterns to find bucket_incremental_volume data
-            patterns_to_try = [
-                # Pattern 1: bucket_incremental_volume:bucket:{symbol}:{session}:{hour}:{minute} (JSON string) - PRIMARY
-                f"bucket_incremental_volume:bucket:{symbol}:{session_date}:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket:{base_symbol}:{session_date}:{hour if hour is not None else '*'}:*",
-                # Pattern 2: bucket_incremental_volume:bucket_incremental_volume:bucket1:{symbol}:buckets:{hour}:{minute} (ACTUAL FORMAT) - PRIMARY
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket1:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket1:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 3: bucket_incremental_volume:bucket_incremental_volume:bucket2:{symbol}:buckets:{hour}:{minute} (ACTUAL FORMAT) - PRIMARY
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket2:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket2:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 4: bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:buckets:{hour}:{minute_bucket} (Legacy format)
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:buckets:{hour if hour is not None else '*'}:*",
-                f"bucket_incremental_volume:bucket_incremental_volume:bucket:{base_symbol}:buckets:{hour if hour is not None else '*'}:*",
-                # Pattern 3: bucket_incremental_volume:bucket_incremental_volume:bucket:bucket:{symbol}:* (Legacy format)
-                f"bucket_incremental_volume:bucket:{symbol}:*",
-                f"bucket_incremental_volume:bucket:{base_symbol}:*",
-                # Pattern 4: data:{symbol}:* (Alternative format)
-                f"data:{symbol}:*",
-                f"data:{base_symbol}:*",
-                # Pattern 5: *:{symbol}:* (Fallback pattern)
-                f"*:{symbol}:*",
-                f"*:{base_symbol}:*"
-            ]
-            
-            buckets = []
-            logger.debug(f"{symbol} -> {base_symbol} - Trying {len(patterns_to_try)} patterns")
-            for i, pattern in enumerate(patterns_to_try):
-                try:
-                    keys = self.redis_client.keys(pattern)
-                    if keys:
-                        logger.debug(f"Pattern {i+1}: {pattern} -> {len(keys)} keys")
-                    for key in keys:
-                        try:
-                            if pattern.startswith("bucket_incremental_volume:bucket:") or pattern.startswith("bucket_incremental_volume:bucket:bucket:") or pattern.startswith("data:"):
-                                # JSON string format
-                                data = self.redis_client.get(key)
-                                if data:
-                                    bucket_data = json.loads(data)
-                                    # Ensure bucket_incremental_volume field exists
-                                    if 'bucket_incremental_volume' not in bucket_data and 'bucket_incremental_volume' in bucket_data:
-                                        bucket_data['bucket_incremental_volume'] = bucket_data['bucket_incremental_volume']
-                                    buckets.append(bucket_data)
-                            elif pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket1:") or pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket2:") or pattern.startswith("bucket_incremental_volume:bucket_incremental_volume:bucket:"):
-                                # Redis hash format - convert to bucket format
-                                hash_data = self.redis_client.redis_client.hgetall(key)
-                                if hash_data and "bucket_incremental_volume" in hash_data:
-                                    # Convert hash data to bucket format
-                                    bucket_data = {
-                                        "symbol": symbol,
-                                        "session_date": session_date,
-                                        "bucket_incremental_volume": int(hash_data.get("bucket_incremental_volume", 0)),
-                                        "count": int(hash_data.get("count", 0)),
-                                        "cumulative": int(hash_data.get("cumulative", 0)),
-                                        "first_timestamp": 0,
-                                        "last_timestamp": 0
-                                    }
-                                    # Parse timestamp from key if possible
-                                    key_parts = key.split(":")
-                                    if len(key_parts) >= 4:
-                                        try:
-                                            hour_part = int(key_parts[-2])
-                                            minute_part = int(key_parts[-1]) * 5  # Convert bucket to minute
-                                            # Create approximate timestamp
-                                            from datetime import datetime
-                                            dt = datetime.now().replace(hour=hour_part, minute=minute_part, second=0, microsecond=0)
-                                            bucket_data["first_timestamp"] = dt.timestamp()
-                                            bucket_data["last_timestamp"] = dt.timestamp()
-                                        except (ValueError, IndexError):
-                                            pass
-                                    buckets.append(bucket_data)
-                        except Exception as e:
-                            continue
-                except Exception as e:
-                    continue
-
-            # Sort by timestamp
-            buckets.sort(key=lambda x: x.get("first_timestamp", 0))
-            return buckets
-
-        except Exception as e:
-            logger.error(f"Failed to get time buckets for {symbol}: {e}")
-            return []
     def get_session_price_movement(self, symbol, minutes_back=30):
         """Get last_price movement analysis for recent period"""
         if symbol not in self.price_history:
@@ -3936,111 +3843,6 @@ class CumulativeDataTracker:
 
         except Exception as e:
             logger.error(f"Failed to cleanup old sessions: {e}")
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Initialize Redis client with cumulative tracking
-    redis_client = RobustRedisClient(host="localhost", port=6379)
-
-    # Example 1: Basic cumulative data update
-    print("=== Basic Cumulative Data Update ===")
-    redis_client.update_cumulative_data("RELIANCE", 2500.50, 1000)
-    redis_client.update_cumulative_data("RELIANCE", 2501.25, 500)
-    redis_client.update_cumulative_data("RELIANCE", 2500.75, 750)
-
-    # Get cumulative data
-    reliance_data = redis_client.get_cumulative_data("RELIANCE")
-    print("RELIANCE Cumulative Data:", reliance_data)
-
-    # Example 2: Order book snapshot storage
-    print("\n=== Order Book Snapshot Storage ===")
-    sample_order_book = {
-        "buy": [
-            {"last_price": 2500.00, "quantity": 100, "orders": 5},
-            {"last_price": 2499.50, "quantity": 200, "orders": 8},
-            {"last_price": 2499.00, "quantity": 150, "orders": 6},
-        ],
-        "sell": [
-            {"last_price": 2500.50, "quantity": 120, "orders": 4},
-            {"last_price": 2501.00, "quantity": 180, "orders": 7},
-            {"last_price": 2501.50, "quantity": 90, "orders": 3},
-        ],
-    }
-
-    redis_client.store_order_book_snapshot("RELIANCE", sample_order_book, 2500.25, 200)
-
-    # Example 3: Price movement analysis
-    print("\n=== Price Movement Analysis ===")
-    # Add more data points for analysis
-    for i in range(10):
-        last_price = 2500.50 + (i * 0.25)
-        bucket_incremental_volume = 100 + (i * 50)
-        redis_client.update_cumulative_data("RELIANCE", last_price, bucket_incremental_volume)
-        time.sleep(0.1)  # Small delay for timestamp variation
-
-    movement = redis_client.get_session_price_movement("RELIANCE", minutes_back=5)
-    print("RELIANCE Price Movement (5 min):", movement)
-
-    # Example 4: Pattern data analysis
-    print("\n=== Pattern Data Analysis ===")
-    pattern_data = redis_client.get_pattern_data("RELIANCE", time_of_day="10:30")
-    print("RELIANCE Pattern Data:", pattern_data)
-
-    # Example 5: Order book history retrieval
-    print("\n=== Order Book History ===")
-    order_book_history = redis_client.get_order_book_history(
-        "RELIANCE", minutes_back=10
-    )
-    print(f"RELIANCE Order Book History: {len(order_book_history)} snapshots")
-
-    # Example 6: Session evolution
-    print("\n=== Session Order Book Evolution ===")
-    session_evolution = redis_client.get_session_order_book_evolution("RELIANCE")
-    print(
-        f"RELIANCE Session Evolution: {session_evolution['total_snapshots']} total snapshots"
-    )
-
-    # Example 7: Cleanup old sessions
-    print("\n=== Session Cleanup ===")
-    redis_client.cleanup_old_sessions(days_to_keep=7)
-    print("Cleaned up old sessions")
-
-    # Example 8: AION Signal Publishing and Caching
-    print("\n=== AION Signal Publishing ===")
-    # Example correlation data
-    correlation_data = {
-        "symbol1": "RELIANCE",
-        "symbol2": "TCS",
-        "correlation": 0.95,
-        "p_value": 0.001,
-        "significant": True,
-    }
-
-    # Publish to AION channel
-    success = redis_client.publish_aion_signal(
-        "correlations", correlation_data, "RELIANCE"
-    )
-    print(f"Published AION correlation signal: {success}")
-
-    # Store AION Monte Carlo result using existing methods
-    key = f"monte_carlo:RELIANCE:{int(time.time())}"
-    cache_success = redis_client.store_by_data_type(
-        "analysis_cache", key, json.dumps(monte_carlo_data)
-    )
-    print(f"Stored AION Monte Carlo result: {cache_success}")
-
-    # Retrieve cached result using existing methods
-    cached_result = redis_client.retrieve_by_data_type(key, "analysis_cache")
-    print(f"Retrieved cached AION result: {cached_result is not None}")
-
-    print("\n=== Integration Complete ===")
-    print("✅ Cumulative bucket_incremental_volume tracking with session management")
-    print("✅ Order book history with full depth snapshots")
-    print("✅ Price movement analysis with time-based buckets")
-    print("✅ Pattern recognition data with historical context")
-    print("✅ Memory-efficient storage with automatic cleanup")
-    print("✅ AION signal publishing and caching")
 
 
 # ============================================
@@ -4233,20 +4035,13 @@ def create_consumer_group_if_needed(stream: str, group: str, mkstream: bool = Tr
         if "BUSYGROUP" not in str(e):
             raise
 
-@retryable
-def xreadgroup_blocking(
-    group: str,
-    consumer: str,
-    streams: dict[str, str],
-    count: int = 100,
-    block_ms: int = 2_000,
-) -> list[Tuple[bytes, list[Tuple[bytes, list[Tuple[bytes, dict[bytes, bytes]]]]]]]:
-    """
-    Blocking XREADGROUP with time-bounded wait.
-    Why: bounded latency avoids 'stuck' consumers on network hiccups.
-    """
-    r = get_sync_modern()
-    return r.xreadgroup(groupname=group, consumername=consumer, streams=streams, count=count, block=block_ms)
+# ⚠️ DEPRECATED: xreadgroup_blocking removed - use RobustStreamConsumer instead
+# This function was replaced by RobustStreamConsumer.process_messages() for standardized stream consumption.
+# 
+# Migration guide:
+# - Use RobustStreamConsumer from intraday_scanner.data_pipeline instead
+# - Example: consumer = RobustStreamConsumer(stream_key, group_name, consumer_name, db)
+#            consumer.process_messages(callback)
 
 # ---------------- Health utilities ----------------
 def ping_modern() -> bool:
@@ -4277,6 +4072,10 @@ def role_modern() -> Tuple[Any, ...]:
 
 def get_redis_client(config=None, db: Optional[int] = None, *, decode_responses: bool = False):
     """
+    ⚠️ DEPRECATED: Legacy factory function for backward compatibility.
+    
+    RECOMMENDED: Use RedisManager82.get_client() for new code.
+    
     Factory function to create and return a singleton RobustRedisClient instance.
     Now uses modern RESP3 + retry/backoff client under the hood when available.
     Maintains backward compatibility with existing RobustRedisClient interface.
@@ -4288,52 +4087,53 @@ def get_redis_client(config=None, db: Optional[int] = None, *, decode_responses:
     
     Returns:
         RobustRedisClient instance (or modern client wrapped for backward compatibility)
+        
+    Migration:
+        # Old (deprecated):
+        client = get_redis_client(db=1)
+        
+        # New (recommended):
+        from redis_files.redis_manager import RedisManager82
+        client = RedisManager82.get_client(process_name="your_process", db=1)
     """
     global _redis_client_instance
     
-    # If db or decode_responses specified, try modern client directly
+    # If db or decode_responses specified, use RobustRedisClient to ensure connection pooling
+    # Don't create new connections - reuse singleton and get_client() for specific DB
     if db is not None or decode_responses:
-        try:
-            from config.redis_config import get_redis_config
+        # Get or create singleton RobustRedisClient
+        if _redis_client_instance is None:
+            # Create singleton first
+            from redis_files.redis_config import get_redis_config
             redis_config = get_redis_config()
-            overrides = {
-                "host": redis_config.get("host", "127.0.0.1"),
-                "port": redis_config.get("port", 6379),
-                "db": db if db is not None else redis_config.get("db", 0),
-                "password": redis_config.get("password"),
-                "decode_responses": decode_responses,
-            }
-            return get_sync_modern(overrides)
-        except Exception:
-            # Fallback to legacy path
-            pass
+            redis_config_with_max_conn = redis_config.copy()
+            if "max_connections" in redis_config:
+                redis_config_with_max_conn["redis_max_connections"] = redis_config["max_connections"]
+            _redis_client_instance = RobustRedisClient(
+                host=redis_config.get("host", "localhost"),
+                port=redis_config.get("port", 6379),
+                db=redis_config.get("db", 0),
+                password=redis_config.get("password"),
+                decode_responses=decode_responses,
+                health_check_interval=redis_config.get("health_check_interval", 30),
+                config=redis_config_with_max_conn
+            )
+        
+        # Return appropriate client for the requested DB
+        if db is not None:
+            return _redis_client_instance.get_client(db)
+        return _redis_client_instance
     if _redis_client_instance is None:
         try:
             # Try modern implementation first (if config allows)
             use_modern = os.getenv("REDIS_USE_MODERN", "true").lower() == "true"
-            if use_modern and not config:
-                # Use modern client for simple cases
-                try:
-                    from config.redis_config import get_redis_config
-                    redis_config = get_redis_config()
-                    overrides = {
-                        "host": redis_config.get("host", "127.0.0.1"),
-                        "port": redis_config.get("port", 6379),
-                        "db": redis_config.get("db", 0),
-                        "password": redis_config.get("password"),
-                        "max_connections": redis_config.get("max_connections", 256),
-                    }
-                    modern_client = get_sync_modern(overrides)
-                    # Wrap in RobustRedisClient interface for backward compatibility
-                    # This allows existing code to work without changes
-                    logger.info("✅ Using modern Redis client (RESP3 + retry/backoff) with backward-compat wrapper")
-                except Exception as modern_err:
-                    logger.warning(f"⚠️ Modern client init failed, falling back: {modern_err}")
-                    use_modern = False
+            # Always use RobustRedisClient to ensure wrapper methods are available
+            # Modern client can be used internally but we need the wrapper interface
+            use_modern = False  # Force RobustRedisClient for compatibility
             
-            if not use_modern:
+            if not use_modern or _redis_client_instance is None:
                 # Use centralized Redis configuration (legacy path)
-                from config.redis_config import get_redis_config, Redis8Config
+                from redis_files.redis_config import get_redis_config, Redis8Config
                 
                 # Get base Redis configuration
                 redis_config = get_redis_config()

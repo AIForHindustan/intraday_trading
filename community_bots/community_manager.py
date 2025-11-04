@@ -16,6 +16,7 @@ import os
 # Import bot modules
 from reddit_bot import AIONRedditBot
 from telegram_bot import AIONTelegramBot
+from discord_bot import AIONDiscordBot
 
 # Community Manager Configuration
 COMMUNITY_CONFIG = {
@@ -40,6 +41,11 @@ class AIONCommunityManager:
         # Initialize bots
         self.reddit_bot = AIONRedditBot()
         self.telegram_bot = AIONTelegramBot()
+        try:
+            self.discord_bot = AIONDiscordBot()
+        except Exception as e:
+            self.logger.warning(f"Discord bot not configured: {e}")
+            self.discord_bot = None
         
         # Setup logging
         logging.basicConfig(level=logging.INFO)
@@ -388,16 +394,44 @@ class AIONCommunityManager:
             symbol = validation_data.get('symbol', 'UNKNOWN')
             confidence = validation_data.get('confidence', 0.0)
             
-            # Create Reddit post for high-confidence validation
-            reddit_post = self._format_reddit_validation_post(validation_data)
+            # Initialize Reddit bot if not already done
+            if not hasattr(self, 'reddit_bot') or self.reddit_bot is None:
+                try:
+                    from community_bots.reddit_bot import AIONRedditBot
+                    self.reddit_bot = AIONRedditBot()
+                    if not self.reddit_bot.config.get('client_id'):
+                        self.logger.warning("Reddit bot not configured. Skipping Reddit post.")
+                        return False
+                except Exception as e:
+                    self.logger.error(f"Failed to initialize Reddit bot: {e}")
+                    return False
             
-            # Post to Reddit (implementation depends on Reddit bot)
-            # await self.reddit_bot.post_validation_result(reddit_post)
+            # Format Reddit post
+            reddit_post_data = self._format_reddit_validation_post(validation_data)
             
-            self.logger.info(f"📡 Validation result prepared for Reddit: {symbol}")
+            # Extract title and body
+            if isinstance(reddit_post_data, dict):
+                title = reddit_post_data.get('title', f'🎯 Alert Validation: {symbol}')
+                body = reddit_post_data.get('body', reddit_post_data.get('text', str(reddit_post_data)))
+            else:
+                title = f'🎯 High-Confidence Alert Validation: {symbol}'
+                body = str(reddit_post_data)
+            
+            # Post to Reddit
+            success = await self.reddit_bot.post_update(title=title, text=body)
+            
+            if success:
+                self.logger.info(f"✅ Posted validation result to Reddit: {symbol} (confidence: {confidence:.1%})")
+            else:
+                self.logger.warning(f"⚠️ Failed to post to Reddit: {symbol}")
+            
+            return success
             
         except Exception as e:
             self.logger.error(f"Error distributing to Reddit: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
     
     def _format_reddit_validation_post(self, validation_data: Dict) -> str:
         """Format validation result for Reddit post"""
@@ -485,24 +519,43 @@ class AIONCommunityManager:
         except Exception as e:
             self.logger.error(f"Error updating performance metrics: {e}")
     
-    async def share_educational_content(self):
+    async def share_educational_content(self, file_path: Optional[str] = None):
         """Share educational content across platforms"""
         try:
-            # Get educational content
-            educational_content = self.get_educational_content()
+            # Get educational content from file or Redis
+            if file_path:
+                educational_content = self.get_educational_content(file_path=file_path)
+            else:
+                educational_content = self.get_educational_content()
             
+            if not educational_content:
+                self.logger.warning("No educational content found to share")
+                return False
             
             # Share to Telegram
-            await self.telegram_bot.send_educational_content(educational_content)
+            telegram_success = await self.telegram_bot.send_educational_content(educational_content)
             
             # Share to Reddit
-            await self.share_educational_to_reddit(educational_content)
+            reddit_success = await self.share_educational_to_reddit(educational_content)
             
-            self.community_metrics['educational_content_shared'] += 1
-            self.logger.info("Educational content shared across platforms")
+            # Share to Discord
+            discord_success = False
+            if self.discord_bot:
+                discord_success = await self.discord_bot.send_educational_content(educational_content)
+            
+            if telegram_success or reddit_success or discord_success:
+                self.community_metrics['educational_content_shared'] += 1
+                self.logger.info("Educational content shared across platforms")
+                return True
+            else:
+                self.logger.warning("Failed to share educational content to any platform")
+                return False
             
         except Exception as e:
             self.logger.error(f"Error sharing educational content: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
     
     async def update_market_information(self):
         """Update market information across platforms"""
@@ -549,9 +602,33 @@ class AIONCommunityManager:
             self.logger.error(f"Error getting performance data: {e}")
             return {}
     
-    def get_educational_content(self) -> Dict:
-        """Get educational content from Redis"""
+    def get_educational_content(self, file_path: Optional[str] = None) -> Dict:
+        """Get educational content from file or Redis"""
         try:
+            # If file_path provided, load from markdown file
+            if file_path:
+                from pathlib import Path
+                file = Path(file_path)
+                if file.exists():
+                    with open(file, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    # Extract title (first line or first heading)
+                    lines = content.strip().split('\n')
+                    title = lines[0] if lines else "Educational Content"
+                    # Remove markdown heading markers if present
+                    title = title.replace('#', '').replace('*', '').strip()
+                    
+                    return {
+                        'title': title,
+                        'content': content,
+                        'description': content[:500] + '...' if len(content) > 500 else content,
+                        'source': 'file',
+                        'file_path': str(file)
+                    }
+                else:
+                    self.logger.warning(f"Educational content file not found: {file_path}")
+            
+            # Fallback to Redis
             content_key = "educational:latest"
             content_data = self.redis_client.get(content_key)
             if content_data:
@@ -603,11 +680,37 @@ class AIONCommunityManager:
     async def share_educational_to_reddit(self, content: Dict):
         """Share educational content to Reddit"""
         try:
-            # This would integrate with Reddit bot
-            # For now, just log
-            self.logger.info("Sharing educational content to Reddit")
+            # Initialize Reddit bot if not already done
+            if not hasattr(self, 'reddit_bot') or self.reddit_bot is None:
+                try:
+                    from community_bots.reddit_bot import AIONRedditBot
+                    self.reddit_bot = AIONRedditBot()
+                    if not self.reddit_bot.config.get('client_id'):
+                        self.logger.warning("Reddit bot not configured. Skipping Reddit post.")
+                        return False
+                except Exception as e:
+                    self.logger.error(f"Failed to initialize Reddit bot: {e}")
+                    return False
+            
+            # Extract title and content
+            title = content.get('title', 'Educational Content')
+            body = content.get('content', content.get('description', ''))
+            
+            # Post to Reddit
+            success = await self.reddit_bot.post_update(title=title, text=body, flair="Education")
+            
+            if success:
+                self.logger.info(f"✅ Posted educational content to Reddit: {title}")
+            else:
+                self.logger.warning(f"⚠️ Failed to post educational content to Reddit: {title}")
+            
+            return success
+            
         except Exception as e:
             self.logger.error(f"Error sharing educational content to Reddit: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
     
     
     def get_community_metrics(self) -> Dict:

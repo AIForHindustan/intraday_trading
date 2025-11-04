@@ -208,7 +208,8 @@ class ZerodhaWebSocketClient(BaseCrawler):
                     "mode": tick_data.get("mode", "unknown"),
                 }
 
-                self.redis_client.xadd(stream_key, message_data)
+                # ✅ FIXED: ALWAYS use maxlen to prevent unbounded stream growth
+                self.redis_client.xadd(stream_key, message_data, maxlen=10000, approximate=True)
 
         except Exception as e:
             logger.error(f"Error publishing to binary stream: {e}")

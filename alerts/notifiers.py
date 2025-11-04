@@ -438,7 +438,14 @@ class RedisNotifier:
                 return False
             
             # Get realtime client (DB 1) for alert publishing
-            realtime_client = self.redis_client.get_client(1) if hasattr(self.redis_client, 'get_client') else self.redis_client
+            # Use process-specific optimized client to prevent connection exhaustion
+            try:
+                from redis_files.redis_manager import RedisManager82
+                # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
+                realtime_client = RedisManager82.get_client(process_name="alert_notifier", db=1)
+            except Exception:
+                # Fallback to existing method if process-specific pool fails
+                realtime_client = self.redis_client.get_client(1) if hasattr(self.redis_client, 'get_client') else self.redis_client
             
             # Redis-based de-dup within short window (avoid double-publish)
             try:
@@ -455,9 +462,30 @@ class RedisNotifier:
             except Exception:
                 pass
             
-            # Add metadata
+            # Preserve original timestamp from pattern detection (if exists)
+            # This ensures dashboard shows the actual alert generation time, not publish time
+            original_timestamp = alert_data.get('timestamp')
+            original_timestamp_ms = alert_data.get('timestamp_ms')
+            
+            # Add metadata - published_at is when we publish, timestamp is when alert was generated
             alert_data['published_at'] = datetime.now().isoformat()
             alert_data['source'] = 'alert_manager'
+            
+            # Ensure timestamp is preserved (numeric epoch format)
+            if original_timestamp is None:
+                # If no timestamp from pattern, use current time as epoch
+                alert_data['timestamp'] = time.time()
+            elif isinstance(original_timestamp, str):
+                # Convert ISO string to epoch if needed
+                try:
+                    dt = datetime.fromisoformat(original_timestamp.replace('Z', '+00:00'))
+                    alert_data['timestamp'] = dt.timestamp()
+                except:
+                    alert_data['timestamp'] = time.time()
+            
+            # Preserve timestamp_ms if exists, otherwise calculate from timestamp
+            if original_timestamp_ms is None and 'timestamp' in alert_data:
+                alert_data['timestamp_ms'] = int(alert_data['timestamp'] * 1000)
             
             # Enrich alert with news before publishing (if not already enriched)
             try:
@@ -476,7 +504,9 @@ class RedisNotifier:
             target_channels = self._determine_channels(enhanced_alert)
             
             # Publish to all relevant channels
-            message = json.dumps(enhanced_alert)
+            # CRITICAL: Use module-level json import (ensure it's accessible)
+            import json as json_module
+            message = json_module.dumps(enhanced_alert)
             success_count = 0
             
             for channel_type, channel_name in target_channels.items():
@@ -500,22 +530,51 @@ class RedisNotifier:
                     stream_result = realtime_client.xadd(
                         'alerts:stream',
                         {b'data': binary_data},  # Binary data using orjson - matches HighPerformanceAlertStream.consume_alerts
-                        maxlen=10000,
+                        maxlen=1000,  # Store last 1000 alerts before they disappear - allows tracking patterns/instruments
                         approximate=True
                     )
                 except ImportError:
-                    # Fallback to json if orjson not available
-                    import json
-                    binary_data = json.dumps(enhanced_alert).encode('utf-8')
+                    # Fallback to json if orjson not available (json already imported at module level)
+                    import json as json_module
+                    binary_data = json_module.dumps(enhanced_alert).encode('utf-8')
                     stream_result = realtime_client.xadd(
                         'alerts:stream',
                         {b'data': binary_data},  # Binary data (utf-8 encoded JSON)
-                        maxlen=10000,
+                        maxlen=1000,  # Store last 1000 alerts before they disappear - allows tracking patterns/instruments
                         approximate=True
                     )
                 logger.debug(f"✅ Alert published to alerts:stream (dashboard) - ID: {stream_result}")
             except Exception as e:
                 logger.warning(f"⚠️ Failed to publish to alerts:stream (dashboard may be static): {e}")
+            
+            # CRITICAL: Store alert as individual key for dashboard lookup (DB 1)
+            # Key format: alert:{symbol}:{pattern}:{timestamp}
+            try:
+                symbol = str(enhanced_alert.get('symbol', 'UNKNOWN'))
+                pattern = str(enhanced_alert.get('pattern', enhanced_alert.get('pattern_type', 'unknown')))
+                # Use timestamp (epoch) for key - extract integer part
+                alert_timestamp = enhanced_alert.get('timestamp', time.time())
+                if isinstance(alert_timestamp, str):
+                    try:
+                        dt = datetime.fromisoformat(alert_timestamp.replace('Z', '+00:00'))
+                        alert_timestamp = int(dt.timestamp())
+                    except:
+                        alert_timestamp = int(time.time())
+                else:
+                    alert_timestamp = int(float(alert_timestamp))
+                
+                alert_key = f"alert:{symbol}:{pattern}:{alert_timestamp}"
+                
+                # Store with TTL (1 hour)
+                import json as json_module
+                realtime_client.set(
+                    alert_key,
+                    json_module.dumps(enhanced_alert),
+                    ex=3600  # 1 hour TTL
+                )
+                logger.debug(f"✅ Alert stored as key: {alert_key}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to store alert key for dashboard: {e}")
             
             logger.info(f"Alert published to {success_count} channels + main channel + alerts:stream")
             return success_count > 0
@@ -547,6 +606,23 @@ class RedisNotifier:
     def enhance_alert_for_channels(self, alert_data: Dict[str, Any]) -> Dict[str, Any]:
         """Enhance alert data with channel-specific content."""
         enhanced_alert = alert_data.copy()
+        
+        # CRITICAL: Ensure indicators and Greeks are preserved (explicitly for dashboard/stream consumption)
+        # Copy indicators dict if present (nested updates might be lost)
+        if 'indicators' in alert_data and isinstance(alert_data['indicators'], dict):
+            if 'indicators' not in enhanced_alert or not isinstance(enhanced_alert.get('indicators'), dict):
+                enhanced_alert['indicators'] = {}
+            enhanced_alert['indicators'].update(alert_data['indicators'])
+        
+        # Copy Greeks dict if present (ensure it's preserved)
+        if 'greeks' in alert_data and isinstance(alert_data['greeks'], dict):
+            enhanced_alert['greeks'] = alert_data['greeks'].copy()
+        
+        # Ensure individual Greek fields are at top level (for dashboard compatibility)
+        greek_fields = ['delta', 'gamma', 'theta', 'vega', 'rho', 'dte_years', 'trading_dte']
+        for field in greek_fields:
+            if field in alert_data and field not in enhanced_alert:
+                enhanced_alert[field] = alert_data[field]
         
         # Add news context for MarketNews_Alerts channel (positive or negative sentiment)
         if alert_data.get('news_context') or alert_data.get('sentiment'):

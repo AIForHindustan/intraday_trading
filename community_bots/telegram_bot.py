@@ -8,7 +8,7 @@ import aiohttp
 import json
 import os
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class AIONTelegramBot:
                 data = {
                     'chat_id': chat_id,
                     'text': message,
-                    'parse_mode': 'Markdown'
+                    'parse_mode': None  # Plain text mode (no HTML/Markdown parsing)
                 }
                 
                 async with session.post(url, data=data) as response:
@@ -124,27 +124,126 @@ class AIONTelegramBot:
             logger.error(f"Error sending performance update: {e}")
             return False
     
-    async def send_educational_content(self, content: Dict) -> bool:
-        """Send educational content to Telegram"""
+    async def send_educational_content(self, content: Dict, send_to_all_channels: bool = True) -> bool:
+        """Send educational content to Telegram - sends to main channel and signal bot channels"""
         try:
             title = content.get('title', 'Educational Content')
-            description = content.get('description', 'Learn about algorithmic trading patterns')
+            full_content = content.get('content', content.get('description', ''))
             
-            message = f"""
-📚 <b>EDUCATIONAL CONTENT</b> 📚
-
-<b>{title}</b>
-
-{description}
-
-<i>Educational content from AION Trading System</i>
-            """
+            # Telegram has a 4096 character limit per message
+            # Split into multiple messages if needed
+            max_length = 4000  # Leave buffer for HTML tags
             
-            return await self.send_message(message)
+            # Prepare messages
+            if len(full_content) <= max_length:
+                # Single message
+                message = self._markdown_to_html(full_content)
+                messages = [message]
+            else:
+                # Multiple messages
+                header = f"📚 {title} 📚\n\n"
+                messages = [header]
+                
+                # Split content into chunks
+                chunks = self._split_content(full_content, max_length)
+                for i, chunk in enumerate(chunks, 1):
+                    chunk_text = self._markdown_to_html(chunk)
+                    if i < len(chunks):
+                        chunk_text += f"\n\n(Part {i} of {len(chunks)})"
+                    else:
+                        chunk_text += f"\n\nEducational content from AION Trading System"
+                    messages.append(chunk_text)
+            
+            # Determine which channels to send to
+            channels_to_send = [self.main_channel]
+            
+            # Also send to signal bot channels for educational content (especially Kow Signal)
+            if send_to_all_channels:
+                signal_bot_config = self.config.get('signal_bot', {})
+                signal_channels = signal_bot_config.get('chat_ids', [])
+                if signal_channels:
+                    channels_to_send.extend(signal_channels)
+                    logger.info(f"📚 Sending educational content to {len(channels_to_send)} channels: main + {len(signal_channels)} signal bot channels")
+            
+            # Send to all channels
+            overall_success = True
+            for channel in channels_to_send:
+                channel_success = True
+                for i, message_text in enumerate(messages):
+                    success = await self.send_message(message_text, chat_id=channel)
+                    if not success:
+                        channel_success = False
+                        overall_success = False
+                    # Small delay between messages
+                    if i < len(messages) - 1:
+                        await asyncio.sleep(1)
+                
+                if channel_success:
+                    logger.info(f"✅ Educational content sent to {channel}")
+                else:
+                    logger.warning(f"⚠️ Failed to send some messages to {channel}")
+            
+            return overall_success
             
         except Exception as e:
             logger.error(f"Error sending educational content: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
+    
+    def _markdown_to_html(self, text: str) -> str:
+        """Convert markdown to HTML for Telegram - plain text version (no HTML tags)"""
+        # User requested no HTML formatting, just clean text
+        # Remove all markdown markers
+        text = text.replace('**', '')  # Remove bold markers
+        text = text.replace('*', '')   # Remove italic markers  
+        text = text.replace('#', '')    # Remove heading markers
+        
+        # Clean up any empty HTML tags that might exist
+        import re
+        text = re.sub(r'<[^>]*>', '', text)  # Remove any HTML tags
+        
+        # Return plain text
+        return text
+    
+    def _split_content(self, content: str, max_length: int) -> List[str]:
+        """Split content into chunks respecting line breaks"""
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        paragraphs = content.split('\n\n')
+        
+        for paragraph in paragraphs:
+            para_length = len(paragraph) + 2  # +2 for \n\n
+            
+            if current_length + para_length > max_length:
+                if current_chunk:
+                    chunks.append('\n\n'.join(current_chunk))
+                    current_chunk = [paragraph]
+                    current_length = para_length
+                else:
+                    # Single paragraph is too long, split by sentences
+                    sentences = paragraph.split('. ')
+                    for sentence in sentences:
+                        sent_length = len(sentence) + 2
+                        if current_length + sent_length > max_length:
+                            if current_chunk:
+                                chunks.append('\n\n'.join(current_chunk))
+                                current_chunk = []
+                                current_length = 0
+                            chunks.append(sentence)
+                        else:
+                            current_chunk.append(sentence)
+                            current_length += sent_length
+            else:
+                current_chunk.append(paragraph)
+                current_length += para_length
+        
+        if current_chunk:
+            chunks.append('\n\n'.join(current_chunk))
+        
+        return chunks
     
     async def send_market_update(self, market_data: Dict) -> bool:
         """Send market update to Telegram"""

@@ -22,6 +22,7 @@ except ImportError:
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -632,7 +633,7 @@ def normalize_zerodha_tick_data(tick_data: Dict[str, Any]) -> Dict[str, Any]:
         
         # Handle depth data
         if "depth" in tick_data and isinstance(tick_data["depth"], dict):
-            import json
+            # Use module-level json import, not local import
             normalized["depth"] = json.dumps(tick_data["depth"])
             normalized["depth_valid"] = True
         else:

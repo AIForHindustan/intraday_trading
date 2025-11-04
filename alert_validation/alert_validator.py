@@ -2,6 +2,54 @@
 """
 Standalone Alert Validator for Real-time Backtesting
 Uses Redis for alert processing and validates against multiple rolling windows
+
+================================================================================
+CRITICAL DATA LOCATIONS - ALWAYS CHECK THESE:
+================================================================================
+
+PRICE DATA (get_last_price):
+  ✅ DB 0 (session data) - Real-time prices (PRIORITY 1):
+     - Key: session:{symbol}:{date}
+     - Fields: last_price (direct), time_buckets (dict with close prices)
+     - Most recent real-time price data
+     - Format: JSON with time_buckets containing bucket close prices
+  
+  ✅ DB 2 (analytics) - OHLC snapshot data (PRIORITY 2):
+     - Key: ohlc_latest:{symbol}
+     - Fields: last_price, close, open, high, low
+     - Snapshot OHLC data (updated periodically)
+
+ROLLING METRICS / BUCKETS:
+  ✅ DB 0 (session data):
+     - Key: session:{symbol}:{date}
+     - Contains: time_buckets dict with rolling window data
+     - Each bucket: {close, bucket_incremental_volume, count, timestamps}
+     - Used for rolling window calculations (5min, 15min, 30min, 60min)
+
+METRICS CACHE:
+  ✅ DB 2 (analytics):
+     - Key: metrics:{symbol}:{window}min
+     - Pre-calculated rolling metrics
+
+INDICATORS / GREEKS:
+  ✅ DB 5 (indicators_cache) - Primary:
+     - Key: indicators:{symbol}:{indicator_name}
+     - Key: indicators:{symbol}:greeks
+  ✅ DB 1 (analysis_cache) - Fallback:
+     - Same key pattern as DB 5
+
+ALERTS:
+  ✅ DB 1 (realtime):
+     - Stream: alerts:stream
+     - Hash: alert:{alert_id}
+
+VALIDATION RESULTS:
+  ✅ DB 0 (system):
+     - Stream: alerts:validation:results
+     - Hash: forward_validation:results
+     - State: forward_validation:alert:{alert_id}
+
+================================================================================
 """
 
 import json
@@ -21,8 +69,8 @@ import os
 import pytz
 import asyncio
 
-from redis_files.redis_client import get_redis_client
-from config.redis_config import get_database_for_data_type, get_redis_config
+from redis_files.redis_manager import RedisManager82
+from redis_files.redis_config import get_database_for_data_type, get_redis_config
 from utils.correct_volume_calculator import CorrectVolumeCalculator
 from utils.time_aware_volume_baseline import TimeAwareVolumeBaseline
 
@@ -53,33 +101,253 @@ class AlertValidator:
             "redis_password": redis_config.get('password'),
         }
 
-        self.redis = get_redis_client(client_options)
-        if not self.redis:
-            raise RuntimeError("Unable to initialize RobustRedisClient for alert validation")
-
-        # Primary connection (DB 0) for pub/sub and general reads
-        self.redis_client = self.redis.redis_client or self.redis.get_client(0)
-        if self.redis_client is None:
+        # ✅ CONSISTENCY: Use RedisManager82 for process-specific connection pools
+        from redis_files.redis_manager import RedisManager82
+        
+        # Initialize primary Redis client using RedisManager82
+        self.redis_client = RedisManager82.get_client(
+            process_name="alert_validator",
+            db=0,  # Primary DB for pub/sub and general reads
+            max_connections=None  # Use PROCESS_POOL_CONFIG value
+        )
+        if not self.redis_client:
             raise RuntimeError("Primary Redis connection unavailable for validator")
+        
+        # Create a wrapper for compatibility with existing code
+        class RedisWrapper:
+            def __init__(self, redis_client):
+                self.redis_client = redis_client
+            def get_client(self, db):
+                return RedisManager82.get_client(
+                    process_name="alert_validator",
+                    db=db,
+                    max_connections=None  # Use PROCESS_POOL_CONFIG value
+                )
+            
+            def get_last_price(self, symbol: str):
+                """
+                ✅ FIXED: Get last price from:
+                1. DB 0 (session data) - real-time prices from time_buckets
+                2. DB 2 (ohlc_latest) - OHLC snapshot data
+                
+                Priority: DB 0 session data (most recent) > DB 2 OHLC (snapshot)
+                """
+                import json
+                from datetime import datetime, timedelta
+                import logging
+                logger = logging.getLogger(__name__)
+                
+                try:
+                    logger.debug(f"🔍 get_last_price called for: {symbol}")
+                    # ✅ PRIORITY 1: DB 0 - Session data (real-time prices)
+                    db0_client = self.get_client(0)
+                    now = datetime.now()
+                    
+                    # ✅ FIXED: Check recent dates (today, yesterday, day before) - same as bucket calculation
+                    dates_to_try = [
+                        now.strftime('%Y-%m-%d'),  # Today
+                        (now - timedelta(days=1)).strftime('%Y-%m-%d'),  # Yesterday
+                        (now - timedelta(days=2)).strftime('%Y-%m-%d'),  # Day before
+                    ]
+                    
+                    # Try each date
+                    for date_str in dates_to_try:
+                        session_key = f"session:{symbol}:{date_str}"
+                        session_data = db0_client.get(session_key)
+                        
+                        if session_data:
+                            try:
+                                if isinstance(session_data, bytes):
+                                    session_data = session_data.decode('utf-8')
+                                session_dict = json.loads(session_data)
+                                
+                                # Try direct last_price field first (most recent)
+                                if 'last_price' in session_dict and session_dict['last_price']:
+                                    price = float(session_dict['last_price'])
+                                    logger.debug(f"✅ Found direct last_price for {symbol} on {date_str}: {price}")
+                                    return price
+                                
+                                # Try latest time_bucket close price
+                                if 'time_buckets' in session_dict:
+                                    time_buckets = session_dict['time_buckets']
+                                    if isinstance(time_buckets, dict) and time_buckets:
+                                        # Get latest bucket
+                                        latest_bucket_key = sorted(time_buckets.keys())[-1]
+                                        latest_bucket = time_buckets[latest_bucket_key]
+                                        if isinstance(latest_bucket, dict):
+                                            if 'close' in latest_bucket and latest_bucket['close']:
+                                                price = float(latest_bucket['close'])
+                                                logger.debug(f"✅ Found bucket close for {symbol} on {date_str} (bucket {latest_bucket_key}): {price}")
+                                                return price
+                                            if 'last_price' in latest_bucket and latest_bucket['last_price']:
+                                                price = float(latest_bucket['last_price'])
+                                                logger.debug(f"✅ Found bucket last_price for {symbol} on {date_str} (bucket {latest_bucket_key}): {price}")
+                                                return price
+                            except Exception as e:
+                                logger.debug(f"Error processing session data for {session_key}: {e}")
+                                continue
+                    
+                    # ✅ PRIORITY 2: DB 2 - OHLC latest snapshot
+                    db2_client = self.get_client(2)
+                    
+                    # Try ohlc_latest hash key (DB 2)
+                    ohlc_key = f"ohlc_latest:{symbol}"
+                    ohlc_data = db2_client.hgetall(ohlc_key)
+                    
+                    if ohlc_data:
+                        # Try last_price first, then close
+                        last_price = ohlc_data.get(b'last_price') or ohlc_data.get('last_price')
+                        if last_price:
+                            return float(last_price.decode('utf-8') if isinstance(last_price, bytes) else last_price)
+                        
+                        close = ohlc_data.get(b'close') or ohlc_data.get('close')
+                        if close:
+                            return float(close.decode('utf-8') if isinstance(close, bytes) else close)
+                    
+                    # ✅ FIXED: Try underlying symbol if option/future (using proper extraction)
+                    if 'CE' in symbol or 'PE' in symbol or 'FUT' in symbol:
+                        # ✅ Use proper underlying extraction method (inline implementation)
+                        import re
+                        symbol_upper = symbol.upper()
+                        index_match = re.search(r'(BANKNIFTY|NIFTY|FINNIFTY|MIDCPNIFTY)', symbol_upper)
+                        if index_match:
+                            underlying = index_match.group(1)
+                        else:
+                            base_symbol = re.sub(r'25[A-Z]{3}', '', symbol_upper)
+                            base_symbol = re.sub(r'\d+(CE|PE)$', '', base_symbol)
+                            if base_symbol.endswith('FUT'):
+                                base_symbol = base_symbol[:-3]
+                            underlying = base_symbol if base_symbol else symbol
+                        
+                        # ✅ FIXED: Check recent dates for underlying symbol too
+                        for date_str in dates_to_try:
+                            underlying_session_key = f"session:{underlying}:{date_str}"
+                            underlying_session = db0_client.get(underlying_session_key)
+                            if underlying_session:
+                                try:
+                                    if isinstance(underlying_session, bytes):
+                                        underlying_session = underlying_session.decode('utf-8')
+                                    underlying_dict = json.loads(underlying_session)
+                                    if 'last_price' in underlying_dict and underlying_dict['last_price']:
+                                        return float(underlying_dict['last_price'])
+                                    
+                                    # Also check time_buckets for underlying
+                                    if 'time_buckets' in underlying_dict:
+                                        time_buckets = underlying_dict['time_buckets']
+                                        if isinstance(time_buckets, dict) and time_buckets:
+                                            latest_bucket_key = sorted(time_buckets.keys())[-1]
+                                            latest_bucket = time_buckets[latest_bucket_key]
+                                            if isinstance(latest_bucket, dict):
+                                                if 'close' in latest_bucket and latest_bucket['close']:
+                                                    return float(latest_bucket['close'])
+                                                if 'last_price' in latest_bucket and latest_bucket['last_price']:
+                                                    return float(latest_bucket['last_price'])
+                                except Exception:
+                                    continue
+                        
+                        # Try underlying in DB 2 OHLC
+                        underlying_key = f"ohlc_latest:{underlying}"
+                        underlying_data = db2_client.hgetall(underlying_key)
+                        if underlying_data:
+                            last_price = underlying_data.get(b'last_price') or underlying_data.get('last_price')
+                            if last_price:
+                                return float(last_price.decode('utf-8') if isinstance(last_price, bytes) else last_price)
+                            close = underlying_data.get(b'close') or underlying_data.get('close')
+                            if close:
+                                return float(close.decode('utf-8') if isinstance(close, bytes) else close)
+                    
+                    return None
+                except Exception as e:
+                    # Log error but don't fail - price retrieval is non-critical
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug(f"Failed to get last price for {symbol}: {e}")
+                    return None
+            
+            def store_validation_result(self, alert_id: str, result_data: Dict):
+                """
+                ✅ FIXED: Store validation result in Redis.
+                Stores to alerts:validation:results stream (DB 0).
+                """
+                try:
+                    import json
+                    from redis_files.redis_manager import RedisManager82
+                    
+                    # Get DB 0 client for validation results stream
+                    db0_client = self.get_client(0)
+                    
+                    # ✅ FIXED: Convert dict values to strings for Redis stream
+                    stream_data = {}
+                    for key, value in result_data.items():
+                        if isinstance(value, (dict, list)):
+                            stream_data[key] = json.dumps(value)
+                        else:
+                            stream_data[key] = str(value)
+                    
+                    # Store to validation results stream
+                    stream_key = "alerts:validation:results"
+                    db0_client.xadd(
+                        stream_key,
+                        stream_data,
+                        maxlen=1000,
+                        approximate=True
+                    )
+                    
+                    # Also store as hash for quick lookup
+                    hash_key = f"forward_validation:results"
+                    db0_client.hset(hash_key, alert_id, json.dumps(result_data))
+                    
+                except Exception as e:
+                    # Log error but don't fail - validation can still proceed
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Could not store validation result for {alert_id}: {e}")
+        
+        self.redis = RedisWrapper(self.redis_client)
 
         # Map logical datastores to actual Redis databases
+        # ✅ FIXED: Per REDIS_STORAGE_SIGNATURE.md
         self.datastores = datastore_config
         alerts_data_type = datastore_config.get('alerts', 'pattern_alerts')
-        rolling_data_type = datastore_config.get('rolling', 'daily_cumulative')
-
+        
         try:
             alerts_db_num = get_database_for_data_type(alerts_data_type)
         except Exception:
             alerts_db_num = 1  # Use DB 1 (realtime) for alerts
+        
+        # ✅ FIXED: Metrics cache should be in DB 2 (analytics) per signature
+        # Metrics cache: metrics:{symbol}:{window}min -> DB 2 (analytics_data)
         try:
-            # Use realtime DB for incremental volume/bucket data
-            rolling_db_num = get_database_for_data_type("incremental_volume")
+            metrics_db_num = get_database_for_data_type("metrics_cache")
         except Exception:
-            rolling_db_num = 1  # Fallback to DB 1 (realtime)
+            metrics_db_num = 2  # Fallback to DB 2 (analytics)
+        
+        # ✅ FIXED: Buckets are stored in session data (DB 0), not individual hash keys
+        # Session data: session:{symbol}:{date} -> DB 0 (session_data)
+        # The bucket_incremental_volume data type maps to DB 1, but actual buckets are in DB 0
+        # So we use DB 0 client directly for session data (already set as self.redis_client)
 
-        self.alert_store_client = self.redis.get_client(alerts_db_num) or self.redis_client
-        self.rolling_store_client = self.redis.get_client(rolling_db_num) or self.redis_client
-        self.volume_client = self.rolling_store_client
+        # ✅ CONSISTENCY: Use RedisManager82 for all clients
+        self.alert_store_client = RedisManager82.get_client(
+            process_name="alert_validator",
+            db=alerts_db_num,
+            max_connections=None
+        ) or self.redis_client
+        
+        # ✅ FIXED: Metrics cache client should be DB 2 (analytics)
+        self.metrics_store_client = RedisManager82.get_client(
+            process_name="alert_validator",
+            db=metrics_db_num,
+            max_connections=None
+        ) or RedisManager82.get_client(
+            process_name="alert_validator",
+            db=2,
+            max_connections=None
+        ) or self.redis_client
+        # Keep rolling_store_client for backward compatibility, but use metrics_store_client for metrics cache
+        self.rolling_store_client = self.metrics_store_client
+        # Volume client: buckets are in session data (DB 0), but we keep this for fallback hash key lookups
+        self.volume_client = self.redis_client  # ✅ DB 0 for session data access
         self.cumulative_tracker = getattr(self.redis, "cumulative_tracker", None)
         
         # IST timezone for all time operations
@@ -323,24 +591,44 @@ class AlertValidator:
     
     def get_rolling_metrics(self, symbol: str, windows: List[int]) -> Dict:
         """Get rolling window metrics from Redis using actual system key patterns"""
+        # Check if force_bucket_metrics is enabled in config
+        force_buckets = bool((self.config or {}).get("validation", {}).get("force_bucket_metrics", False))
         metrics = {}
         try:
             for window in windows:
-                # Try to get pre-calculated rolling metrics first
-                key = f"metrics:{symbol}:{window}min"
-                store_client = self.rolling_store_client or self.redis_client
-                window_data = store_client.get(key) if store_client else None
+                used = "cache"
+                window_data = None
                 
-                if window_data:
-                    metrics[window] = json.loads(window_data)
-                    self.logger.debug(f"✅ Found pre-calculated metrics for {symbol} {window}min")
-                else:
-                    # Calculate from bucket_incremental_volume buckets using actual system patterns
+                # Try cache first unless forced to use buckets
+                if not force_buckets:
+                    key = f"metrics:{symbol}:{window}min"
+                    # ✅ FIXED: Metrics cache is in DB 2 (analytics) per REDIS_STORAGE_SIGNATURE.md
+                    store_client = self.metrics_store_client or RedisManager82.get_client(
+                        process_name="alert_validator",
+                        db=2,
+                        max_connections=None
+                    ) or self.redis_client
+                    window_data = store_client.get(key) if store_client else None
+                    
+                    if window_data:
+                        metrics[window] = json.loads(window_data)
+                        self.logger.debug(f"✅ Found pre-calculated metrics for {symbol} {window}min")
+                
+                # Calculate from buckets if no cache or forced
+                if not window_data:
+                    used = "buckets"
                     metrics[window] = self._calculate_from_volume_buckets(symbol, window)
                     if metrics[window]:
                         self.logger.debug(f"✅ Calculated metrics for {symbol} {window}min from buckets")
                     else:
                         self.logger.debug(f"❌ No metrics available for {symbol} {window}min")
+                
+                # Log at INFO level for visibility (as patch does)
+                try:
+                    keys = list(metrics[window].keys()) if isinstance(metrics[window], dict) else 'n/a'
+                    self.logger.info(f"[metrics] {symbol} {window}min via {used} -> keys={keys}")
+                except Exception:
+                    pass
                     
         except Exception as e:
             self.logger.error(f"Error getting rolling metrics for {symbol}: {e}")
@@ -363,88 +651,212 @@ class AlertValidator:
             return 0.0
     
     def _get_underlying_symbol(self, symbol: str) -> str:
-        """Map option symbols to their underlying symbols for bucket data lookup."""
-        # Extract underlying symbol from option symbols - check BANKNIFTY first
-        if "BANKNIFTY" in symbol.upper():
-            return "BANKNIFTY"
-        elif "NIFTY" in symbol.upper():
-            return "NIFTY"
-        elif "FINNIFTY" in symbol.upper():
-            return "FINNIFTY"
-        elif "MIDCPNIFTY" in symbol.upper():
-            return "MIDCPNIFTY"
-        else:
-            # For other symbols, try to extract the base symbol
-            # Remove common option suffixes
-            base_symbol = symbol
-            for suffix in ["25NOV", "25DEC", "25JAN", "25FEB", "25MAR", "25APR", "25MAY", "25JUN", 
-                          "25JUL", "25AUG", "25SEP", "25OCT", "CE", "PE", "FUT"]:
-                if base_symbol.endswith(suffix):
-                    base_symbol = base_symbol[:-len(suffix)]
-                    break
-            return base_symbol
+        """Map option symbols to their underlying symbols for bucket data lookup.
+        
+        ✅ FIXED: Properly extracts underlying from options/futures.
+        Examples:
+        - NIFTY25NOV26100CE -> NIFTY
+        - BANKNIFTY25NOV59500PE -> BANKNIFTY
+        - NIFTY25NOVFUT -> NIFTY
+        """
+        import re
+        symbol_upper = symbol.upper()
+        
+        # ✅ PRIORITY: Check for index names first (BANKNIFTY, NIFTY, etc.)
+        index_match = re.search(r'(BANKNIFTY|NIFTY|FINNIFTY|MIDCPNIFTY)', symbol_upper)
+        if index_match:
+            return index_match.group(1)
+        
+        # ✅ For other symbols, extract base by removing date pattern and option/future suffix
+        # Pattern: SYMBOL + 25NOV/25DEC + STRIKE + CE/PE or FUT
+        # Remove date pattern (25NOV, 25DEC, etc.)
+        base_symbol = re.sub(r'25[A-Z]{3}', '', symbol_upper)
+        # Remove strike + option suffix (e.g., 26100CE, 59500PE)
+        base_symbol = re.sub(r'\d+(CE|PE)$', '', base_symbol)
+        # Remove FUT suffix
+        if base_symbol.endswith('FUT'):
+            base_symbol = base_symbol[:-3]
+        
+        return base_symbol if base_symbol else symbol
 
     def _calculate_from_volume_buckets(self, symbol: str, window_minutes: int) -> Dict:
         """Calculate rolling metrics by directly accessing Redis bucket data."""
+        # Add entry log for visibility (as patch does)
+        try:
+            self.logger.info(f"↗️  computing bucket metrics for {symbol} over {window_minutes}m")
+        except Exception:
+            pass
         try:
             now = datetime.now(pytz.timezone("Asia/Kolkata"))
             cutoff_ts = (now - timedelta(minutes=window_minutes)).timestamp()
             
-            # Get underlying symbol for bucket lookup
+            # ✅ FIXED: Buckets are stored in session data (DB 0), not as individual hash keys
+            # Format: session:{symbol}:{date} -> time_buckets (nested JSON with prices)
+            # Try current date and recent dates
+            dates_to_try = [
+                now.strftime("%Y-%m-%d"),  # Today
+                (now - timedelta(days=1)).strftime("%Y-%m-%d"),  # Yesterday
+                (now - timedelta(days=2)).strftime("%Y-%m-%d"),  # Day before
+            ]
+            
+            # Also try symbol variants (original, underlying)
+            symbols_to_try = [symbol]
             underlying_symbol = self._get_underlying_symbol(symbol)
+            if underlying_symbol != symbol:
+                symbols_to_try.append(underlying_symbol)
             
-            # Get all bucket keys for this underlying symbol
-            bucket_pattern = f"bucket_incremental_volume:bucket_incremental_volume:bucket*:{underlying_symbol}:buckets:*"
-            self.logger.info(f"🔍 Looking for bucket pattern: {bucket_pattern}")
-            self.logger.info(f"🔍 Using volume_client: {type(self.volume_client)}")
-            self.logger.info(f"🔍 Volume client database: {self.volume_client.connection_pool.connection_kwargs.get('db', 'unknown')}")
-            bucket_keys = self.volume_client.keys(bucket_pattern)
+            buckets_data = []
             
-            self.logger.info(f"🔍 Found {len(bucket_keys)} bucket keys for {symbol} (underlying: {underlying_symbol})")
-            if bucket_keys:
-                self.logger.info(f"🔍 Sample bucket keys: {bucket_keys[:3]}")
-            else:
-                self.logger.warning(f"❌ No bucket keys found for pattern: {bucket_pattern}")
+            # Try session data first (where buckets are actually stored)
+            for try_symbol in symbols_to_try:
+                for date_str in dates_to_try:
+                    session_key = f"session:{try_symbol}:{date_str}"
+                    try:
+                        # Use DB 0 client for session data
+                        session_client = self.redis_client if hasattr(self.redis_client, 'get') else RedisManager82.get_client(
+                            process_name="alert_validator",
+                            db=0,
+                            max_connections=None
+                        )
+                        session_data_str = session_client.get(session_key)
+                        if session_data_str:
+                            import json
+                            session_data = json.loads(session_data_str) if isinstance(session_data_str, str) else session_data_str
+                            time_buckets = session_data.get('time_buckets', {})
+                            
+                            if time_buckets:
+                                self.logger.info(f"✅ Found {len(time_buckets)} buckets in {session_key}")
+                                # Convert time_buckets to list of bucket data
+                                for bucket_key, bucket_data in time_buckets.items():
+                                    if isinstance(bucket_data, dict):
+                                        # Extract timestamp from bucket
+                                        last_ts_str = bucket_data.get('last_timestamp', '')
+                                        if last_ts_str:
+                                            try:
+                                                bucket_ts = datetime.fromisoformat(last_ts_str.replace('+05:30', '')).timestamp()
+                                                if bucket_ts >= cutoff_ts:
+                                                    buckets_data.append(bucket_data)
+                                            except:
+                                                pass
+                                if buckets_data:
+                                    break  # Found buckets, no need to check other dates
+                    except Exception as e:
+                        self.logger.debug(f"Session lookup failed for {session_key}: {e}")
+                        continue
+                
+                if buckets_data:
+                    break  # Found buckets, no need to check other symbols
+            
+            # ✅ NOTE: Individual bucket hash keys don't exist per REDIS_STORAGE_SIGNATURE.md
+            # Buckets are stored in session data (DB 0) only, not as individual hash keys
+            # This fallback is kept for compatibility but will not find any keys
+            if not buckets_data:
+                underlying_symbol = self._get_underlying_symbol(symbol)
+                bucket_prefixes = [
+                    "bucket_incremental_volume:bucket_incremental_volume:bucket1",
+                    "bucket_incremental_volume:bucket_incremental_volume:bucket2",
+                    "bucket_incremental_volume:bucket_incremental_volume:bucket",
+                    "bucket_incremental_volume:bucket_incremental_volume:bucket10"
+                ]
+                
+                bucket_keys = []
+                # ✅ FIXED: Use DB 0 client for fallback lookup (buckets are in session data, DB 0)
+                # But individual hash keys don't exist, so this will always be empty
+                fallback_client = self.redis_client  # DB 0 for session data
+                for prefix in bucket_prefixes:
+                    bucket_pattern = f"{prefix}:{underlying_symbol}:buckets:*"
+                    try:
+                        found_keys = fallback_client.keys(bucket_pattern)
+                        bucket_keys.extend(found_keys)
+                        if found_keys:
+                            self.logger.info(f"✅ Found {len(found_keys)} keys with prefix {prefix}")
+                    except Exception as e:
+                        self.logger.debug(f"Pattern {bucket_pattern} failed: {e}")
+                
+                if bucket_keys:
+                    self.logger.info(f"🔍 Found {len(bucket_keys)} individual bucket hash keys (fallback)")
+                # Note: Per REDIS_STORAGE_SIGNATURE.md, individual bucket hash keys are NOT created
             
             volumes: List[float] = []
             counts: List[int] = []
             timestamps: List[float] = []
+            prices: List[float] = []
 
-            for bucket_key in bucket_keys:
-                try:
-                    # Get bucket data from Redis
-                    bucket_data = self.volume_client.hgetall(bucket_key)
-                    if not bucket_data:
-                        continue
-                    
-                    # Parse timestamps
-                    first_ts_str = bucket_data.get('first_timestamp', '')
-                    last_ts_str = bucket_data.get('last_timestamp', '')
-                    
-                    if first_ts_str:
-                        # Parse ISO timestamp
-                        first_ts = datetime.fromisoformat(first_ts_str.replace('+05:30', '')).timestamp()
-                        # For testing, use a more lenient time window (2 hours instead of 30 minutes)
-                        test_cutoff_ts = (now - timedelta(hours=2)).timestamp()
-                        if first_ts < test_cutoff_ts:
-                            continue
-                    
-                    # Get volume data
-                    bucket_incremental_volume = bucket_data.get('bucket_incremental_volume')
-                    if not bucket_incremental_volume:
-                        continue
-                    
-                    volumes.append(float(bucket_incremental_volume))
-                    counts.append(int(bucket_data.get('count', 1)))
-                    
-                    if first_ts_str:
-                        timestamps.append(first_ts)
+            # Process buckets from session data (primary source)
+            if buckets_data:
+                for bucket_data in buckets_data:
+                    try:
+                        # Extract volume
+                        volume = bucket_data.get('bucket_incremental_volume', 0)
+                        if volume:
+                            volumes.append(float(volume))
                         
-                except Exception as e:
-                    self.logger.debug(f"Error processing bucket {bucket_key}: {e}")
-                    continue
+                        # Extract count
+                        count = bucket_data.get('count', 0)
+                        if count:
+                            counts.append(int(count))
+                        
+                        # Extract price (close or last_price)
+                        price = bucket_data.get('close') or bucket_data.get('last_price')
+                        if price:
+                            prices.append(float(price))
+                        
+                        # Extract timestamp
+                        last_ts_str = bucket_data.get('last_timestamp', '')
+                        if last_ts_str:
+                            try:
+                                bucket_ts = datetime.fromisoformat(last_ts_str.replace('+05:30', '')).timestamp()
+                                timestamps.append(bucket_ts)
+                            except:
+                                pass
+                    except Exception as e:
+                        self.logger.debug(f"Error processing bucket from session data: {e}")
+                        continue
+            
+            # ✅ NOTE: This fallback won't execute per REDIS_STORAGE_SIGNATURE.md
+            # Individual bucket hash keys don't exist - buckets are only in session data
+            elif bucket_keys:
+                for bucket_key in bucket_keys:
+                    try:
+                        # ✅ FIXED: Use DB 0 client (buckets would be in session data if they existed)
+                        bucket_data = self.redis_client.hgetall(bucket_key)
+                        if not bucket_data:
+                            continue
+                        
+                        # Parse timestamps
+                        first_ts_str = bucket_data.get('first_timestamp', '')
+                        last_ts_str = bucket_data.get('last_timestamp', '')
+                        
+                        if first_ts_str:
+                            # Parse ISO timestamp
+                            first_ts = datetime.fromisoformat(first_ts_str.replace('+05:30', '')).timestamp()
+                            # For testing, use a more lenient time window (2 hours instead of 30 minutes)
+                            test_cutoff_ts = (now - timedelta(hours=2)).timestamp()
+                            if first_ts < test_cutoff_ts:
+                                continue
+                    
+                        # Get volume data
+                        bucket_incremental_volume = bucket_data.get('bucket_incremental_volume')
+                        if not bucket_incremental_volume:
+                            continue
+                        
+                        volumes.append(float(bucket_incremental_volume))
+                        counts.append(int(bucket_data.get('count', 1)))
+                        
+                        # Extract price if available
+                        price = bucket_data.get('last_price') or bucket_data.get('close')
+                        if price:
+                            prices.append(float(price))
+                        
+                        if first_ts_str:
+                            timestamps.append(first_ts)
+                            
+                    except Exception as e:
+                        self.logger.debug(f"Error processing bucket {bucket_key}: {e}")
+                        continue
 
             if not volumes:
+                self.logger.warning(f"❌ No bucket data found for {symbol} in session data or individual hash keys")
                 return {}
 
             volume_array = np.array(volumes, dtype=float)
@@ -481,7 +893,12 @@ class AlertValidator:
         try:
             # Get recent trades from Redis
             trades_key = f"trades:{symbol}"
-            store_client = self.rolling_store_client or self.redis_client
+            # ✅ FIXED: Trades are in realtime DB (DB 1) per REDIS_STORAGE_SIGNATURE.md
+            store_client = RedisManager82.get_client(
+                process_name="alert_validator",
+                db=1,
+                max_connections=None
+            ) or self.redis_client
             recent_trades = store_client.lrange(trades_key, 0, -1) if store_client else []
             
             if not recent_trades:
@@ -528,7 +945,11 @@ class AlertValidator:
         indicators = {}
         try:
             # Get realtime client (DB 1)
-            redis_db1 = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis_client
+            redis_db1 = RedisManager82.get_client(
+                process_name="alert_validator",
+                db=1,
+                max_connections=None
+            ) if RedisManager82 else self.redis_client
             if not redis_db1:
                 return indicators
             
@@ -572,7 +993,7 @@ class AlertValidator:
                 if indicators:
                     break  # Found indicators for this variant
         except Exception as e:
-            logger.debug(f"Error loading indicators from Redis for {symbol}: {e}")
+            self.logger.debug(f"Error loading indicators from Redis for {symbol}: {e}")
         
         return indicators
     
@@ -593,7 +1014,11 @@ class AlertValidator:
                 return greeks
             
             # Get realtime client (DB 1)
-            redis_db1 = self.redis.get_client(1) if hasattr(self.redis, 'get_client') else self.redis_client
+            redis_db1 = RedisManager82.get_client(
+                process_name="alert_validator",
+                db=1,
+                max_connections=None
+            ) if RedisManager82 else self.redis_client
             if not redis_db1:
                 return greeks
             
@@ -634,7 +1059,7 @@ class AlertValidator:
                 if greeks:
                     break
         except Exception as e:
-            logger.debug(f"Error loading Greeks from Redis for {symbol}: {e}")
+            self.logger.debug(f"Error loading Greeks from Redis for {symbol}: {e}")
         
         return greeks
     
@@ -1080,17 +1505,20 @@ class AlertValidator:
             self.logger.error(f"Error storing validation result: {e}")
     
     def start_alert_consumer(self):
-        """Start consuming alerts from Redis pub/sub with deferred forward validation."""
+        """Start consuming alerts from Redis stream using RobustStreamConsumer (standardized)."""
+        import os
+        from intraday_scanner.data_pipeline import RobustStreamConsumer
+        
         self.running = True
         if self.forward_enabled:
             self._ensure_forward_worker()
 
-        pubsub = self.redis_client.pubsub()
-        # Listen to the configured input channel
-        input_channel = self.channels.get('alerts_input', 'alerts:notifications')
-        pubsub.subscribe(input_channel)
+        # ✅ FIXED: Use alerts:stream in DB 1 (realtime) instead of pub/sub
+        stream_name = 'alerts:stream'
+        group_name = 'alert_validator_group'
+        consumer_name = f"validator_{os.getpid()}_{int(time.time())}"
         
-        self.logger.info(f"Started consolidated alert validator - listening to '{input_channel}' channel")
+        self.logger.info(f"📡 Started alert validator - consuming from '{stream_name}' stream (group: {group_name}, consumer: {consumer_name})")
         self.logger.info(f"🎯 FILTERING: Only processing alerts with {self.confidence_threshold*100:.0f}%+ confidence")
         if self.forward_enabled:
             self.logger.info(
@@ -1102,75 +1530,318 @@ class AlertValidator:
                 f"{self.window_success_rate_threshold*100:.0f}% window success rate"
             )
         
-        for message in pubsub.listen():
-            if not self.running:
-                break
+        # ✅ STANDARDIZED: Use RobustStreamConsumer instead of manual XREADGROUP
+        consumer = RobustStreamConsumer(
+            stream_key=stream_name,
+            group_name=group_name,
+            consumer_name=consumer_name,
+            db=1  # DB 1 for realtime streams
+        )
+        
+        # Define callback for processing messages
+        def process_alert_message(message_data):
+            """Callback to process alert messages from stream"""
+            try:
+                # message_data is dict: {b'data': binary_json, ...}
+                # Extract binary data
+                data_field = message_data.get(b'data') or message_data.get('data')
+                if not data_field:
+                    return True  # ACK even if no data
                 
-            if message['type'] == 'message':
-                try:
-                    alert_data = json.loads(message['data'])
+                # Parse JSON
+                if isinstance(data_field, bytes):
+                    try:
+                        import orjson
+                        alert_data = orjson.loads(data_field)
+                    except:
+                        import json
+                        alert_data = json.loads(data_field.decode('utf-8'))
+                else:
+                    import json
+                    alert_data = json.loads(data_field) if isinstance(data_field, str) else data_field
+                
+                # Parse alert stream message format
+                parsed_alert = self._parse_alert_stream_message(message_data)
+                if parsed_alert:
+                    alert_data = parsed_alert
+                
+                # Process alert
+                # ✅ RobustStreamConsumer handles ACK automatically
+                if alert_data:
                     symbol = alert_data.get('symbol', 'UNKNOWN')
-                    # Support both 'pattern' and 'pattern_type' field names
                     pattern = alert_data.get('pattern') or alert_data.get('pattern_type', 'UNKNOWN')
-                    # Support both 'confidence' and 'confidence_score' field names
                     confidence = alert_data.get('confidence') or alert_data.get('confidence_score', 0.0)
-
+                    
+                    # Market hours check
                     if self.enforce_market_hours and not self._is_within_market_hours():
                         if not self._market_closed_logged:
                             next_open = self._next_market_open()
-                            self.logger.info(
-                                "🛑 Market is closed (skipping alerts). Next session starts at %s IST",
-                                next_open.strftime("%Y-%m-%d %H:%M"),
-                            )
+                            self.logger.info("🛑 Market is closed (skipping alerts). Next session starts at %s IST", next_open.strftime("%Y-%m-%d %H:%M"))
                             self._market_closed_logged = True
                         time.sleep(self._market_closed_sleep_seconds)
-                        continue
+                        return True  # Don't ACK if market is closed
                     else:
                         self._market_closed_logged = False
                     
-                    # 🎯 85% CONFIDENCE FILTER
+                    # Confidence filter
                     if confidence < self.confidence_threshold:
                         self.logger.debug(f"🚫 LOW CONFIDENCE: Skipping {symbol} {pattern} (confidence: {confidence:.2f} < {self.confidence_threshold})")
-                        continue
+                        return True  # ACK low confidence alerts
                     
-                    # Check cooldown before processing
-                    if not self._check_symbol_cooldown(symbol):
-                        self.logger.info(f"🚫 COOLDOWN: Skipping alert for {symbol} - still in cooldown period")
-                        continue
+                    # Check cooldown
+                    if self._is_on_cooldown(symbol, pattern):
+                        return True  # ACK cooldown alerts
                     
-                    self.logger.info(f"✅ HIGH CONFIDENCE ALERT: {symbol} {pattern} (confidence: {confidence:.2f})")
-                    
-                    # Convert alert data to validator format
-                    validator_alert = self._convert_alert_format(alert_data)
-
-                    if self.forward_enabled:
-                        state = self._schedule_forward_validation(validator_alert)
-                        if state:
-                            self.logger.info(
-                                "🗓️ Scheduled forward validation for %s %s across %d windows",
-                                symbol,
-                                pattern,
-                                len(self.forward_windows),
-                            )
-                        else:
-                            self.logger.warning(
-                                "⚠️ Failed to schedule forward validation for %s %s, "
-                                "falling back to immediate processing",
-                                symbol,
-                                pattern,
-                            )
-                            result = self.process_alert_with_expected_move(validator_alert)
-                            self._post_process_validation_result(result)
-                    else:
-                        # Legacy immediate validation flow
-                        result = self.process_alert_with_expected_move(validator_alert)
-                        self._post_process_validation_result(result)
-                    
-                    # Update cooldown for this symbol
+                    # Process alert (main validation logic)
+                    result = self.process_alert_with_expected_move(alert_data)
+                    self._post_process_validation_result(result)
                     self._update_symbol_cooldown(symbol)
-                    
+                
+                return True  # ACK successful processing
+                
+            except Exception as e:
+                self.logger.error(f"❌ Error processing alert message: {e}")
+                return True  # ACK even on error to prevent infinite reprocessing
+        
+        # Start processing messages using RobustStreamConsumer
+        try:
+            consumer.process_messages(process_alert_message)
+        except Exception as e:
+            self.logger.error(f"❌ RobustStreamConsumer error: {e}")
+        finally:
+            self.logger.info("🛑 Alert consumer stopped")
+    
+    def _parse_alert_stream_message(self, message_data: dict) -> Optional[Dict]:
+        """Parse alert data from Redis stream message (handles binary JSON in 'data' field)"""
+        try:
+            # Stream messages have bytes keys, decode them
+            parsed = {}
+            for key, value in message_data.items():
+                if isinstance(key, bytes):
+                    key_str = key.decode('utf-8')
+                else:
+                    key_str = str(key)
+                
+                if isinstance(value, bytes):
+                    try:
+                        value_str = value.decode('utf-8')
+                        # For 'data' field, keep as string for JSON parsing
+                        if key_str == 'data':
+                            parsed[key_str] = value_str
+                        elif value_str.startswith('{') or value_str.startswith('['):
+                            try:
+                                parsed[key_str] = json.loads(value_str)
+                            except:
+                                parsed[key_str] = value_str
+                        else:
+                            parsed[key_str] = value_str
+                    except:
+                        parsed[key_str] = value
+                else:
+                    parsed[key_str] = value
+            
+            # ✅ CRITICAL: The alerts:stream has binary JSON in 'data' field (similar to ticks:intraday:processed)
+            # Scanner publishes as: {"data": binary_json} where binary_json contains the alert dict
+            if 'data' in parsed:
+                data_value = parsed['data']
+                if isinstance(data_value, bytes):
+                    try:
+                        data_str = data_value.decode('utf-8')
+                    except Exception:
+                        # Try orjson decoding
+                        try:
+                            import orjson
+                            alert_data = orjson.loads(data_value)
+                            return alert_data
+                        except:
+                            self.logger.error(f"Failed to decode data field")
+                            return None
+                elif isinstance(data_value, str):
+                    data_str = data_value
+                else:
+                    self.logger.error(f"Unexpected data field type: {type(data_value)}")
+                    return None
+                
+                # Parse the JSON string to get the actual alert data
+                try:
+                    # Try orjson first (faster), fallback to json
+                    try:
+                        import orjson
+                        alert_data = orjson.loads(data_str)
+                    except:
+                        alert_data = json.loads(data_str)
+                    return alert_data
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"Failed to parse JSON from data field: {e}, preview: {data_str[:200]}")
+                    return None
                 except Exception as e:
-                    self.logger.error(f"Error processing alert message: {e}")
+                    self.logger.error(f"Error parsing data field: {e}")
+                    return None
+            
+            # If no 'data' field, return parsed dict as-is (backward compatibility)
+            return parsed
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing alert stream message: {e}")
+            return None
+    
+    def _process_alert_from_stream(self, alert_data: Dict, stream_client, stream_name: str, group_name: str, message_id):
+        """Process a single alert from stream and ACK if successful"""
+        try:
+            symbol = alert_data.get('symbol', 'UNKNOWN')
+            # Support both 'pattern' and 'pattern_type' field names
+            pattern = alert_data.get('pattern') or alert_data.get('pattern_type', 'UNKNOWN')
+            # Support both 'confidence' and 'confidence_score' field names
+            confidence = alert_data.get('confidence') or alert_data.get('confidence_score', 0.0)
+
+            if self.enforce_market_hours and not self._is_within_market_hours():
+                if not self._market_closed_logged:
+                    next_open = self._next_market_open()
+                    self.logger.info(
+                        "🛑 Market is closed (skipping alerts). Next session starts at %s IST",
+                        next_open.strftime("%Y-%m-%d %H:%M"),
+                    )
+                    self._market_closed_logged = True
+                time.sleep(self._market_closed_sleep_seconds)
+                # Don't ACK if market is closed
+                return
+            else:
+                self._market_closed_logged = False
+            
+            # 🎯 CONFIDENCE FILTER
+            if confidence < self.confidence_threshold:
+                self.logger.debug(f"🚫 LOW CONFIDENCE: Skipping {symbol} {pattern} (confidence: {confidence:.2f} < {self.confidence_threshold})")
+                # ACK low confidence alerts to avoid reprocessing
+                stream_client.xack(stream_name, group_name, message_id)
+                return
+            
+            # Check cooldown before processing
+            if not self._check_symbol_cooldown(symbol):
+                self.logger.info(f"🚫 COOLDOWN: Skipping alert for {symbol} - still in cooldown period")
+                # ACK cooldown alerts to avoid reprocessing
+                stream_client.xack(stream_name, group_name, message_id)
+                return
+            
+            self.logger.info(f"✅ HIGH CONFIDENCE ALERT: {symbol} {pattern} (confidence: {confidence:.2f})")
+            
+            # Convert alert data to validator format
+            validator_alert = self._convert_alert_format(alert_data)
+
+            if self.forward_enabled:
+                state = self._schedule_forward_validation(validator_alert)
+                if state:
+                    self.logger.info(
+                        "🗓️ Scheduled forward validation for %s %s across %d windows",
+                        symbol,
+                        pattern,
+                        len(self.forward_windows),
+                    )
+                    # ACK after successful scheduling
+                    stream_client.xack(stream_name, group_name, message_id)
+                else:
+                    self.logger.warning(
+                        "⚠️ Failed to schedule forward validation for %s %s, "
+                        "falling back to immediate processing",
+                        symbol,
+                        pattern,
+                    )
+                    result = self.process_alert_with_expected_move(validator_alert)
+                    self._post_process_validation_result(result)
+                    # ACK after processing
+                    stream_client.xack(stream_name, group_name, message_id)
+            else:
+                # Legacy immediate validation flow
+                result = self.process_alert_with_expected_move(validator_alert)
+                self._post_process_validation_result(result)
+                # ACK after processing
+                stream_client.xack(stream_name, group_name, message_id)
+            
+            # Update cooldown for this symbol
+            self._update_symbol_cooldown(symbol)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error processing alert from stream: {e}")
+            # Don't ACK on error - message will be retried
+            raise
+
+    def _process_alert_from_stream(self, alert_data: Dict, stream_client, stream_name: str, group_name: str, message_id):
+        """Process a single alert from stream and ACK if successful"""
+        try:
+            symbol = alert_data.get('symbol', 'UNKNOWN')
+            # Support both 'pattern' and 'pattern_type' field names
+            pattern = alert_data.get('pattern') or alert_data.get('pattern_type', 'UNKNOWN')
+            # Support both 'confidence' and 'confidence_score' field names
+            confidence = alert_data.get('confidence') or alert_data.get('confidence_score', 0.0)
+
+            if self.enforce_market_hours and not self._is_within_market_hours():
+                if not self._market_closed_logged:
+                    next_open = self._next_market_open()
+                    self.logger.info(
+                        "🛑 Market is closed (skipping alerts). Next session starts at %s IST",
+                        next_open.strftime("%Y-%m-%d %H:%M"),
+                    )
+                    self._market_closed_logged = True
+                time.sleep(self._market_closed_sleep_seconds)
+                # Don't ACK if market is closed
+                return
+            else:
+                self._market_closed_logged = False
+            
+            # 🎯 CONFIDENCE FILTER
+            if confidence < self.confidence_threshold:
+                self.logger.debug(f"🚫 LOW CONFIDENCE: Skipping {symbol} {pattern} (confidence: {confidence:.2f} < {self.confidence_threshold})")
+                # ACK low confidence alerts to avoid reprocessing
+                stream_client.xack(stream_name, group_name, message_id)
+                return
+            
+            # Check cooldown before processing
+            if not self._check_symbol_cooldown(symbol):
+                self.logger.info(f"🚫 COOLDOWN: Skipping alert for {symbol} - still in cooldown period")
+                # ACK cooldown alerts to avoid reprocessing
+                stream_client.xack(stream_name, group_name, message_id)
+                return
+            
+            self.logger.info(f"✅ HIGH CONFIDENCE ALERT: {symbol} {pattern} (confidence: {confidence:.2f})")
+            
+            # Convert alert data to validator format
+            validator_alert = self._convert_alert_format(alert_data)
+
+            if self.forward_enabled:
+                state = self._schedule_forward_validation(validator_alert)
+                if state:
+                    self.logger.info(
+                        "🗓️ Scheduled forward validation for %s %s across %d windows",
+                        symbol,
+                        pattern,
+                        len(self.forward_windows),
+                    )
+                    # ACK after successful scheduling
+                    stream_client.xack(stream_name, group_name, message_id)
+                else:
+                    self.logger.warning(
+                        "⚠️ Failed to schedule forward validation for %s %s, "
+                        "falling back to immediate processing",
+                        symbol,
+                        pattern,
+                    )
+                    result = self.process_alert_with_expected_move(validator_alert)
+                    self._post_process_validation_result(result)
+                    # ACK after processing
+                    stream_client.xack(stream_name, group_name, message_id)
+            else:
+                # Legacy immediate validation flow
+                result = self.process_alert_with_expected_move(validator_alert)
+                self._post_process_validation_result(result)
+                # ACK after processing
+                stream_client.xack(stream_name, group_name, message_id)
+            
+            # Update cooldown for this symbol
+            self._update_symbol_cooldown(symbol)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error processing alert from stream: {e}")
+            # Don't ACK on error - message will be retried
+            raise
     
     def _post_process_validation_result(self, result: Dict):
         """Persist and publish a completed validation result."""
@@ -1676,9 +2347,66 @@ class AlertValidator:
                 "window_minutes": window_minutes,
             }
 
-        current_price = self.redis.get_last_price(symbol)
+        # ✅ FIXED: Try original symbol first (for FNO options/futures that have tick streams)
+        # Then fall back to underlying symbol for indices
+        current_price = None
+        
+        # Priority 1: Try original symbol (works for options/futures with tick streams)
+        try:
+            current_price = self.redis.get_last_price(symbol)
+        except Exception:
+            pass
+        
+        # Priority 2: Try underlying symbol (for indices like BANKNIFTY, NIFTY)
         if current_price is None:
-            return None
+            underlying_symbol = self._get_underlying_symbol(symbol)
+            try:
+                current_price = self.redis.get_last_price(underlying_symbol)
+            except Exception:
+                pass
+        
+        # Priority 3: For options, try corresponding futures contract (e.g., BANKNIFTY25NOVFUT)
+        if current_price is None and ('CE' in symbol or 'PE' in symbol):
+            # Try to construct futures contract symbol
+            futures_symbol = symbol.replace('CE', 'FUT').replace('PE', 'FUT')
+            if futures_symbol != symbol:
+                try:
+                    current_price = self.redis.get_last_price(futures_symbol)
+                except Exception:
+                    pass
+        
+        # Fallback 1: Try last candle close
+        if current_price is None:
+            try:
+                candle = getattr(self.redis, "get_last_candle", None)
+                if callable(candle):
+                    c = candle(underlying_symbol)
+                    if c and isinstance(c, dict):
+                        for key in ("close", "last_price", "price"):
+                            if key in c and c[key] is not None:
+                                current_price = float(c[key])
+                                break
+            except Exception:
+                pass
+        
+        # Fallback 2: Try last trade tick
+        if current_price is None:
+            try:
+                tick = getattr(self.redis, "get_last_trade", None)
+                if callable(tick):
+                    t = tick(underlying_symbol)
+                    if t and isinstance(t, dict) and t.get("price") is not None:
+                        current_price = float(t["price"])
+            except Exception:
+                pass
+        
+        # If still no price, return INCONCLUSIVE to avoid infinite retry loops
+        if current_price is None:
+            return {
+                "status": "INCONCLUSIVE",
+                "reason": "PRICE_UNAVAILABLE",
+                "window_minutes": window_minutes,
+            }
 
         current_price = float(current_price)
         pct_change = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0.0

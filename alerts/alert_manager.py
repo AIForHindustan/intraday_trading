@@ -1234,6 +1234,18 @@ class AlertManager:
 
 class EnhancedAlertManager(AlertManager):
     """Alert manager with conflict resolution and pattern-specific thresholds."""
+    
+    def __init__(self, *args, **kwargs):
+        """Initialize with indicator caching support."""
+        super().__init__(*args, **kwargs)
+        
+        # ✅ SMART CACHING: In-memory indicator cache matching HybridCalculations
+        self._indicator_cache = {}  # {symbol: {indicator_name: {timestamp, value}}}
+        self._cache_ttl = 300  # 5 minutes TTL (matches HybridCalculations)
+        self._cache_lock = threading.Lock()
+        self._cache_max_size = 1000  # Max cache entries
+        self._cache_hits = 0
+        self._cache_misses = 0
 
     INDICATOR_FIELDS: List[str] = [
         "rsi",
@@ -1516,7 +1528,284 @@ class EnhancedAlertManager(AlertManager):
             logger.error(f"❌ [INDICATOR_COMPOSE] Error for {symbol}: {e}")
             existing = alert_data.get("indicators") or {}
             return existing if isinstance(existing, dict) else {}
-
+    
+    def _get_cached_indicator(self, symbol: str, indicator_name: str) -> Optional[Any]:
+        """Get cached indicator if available and not expired."""
+        with self._cache_lock:
+            if symbol in self._indicator_cache:
+                symbol_cache = self._indicator_cache[symbol]
+                if indicator_name in symbol_cache:
+                    cached = symbol_cache[indicator_name]
+                    if time.time() - cached['timestamp'] < self._cache_ttl:
+                        self._cache_hits += 1
+                        return cached['value']
+            self._cache_misses += 1
+            return None
+    
+    def _cache_indicator(self, symbol: str, indicator_name: str, value: Any):
+        """Cache indicator value with timestamp."""
+        with self._cache_lock:
+            # Enforce cache size bounds
+            if len(self._indicator_cache) >= self._cache_max_size:
+                # Remove oldest entry
+                oldest_symbol = min(self._indicator_cache.keys(), 
+                                  key=lambda k: min(
+                                      [x.get('timestamp', 0) if isinstance(x, dict) else 0 
+                                       for x in (self._indicator_cache.get(k).values() 
+                                                if isinstance(self._indicator_cache.get(k), dict) else [])] or [0]
+                                  ))
+                del self._indicator_cache[oldest_symbol]
+            
+            if symbol not in self._indicator_cache:
+                self._indicator_cache[symbol] = {}
+            
+            self._indicator_cache[symbol][indicator_name] = {
+                'timestamp': time.time(),
+                'value': value
+            }
+    
+    def _fetch_basic_indicators_from_redis(self, symbol: str) -> Dict[str, Any]:
+        """
+        ✅ SMART CACHING: Fetch indicators from Redis with in-memory cache.
+        Checks cache first, then Redis (DB 5 → DB 1 → DB 4), then caches result.
+        
+        Redis Storage Schema:
+        - DB 5 (primary per user): indicators:{symbol}:{indicator_name} via analysis_cache data type
+        - DB 1 (realtime): indicators:{symbol}:{indicator_name} via analysis_cache data type (fallback)
+        - DB 4 (fallback): Additional indicator storage
+        - Format: Simple indicators (RSI, EMA, ATR, VWAP) stored as string/number
+                  Complex indicators (MACD, BB) stored as JSON with {'value': {...}, 'timestamp': ..., 'symbol': ...}
+        """
+        indicators = {}
+        if not self.redis_client:
+            return indicators
+        
+        try:
+            # ✅ SMART CACHING: Check cache first for each indicator
+            indicator_names = [
+                'rsi', 'atr', 'vwap', 'volume_ratio', 'price_change',
+                'ema_5', 'ema_10', 'ema_20', 'ema_50', 'ema_100', 'ema_200',
+                'macd', 'bollinger_bands', 'volume_profile',
+            ]
+            
+            # Try cache first
+            cached_indicators = {}
+            for indicator_name in indicator_names:
+                cached_value = self._get_cached_indicator(symbol, indicator_name)
+                if cached_value is not None:
+                    cached_indicators[indicator_name] = cached_value
+            
+            # If all indicators found in cache, return immediately
+            if len(cached_indicators) == len(indicator_names):
+                return cached_indicators
+            
+            # Get Redis clients for DB 5 (primary), DB 1 (fallback), DB 4 (fallback)
+            redis_db5 = self.redis_client.get_client(5) if hasattr(self.redis_client, 'get_client') else None
+            redis_db1 = self.redis_client.get_client(1) if hasattr(self.redis_client, 'get_client') else self.redis_client
+            redis_db4 = self.redis_client.get_client(4) if hasattr(self.redis_client, 'get_client') else None
+            
+            # ✅ PRIORITY: Check DB 5 first (user confirmed indicators are in DB 5)
+            redis_clients = []
+            if redis_db5:
+                redis_clients.append(('DB5', redis_db5))
+            redis_clients.append(('DB1', redis_db1))
+            if redis_db4:
+                redis_clients.append(('DB4', redis_db4))
+            
+            # Normalize symbol for Redis key lookup (same variants as dashboard)
+            symbol_variants = [
+                symbol,
+                symbol.split(':')[-1] if ':' in symbol else symbol,
+                f"NFO:{symbol.split(':')[-1]}" if ':' not in symbol and ('NIFTY' in symbol.upper() or 'BANKNIFTY' in symbol.upper()) else symbol,
+                f"NSE:{symbol.split(':')[-1]}" if ':' not in symbol else symbol,
+            ]
+            
+            # Merge cached indicators into result
+            indicators.update(cached_indicators)
+            
+            # Fetch missing indicators from Redis (check DB 5 → DB 1 → DB 4)
+            missing_indicator_names = [name for name in indicator_names if name not in cached_indicators]
+            
+            for variant in symbol_variants:
+                found_any = False
+                for indicator_name in missing_indicator_names:
+                    redis_key = f"indicators:{variant}:{indicator_name}"
+                    
+                    # Try each Redis DB in priority order (DB 5 → DB 1 → DB 4)
+                    value = None
+                    for db_name, redis_client in redis_clients:
+                        try:
+                            # Try retrieve_by_data_type first (matches scanner storage)
+                            if hasattr(redis_client, 'retrieve_by_data_type'):
+                                try:
+                                    value = redis_client.retrieve_by_data_type(redis_key, "analysis_cache")
+                                    if value:
+                                        break
+                                except Exception:
+                                    pass
+                            
+                            # Fallback to direct GET
+                            if not value:
+                                try:
+                                    value = redis_client.get(redis_key)
+                                    if value:
+                                        break
+                                except Exception:
+                                    continue
+                        except Exception as e:
+                            logger.debug(f"Error checking {db_name} for {redis_key}: {e}")
+                            continue
+                    
+                    if value:
+                        try:
+                            # Handle bytes response
+                            if isinstance(value, bytes):
+                                value = value.decode('utf-8')
+                            
+                            # Try parsing as JSON first (for complex indicators)
+                            try:
+                                parsed = json.loads(value)
+                                if isinstance(parsed, dict):
+                                    # Check for nested structure with 'value' field (from redis_storage)
+                                    if 'value' in parsed:
+                                        # For MACD, extract the macd value from the dict
+                                        if indicator_name == 'macd' and isinstance(parsed['value'], dict):
+                                            indicator_value = parsed['value'].get('macd') or parsed['value']
+                                        else:
+                                            indicator_value = parsed['value']
+                                    else:
+                                        indicator_value = parsed
+                                else:
+                                    indicator_value = parsed
+                                
+                                indicators[indicator_name] = indicator_value
+                                # ✅ SMART CACHING: Cache the fetched indicator
+                                self._cache_indicator(symbol, indicator_name, indicator_value)
+                                found_any = True
+                            except (json.JSONDecodeError, TypeError):
+                                # Simple numeric/string value (RSI, EMA, ATR, VWAP, etc.)
+                                try:
+                                    indicator_value = float(value)
+                                except (ValueError, TypeError):
+                                    indicator_value = value
+                                
+                                indicators[indicator_name] = indicator_value
+                                # ✅ SMART CACHING: Cache the fetched indicator
+                                self._cache_indicator(symbol, indicator_name, indicator_value)
+                                found_any = True
+                        except Exception as e:
+                            logger.debug(f"Error parsing indicator {indicator_name} for {variant}: {e}")
+                
+                if found_any:
+                    break  # Found indicators for this variant
+            
+            # Merge cached indicators back in (in case we missed some)
+            indicators.update(cached_indicators)
+            
+            if indicators:
+                logger.debug(f"✅ Loaded {len(indicators)} indicators from Redis for {symbol}: {list(indicators.keys())[:5]}")
+            else:
+                logger.debug(f"⚠️ No indicators found in Redis for {symbol}")
+        
+        except Exception as e:
+            logger.debug(f"Error fetching indicators from Redis for {symbol}: {e}")
+        
+        return indicators
+    
+    def _fetch_greeks_from_redis(self, symbol: str) -> Dict[str, Any]:
+        """
+        Fetch Options Greeks from Redis using the same logic as dashboard.
+        This ensures alert payloads are enriched with real-time Greeks for option symbols.
+        
+        Redis Storage Schema:
+        - DB 1 (realtime): indicators:{symbol}:greeks (combined dict) and indicators:{symbol}:{greek} (individual)
+        - Format: Combined stored as JSON with {'value': {'delta': ..., 'gamma': ..., ...}, 'timestamp': ..., 'symbol': ...}
+                  Individual Greeks stored as string/number
+        - Calculated by: EnhancedGreekCalculator.black_scholes_greeks() using scipy.stats.norm (pure Python)
+        """
+        greeks = {}
+        if not self.redis_client:
+            return greeks
+        
+        try:
+            # Get Redis client for DB 1 (realtime)
+            redis_client = self.redis_client.get_client(1) if hasattr(self.redis_client, 'get_client') else self.redis_client
+            
+            # Normalize symbol for Redis key lookup (same variants as dashboard)
+            symbol_variants = [
+                symbol,
+                symbol.split(':')[-1] if ':' in symbol else symbol,
+                f"NFO:{symbol.split(':')[-1]}" if ':' not in symbol and ('NIFTY' in symbol.upper() or 'BANKNIFTY' in symbol.upper()) else symbol,
+                f"NSE:{symbol.split(':')[-1]}" if ':' not in symbol else symbol,
+            ]
+            
+            # Greek fields to fetch
+            greek_names = ['delta', 'gamma', 'theta', 'vega', 'rho']
+            
+            # Try each symbol variant
+            for variant in symbol_variants:
+                # Try combined greeks first (preferred format)
+                greeks_key = f"indicators:{variant}:greeks"
+                try:
+                    greeks_data = redis_client.get(greeks_key)
+                    if greeks_data:
+                        if isinstance(greeks_data, bytes):
+                            greeks_data = greeks_data.decode('utf-8')
+                        
+                        # Parse JSON if string
+                        parsed = json.loads(greeks_data) if isinstance(greeks_data, str) else greeks_data
+                        
+                        if isinstance(parsed, dict):
+                            # Extract from nested 'value' field (from redis_storage format)
+                            if 'value' in parsed and isinstance(parsed['value'], dict):
+                                greeks.update(parsed['value'])
+                            else:
+                                # Direct greeks dict
+                                greeks.update(parsed)
+                            break  # Found combined greeks, no need to try individual
+                except Exception as e:
+                    logger.debug(f"Error getting combined Greeks for {variant}: {e}")
+                
+                # Try individual Greeks if combined not found
+                found_any = False
+                for greek_name in greek_names:
+                    greek_key = f"indicators:{variant}:{greek_name}"
+                    try:
+                        greek_value = redis_client.get(greek_key)
+                        if greek_value:
+                            if isinstance(greek_value, bytes):
+                                greek_value = greek_value.decode('utf-8')
+                            
+                            # Try to parse as float
+                            try:
+                                greeks[greek_name] = float(greek_value)
+                            except (ValueError, TypeError):
+                                # If not a number, try JSON parsing
+                                try:
+                                    parsed = json.loads(greek_value) if isinstance(greek_value, str) else greek_value
+                                    if isinstance(parsed, dict) and 'value' in parsed:
+                                        greeks[greek_name] = parsed['value']
+                                    else:
+                                        greeks[greek_name] = parsed
+                                except (json.JSONDecodeError, TypeError):
+                                    greeks[greek_name] = greek_value
+                            found_any = True
+                    except Exception as e:
+                        logger.debug(f"Error getting {greek_name} for {variant}: {e}")
+                
+                if found_any or greeks:
+                    break  # Found Greeks for this variant
+            
+            if greeks:
+                logger.debug(f"✅ Loaded Greeks from Redis for {symbol}: {list(greeks.keys())}")
+            else:
+                logger.debug(f"⚠️ No Greeks found in Redis for {symbol}")
+        
+        except Exception as e:
+            logger.debug(f"Error fetching Greeks from Redis for {symbol}: {e}")
+        
+        return greeks
+    
     def _attach_market_context(self, alert_data: Dict[str, Any]) -> None:
         """Include VIX context in alert data for downstream consumers."""
         if not isinstance(alert_data, dict):
@@ -1874,6 +2163,20 @@ class EnhancedAlertManager(AlertManager):
                     for key in ("rsi", "atr", "volume_ratio", "price_change", "ema_20", "ema_50", "vwap"):
                         if key in merged_indicators and not self._has_meaningful_value(alert.get(key)):
                             alert[key] = merged_indicators[key]
+                
+                # Fetch Greeks for option symbols
+                is_option = any(x in symbol.upper() for x in ['CE', 'PE']) or 'NFO:' in symbol.upper()
+                if is_option:
+                    greeks_snapshot = self._fetch_greeks_from_redis(symbol)
+                    if greeks_snapshot:
+                        existing_greeks = alert.get('greeks') if isinstance(alert.get('greeks'), dict) else {}
+                        merged_greeks = {**existing_greeks, **greeks_snapshot}
+                        alert['greeks'] = merged_greeks
+                        
+                        # Also add individual Greek fields to top level for dashboard compatibility
+                        for key in ("delta", "gamma", "theta", "vega", "rho"):
+                            if key in merged_greeks and not self._has_meaningful_value(alert.get(key)):
+                                alert[key] = merged_greeks[key]
 
                 self._ensure_pattern_metadata(alert)
                 self._ensure_news_context(alert)
@@ -2007,6 +2310,20 @@ class ProductionAlertManager(EnhancedAlertManager):
             for key in ("rsi", "atr", "volume_ratio", "price_change", "ema_20", "ema_50", "vwap"):
                 if key in merged_indicators and not self._has_meaningful_value(pattern.get(key)):
                     pattern[key] = merged_indicators[key]
+
+        # Fetch Greeks for option symbols
+        is_option = any(x in symbol.upper() for x in ['CE', 'PE']) or 'NFO:' in symbol.upper()
+        if is_option:
+            greeks_snapshot = self._fetch_greeks_from_redis(symbol)
+            if greeks_snapshot:
+                existing_greeks = pattern.get("greeks") if isinstance(pattern.get("greeks"), dict) else {}
+                merged_greeks = {**existing_greeks, **greeks_snapshot}
+                pattern["greeks"] = merged_greeks
+                
+                # Also add individual Greek fields to top level for dashboard compatibility
+                for key in ("delta", "gamma", "theta", "vega", "rho"):
+                    if key in merged_greeks and not self._has_meaningful_value(pattern.get(key)):
+                        pattern[key] = merged_greeks[key]
 
         self._ensure_news_context(pattern)
         self._attach_market_context(pattern)

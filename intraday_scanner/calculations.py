@@ -155,9 +155,15 @@ except ImportError as e:
 try:
     import pandas_market_calendars as mcal
     from scipy.stats import norm
+    # Use py_vollib for standardized Greek calculations
+    from py_vollib.black_scholes.greeks.analytical import (
+        delta, gamma, theta, vega, rho
+    )
+    PY_VOLLIB_AVAILABLE = True
     GREEK_CALCULATIONS_AVAILABLE = True
-    logger.info("✅ Greek calculation libraries loaded successfully")
+    logger.info("✅ Greek calculation libraries loaded successfully (py_vollib + scipy)")
 except ImportError as e:
+    PY_VOLLIB_AVAILABLE = False
     GREEK_CALCULATIONS_AVAILABLE = False
     logger.warning(f"⚠️ Greek calculation libraries not available: {e}")
 
@@ -185,9 +191,7 @@ class HybridCalculations:
         self.max_cache_size = max_cache_size
         self.max_batch_size = max_batch_size
         self.rolling_windows = {}  # symbol -> DataFrame
-        self.cache = {}
-        self.cache_hits = 0
-        self.cache_misses = 0
+        self.cache = {}  # Legacy cache (kept for backward compatibility)
         
         # ✅ FIXED: Initialize missing attributes that were causing errors
         self._symbol_windows = {}  # symbol -> rolling window data
@@ -212,17 +216,15 @@ class HybridCalculations:
             'ema_200': CircularEMA(200)
         }
         
-        self._calculation_cache = {}  # calculation results cache
-        self._polars_cache = {}  # Polars DataFrame cache
+        self._polars_cache = {}  # Polars DataFrame cache (for DataFrame reuse)
         self._window_size = 100  # Default rolling window size
-        self._cache_hits = 0
-        self._cache_misses = 0
         
-        # ✅ CACHED INDICATORS: LRU cache with TTL for indicator calculations
-        self._indicator_cache = {}  # {symbol: {indicator_type: {timestamp, value}}}
+        # ✅ SIMPLIFIED CACHING: Single unified cache with TTL (replaces redundant layers)
+        self._cache = {}  # {symbol_indicators: {data, timestamp, data_hash}}
         self._cache_ttl = 300  # 5 minutes TTL
-        self._cache_lock = __import__('threading').Lock()
-        self._cache_max_size = 1000  # Max cache entries
+        self._last_calculation_time = {}  # Track when each symbol was last calculated
+        self._fresh_calculations = set()  # Track which symbols had fresh calculations (not cached)
+        
         self._volume_calculator = None  # Lazy-initialized CorrectVolumeCalculator
 
     def _get_volume_calculator(self) -> CorrectVolumeCalculator:
@@ -276,11 +278,6 @@ class HybridCalculations:
     def calculate_atr(self, highs: List[float], lows: List[float], 
                      closes: List[float], period: int = 14, symbol: str = None) -> float:
         """ATR using pure Python libraries (pandas/pandas_ta preferred) with TA-Lib fallback"""
-        # ✅ CACHED INDICATORS: Check in-memory cache first (5 min TTL)
-        if symbol:
-            cached = self._get_cached_indicators(symbol, 'atr', closes)
-            if cached is not None:
-                return cached
         
         # First try Redis fallback
         if hasattr(self, 'redis_client') and self.redis_client:
@@ -525,61 +522,30 @@ class HybridCalculations:
             'ema_200': self.update_ema_for_tick(symbol, price, 200)
         }
     
-    def _get_cached_indicators(self, symbol: str, indicator_type: str, price_series: list = None, volume_series: list = None):
-        """Get cached indicator or calculate new one"""
-        cache_key = f"{symbol}_{indicator_type}"
+    def _should_recalculate(self, symbol: str, current_time: float, new_data: List[Dict]) -> bool:
+        """Determine if we need fresh calculations (not from cache)"""
+        cache_key = f"{symbol}_indicators"
         
-        with self._cache_lock:
-            if symbol in self._indicator_cache:
-                symbol_cache = self._indicator_cache[symbol]
-                if indicator_type in symbol_cache:
-                    cached = symbol_cache[indicator_type]
-                    if time.time() - cached['timestamp'] < self._cache_ttl:
-                        self._cache_hits += 1
-                        return cached['value']
-            
-            self._cache_misses += 1
-            
-            # Calculate and cache the indicator
-            if indicator_type == 'rsi':
-                value = self.calculate_rsi(price_series or [], 14) if price_series else 50.0
-            elif indicator_type == 'atr':
-                highs = price_series or []
-                lows = price_series or []
-                closes = price_series or []
-                value = self.calculate_atr(highs, lows, closes, 14) if len(closes) >= 14 else 0.0
-            elif indicator_type == 'vwap':
-                value = self._calculate_vwap_from_series(price_series, volume_series) if price_series and volume_series else 0.0
-            else:
-                value = None
-            
-            if value is not None:
-                # Ensure cache doesn't exceed max size
-                if len(self._indicator_cache) >= self._cache_max_size:
-                    # Remove oldest entry
-                    oldest_symbol = min(self._indicator_cache.keys(), 
-                                      key=lambda k: min(
-                                          [x.get('timestamp', 0) if isinstance(x, dict) else 0 for x in (self._indicator_cache.get(k).values() if isinstance(self._indicator_cache.get(k), dict) else [])] or [0]
-                                      ))
-                    del self._indicator_cache[oldest_symbol]
-                
-                if symbol not in self._indicator_cache:
-                    self._indicator_cache[symbol] = {}
-                
-                self._indicator_cache[symbol][indicator_type] = {
-                    'timestamp': time.time(),
-                    'value': value
-                }
-            
-            return value
+        # No cache? Recalculate
+        if cache_key not in self._cache:
+            return True
+        
+        cached = self._cache[cache_key]
+        
+        # Time expired? Recalculate
+        if current_time - cached['timestamp'] >= self._cache_ttl:
+            return True
+        
+        # Data changed significantly? Recalculate
+        new_hash = hash(str(new_data))
+        if new_hash != cached['data_hash']:
+            return True
+        
+        # Otherwise use cache
+        return False
     
     def calculate_rsi(self, prices: List[float], period: int = 14, symbol: str = None) -> float:
         """RSI using TA-Lib (preferred) with Polars fallback and Redis caching"""
-        # ✅ CACHED INDICATORS: Check in-memory cache first (5 min TTL)
-        if symbol:
-            cached = self._get_cached_indicators(symbol, 'rsi', prices)
-            if cached is not None:
-                return cached
         
         # First try Redis fallback
         if hasattr(self, 'redis_client') and self.redis_client:
@@ -727,17 +693,20 @@ class HybridCalculations:
                 return {}
             
             # Create last_price bins and aggregate bucket_incremental_volume using Zerodha field names
+            # NOTE: This is for display visualization only - POC/VA calculation is done by VolumeProfileManager
+            # Use bucket_incremental_volume (not cumulative) for correct bin aggregation
             min_price, max_price = df['last_price'].min(), df['last_price'].max()
             
             if min_price == max_price:
-                return {'bins': [min_price], 'volumes': [df['zerodha_cumulative_volume'].sum()]}
+                # For single price level, use bucket_incremental_volume
+                return {'bins': [min_price], 'volumes': [df['bucket_incremental_volume'].sum()]}
             
             bin_size = (max_price - min_price) / price_bins
             
             volume_profile = df.with_columns([
                 ((pl.col('last_price') - min_price) / bin_size).floor().cast(pl.Int64).alias('bin')
             ]).group_by('bin').agg([
-                pl.col('zerodha_cumulative_volume').sum().alias('total_volume'),
+                pl.col('bucket_incremental_volume').sum().alias('total_volume'),  # ✅ FIXED: Use incremental volume
                 pl.col('last_price').mean().alias('avg_price')
             ]).sort('bin')
             
@@ -1098,9 +1067,41 @@ class HybridCalculations:
             if redis_price and redis_price > 0:
                 last_price = redis_price
         
-        # ✅ FAST EMA CALCULATIONS: Use ultra-fast EMA methods for batch processing
-        current_price = prices[-1] if prices else 0.0
-        fast_emas = self.get_all_emas_fast(symbol or "BATCH", current_price)
+        # ✅ STANDARDIZED EMA CALCULATIONS: Use price series for proper EMA calculation
+        # ❌ FIXED: Previous code used shared global EMA instances with single price - caused contamination
+        # ✅ NOW: Calculate EMAs from actual price series using proper Polars/Numpy methods
+        if not prices or len(prices) == 0:
+            # No price data, return default EMAs
+            ema_5 = ema_10 = ema_20 = ema_50 = ema_100 = ema_200 = last_price
+        else:
+            # Calculate EMAs from actual price series (batch calculation)
+            # Use Polars for vectorized EMA calculation
+            try:
+                price_series = pl.Series('price', prices)
+                ema_5 = float(price_series.ewm_mean(span=5).tail(1)[0]) if len(prices) >= 5 else float(prices[-1])
+                ema_10 = float(price_series.ewm_mean(span=10).tail(1)[0]) if len(prices) >= 10 else float(prices[-1])
+                ema_20 = float(price_series.ewm_mean(span=20).tail(1)[0]) if len(prices) >= 20 else float(prices[-1])
+                ema_50 = float(price_series.ewm_mean(span=50).tail(1)[0]) if len(prices) >= 50 else float(prices[-1])
+                ema_100 = float(price_series.ewm_mean(span=100).tail(1)[0]) if len(prices) >= 100 else float(prices[-1])
+                ema_200 = float(price_series.ewm_mean(span=200).tail(1)[0]) if len(prices) >= 200 else float(prices[-1])
+            except Exception as e:
+                logger.debug(f"Polars EMA calculation failed for {symbol}, using fallback: {e}")
+                # Fallback: Use calculate_ema for each period
+                ema_5 = self.calculate_ema(prices, 5)
+                ema_10 = self.calculate_ema(prices, 10)
+                ema_20 = self.calculate_ema(prices, 20)
+                ema_50 = self.calculate_ema(prices, 50)
+                ema_100 = self.calculate_ema(prices, 100)
+                ema_200 = self.calculate_ema(prices, 200)
+        
+        fast_emas = {
+            'ema_5': ema_5,
+            'ema_10': ema_10,
+            'ema_20': ema_20,
+            'ema_50': ema_50,
+            'ema_100': ema_100,
+            'ema_200': ema_200
+        }
         
         # Calculate all indicators in batch using TA-Lib (preferred) with Redis fallback
         last_tick = tick_data[-1] if tick_data else {}
@@ -1143,6 +1144,25 @@ class HybridCalculations:
             'price_change': self.calculate_price_change(prices[-1] if prices else 0, 
                                                       prices[-2] if len(prices) > 1 else 0)
         }
+        
+        # 🎯 ADD GREEK CALCULATIONS FOR F&O OPTIONS (same as process_tick)
+        if symbol and self._is_option_symbol(symbol) and GREEK_CALCULATIONS_AVAILABLE:
+            try:
+                # Use last tick for Greek calculations
+                greeks = greek_calculator.calculate_greeks_for_tick_data(last_tick)
+                if greeks and any(greeks.get(greek, 0) != 0 for greek in ['delta', 'gamma', 'theta', 'vega', 'rho']):
+                    indicators.update({
+                        'delta': greeks.get('delta', 0.0),
+                        'gamma': greeks.get('gamma', 0.0),
+                        'theta': greeks.get('theta', 0.0),
+                        'vega': greeks.get('vega', 0.0),
+                        'rho': greeks.get('rho', 0.0),
+                        'dte_years': greeks.get('dte_years', 0.0),
+                        'trading_dte': greeks.get('trading_dte', 0),
+                        'expiry_series': greeks.get('expiry_series', 'UNKNOWN')
+                    })
+            except Exception as e:
+                logger.debug(f"Greek calculation failed in batch for {symbol}: {e}")
         
         return indicators
     
@@ -1352,10 +1372,9 @@ class HybridCalculations:
     def clear_cache(self):
         """Clear calculation cache"""
         self._polars_cache.clear()
-        self._calculation_cache.clear()
+        self._cache.clear()  # ✅ SIMPLIFIED: Clear unified cache
         self._symbol_windows.clear()
-        self._cache_hits = 0
-        self._cache_misses = 0
+        self._fresh_calculations.clear()
     
     def get_rolling_window_stats(self) -> Dict:
         """Get statistics about rolling windows"""
@@ -1397,10 +1416,8 @@ class HybridCalculations:
         """Get cache statistics"""
         return {
             'polars_cache_size': len(self._polars_cache),
-            'calculation_cache_size': len(self._calculation_cache),
-            'cache_hits': self._cache_hits,
-            'cache_misses': self._cache_misses,
-            'hit_rate': self._cache_hits / (self._cache_hits + self._cache_misses) if (self._cache_hits + self._cache_misses) > 0 else 0,
+            'indicator_cache_size': len(self._cache),
+            'fresh_calculations_count': len(self._fresh_calculations),
             'polars_available': POLARS_AVAILABLE,
             'pandas_available': PANDAS_AVAILABLE,
             'numpy_available': NUMPY_AVAILABLE
@@ -1408,6 +1425,7 @@ class HybridCalculations:
     
     def _enforce_cache_bounds(self):
         """Enforce cache size bounds using LRU eviction"""
+        # ✅ SIMPLIFIED: Only enforce bounds on unified cache and Polars cache
         if len(self._polars_cache) > self.max_cache_size:
             # Remove oldest entries (simple LRU)
             excess = len(self._polars_cache) - self.max_cache_size
@@ -1415,16 +1433,21 @@ class HybridCalculations:
             for key in keys_to_remove:
                 del self._polars_cache[key]
         
-        if len(self._calculation_cache) > self.max_cache_size:
-            # Remove oldest entries (simple LRU)
-            excess = len(self._calculation_cache) - self.max_cache_size
-            keys_to_remove = list(self._calculation_cache.keys())[:excess]
+        # Enforce bounds on unified indicator cache
+        if len(self._cache) > self.max_cache_size:
+            # Remove oldest entries (simple LRU based on timestamp)
+            excess = len(self._cache) - self.max_cache_size
+            # Sort by timestamp and remove oldest
+            sorted_keys = sorted(self._cache.keys(), 
+                               key=lambda k: self._cache[k].get('timestamp', 0))
+            keys_to_remove = sorted_keys[:excess]
             for key in keys_to_remove:
-                del self._calculation_cache[key]
+                del self._cache[key]
     
     def batch_process_symbols(self, symbol_data: Dict[str, List[Dict]], max_ticks_per_symbol: int = 50) -> Dict[str, Dict]:
         """
-        Process multiple symbols in bounded batch using Polars
+        ✅ SIMPLIFIED CACHING: Process symbols with intelligent caching.
+        Only recalculates when cache expired or data changed significantly.
         
         Args:
             symbol_data: Dict mapping symbol -> list of tick data
@@ -1441,81 +1464,78 @@ class HybridCalculations:
             logger.warning(f"Batch size {len(symbol_data)} exceeds max {self.max_batch_size}, truncating")
             symbol_data = dict(list(symbol_data.items())[:self.max_batch_size])
         
+        # ✅ SIMPLIFIED CACHING: Track fresh calculations
+        self._fresh_calculations.clear()
+        current_time = time.time()
+        results = {}
+        
         # Prepare bounded data for all symbols
-        batch_data = []
         for symbol, ticks in symbol_data.items():
             # Limit ticks per symbol to prevent memory bloat
             limited_ticks = ticks[-max_ticks_per_symbol:] if len(ticks) > max_ticks_per_symbol else ticks
             
-            for tick in limited_ticks:
-                batch_data.append({
-                    'symbol': symbol,
-                    'last_price': tick.get('last_price', 0.0),
-                    'zerodha_cumulative_volume': tick.get('zerodha_cumulative_volume', 0.0),
-                    'high': tick.get('high', 0.0),
-                    'low': tick.get('low', 0.0),
-                    'timestamp': tick.get('exchange_timestamp_ms', 0)
-                })
-        
-        if not batch_data:
-            return {}
-        
-        try:
-            # Create single DataFrame for all symbols
-            df = pl.DataFrame(batch_data)
+            cache_key = f"{symbol}_indicators"
             
-            # Group by symbol and aggregate data
-            symbol_groups = df.group_by('symbol').agg([
-                pl.col('last_price').tail(50).alias('prices'),
-                pl.col('zerodha_cumulative_volume').tail(50).alias('volumes'),
-                pl.col('high').tail(50).alias('highs'),
-                pl.col('low').tail(50).alias('lows'),
-                pl.col('timestamp').tail(50).alias('timestamps')
-            ])
+            # ✅ SIMPLIFIED CACHING: Check if we should recalculate
+            should_recalculate = self._should_recalculate(symbol, current_time, limited_ticks)
             
-            # Process each symbol group
-            results = {}
-            for row in symbol_groups.rows():
-                symbol, prices, volumes, highs, lows, timestamps = row
-                
-                # Check cache first
-                cache_key = f"{symbol}_{hash(str(prices))}"
-                if cache_key in self._calculation_cache:
-                    self._cache_hits += 1
-                    results[symbol] = self._calculation_cache[cache_key]
-                    continue
-                
-                self._cache_misses += 1
-                
-                # Minimum data requirement
-                if len(prices) < 20:
+            if should_recalculate:
+                # Calculate fresh indicators
+                if len(limited_ticks) < 20:
                     results[symbol] = {}
                     continue
                 
-                # Calculate indicators for this symbol
-                tick_data = [
-                    {
-                        'last_price': p,
-                        'zerodha_cumulative_volume': v,
-                        'high': h,
-                        'low': l,
-                        'exchange_timestamp_ms': t
-                    } for p, v, h, l, t in zip(prices, volumes, highs, lows, timestamps)
-                ]
-                
-                indicators = self.batch_calculate_indicators(tick_data, symbol)
-                
-                # Cache results with bounds enforcement
-                self._calculation_cache[cache_key] = indicators
-                self._enforce_cache_bounds()
-                
-                results[symbol] = indicators
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Batch processing error: {e}")
-            return self._fallback_batch_process_symbols(symbol_data, max_ticks_per_symbol)
+                try:
+                    # Convert to Polars DataFrame for processing
+                    batch_data = []
+                    for tick in limited_ticks:
+                        batch_data.append({
+                            'symbol': symbol,
+                            'last_price': tick.get('last_price', 0.0),
+                            'zerodha_cumulative_volume': tick.get('zerodha_cumulative_volume', 0.0),
+                            'high': tick.get('high', 0.0),
+                            'low': tick.get('low', 0.0),
+                            'timestamp': tick.get('exchange_timestamp_ms', 0)
+                        })
+                    
+                    if batch_data:
+                        df = pl.DataFrame(batch_data)
+                        prices = df['last_price'].to_list()
+                        volumes = df['zerodha_cumulative_volume'].to_list()
+                        highs = df['high'].to_list()
+                        lows = df['low'].to_list()
+                        
+                        tick_data = [
+                            {
+                                'last_price': p,
+                                'zerodha_cumulative_volume': v,
+                                'high': h,
+                                'low': l,
+                                'exchange_timestamp_ms': t
+                            } for p, v, h, l, t in zip(prices, volumes, highs, lows, df['timestamp'].to_list())
+                        ]
+                        
+                        indicators = self.batch_calculate_indicators(tick_data, symbol)
+                        results[symbol] = indicators
+                        
+                        # ✅ SIMPLIFIED CACHING: Update cache with fresh calculation
+                        self._cache[cache_key] = {
+                            'data': indicators,
+                            'timestamp': current_time,
+                            'data_hash': hash(str(limited_ticks))
+                        }
+                        self._last_calculation_time[symbol] = current_time
+                        self._fresh_calculations.add(symbol)  # Mark as fresh calculation
+                        
+                except Exception as e:
+                    logger.error(f"Error calculating indicators for {symbol}: {e}")
+                    results[symbol] = {}
+            else:
+                # ✅ SIMPLIFIED CACHING: Use cached result
+                results[symbol] = self._cache[cache_key]['data']
+                logger.debug(f"✅ Using cached indicators for {symbol} (age: {current_time - self._cache[cache_key]['timestamp']:.1f}s)")
+        
+        return results
     
     def _fallback_batch_process_symbols(self, symbol_data: Dict[str, List[Dict]], max_ticks_per_symbol: int) -> Dict[str, Dict]:
         """Fallback batch processing when Polars is not available"""
@@ -1540,15 +1560,19 @@ class HybridCalculations:
         import sys
         
         polars_memory = sum(sys.getsizeof(v) for v in self._polars_cache.values())
-        calc_memory = sum(sys.getsizeof(v) for v in self._calculation_cache.values())
+        # ✅ SIMPLIFIED: Calculate memory for unified cache
+        indicator_cache_memory = sum(
+            sys.getsizeof(v) + sys.getsizeof(k) 
+            for k, v in self._cache.items()
+        )
         
         return {
             'polars_cache_memory_mb': polars_memory / (1024 * 1024),
-            'calculation_cache_memory_mb': calc_memory / (1024 * 1024),
-            'total_memory_mb': (polars_memory + calc_memory) / (1024 * 1024),
+            'indicator_cache_memory_mb': indicator_cache_memory / (1024 * 1024),
+            'total_memory_mb': (polars_memory + indicator_cache_memory) / (1024 * 1024),
             'max_cache_size': self.max_cache_size,
             'max_batch_size': self.max_batch_size,
-            'cache_utilization': len(self._calculation_cache) / self.max_cache_size
+            'cache_utilization': len(self._cache) / self.max_cache_size if self.max_cache_size > 0 else 0
         }
     
     def process_tick(self, symbol: str, tick_data: Dict) -> Dict:
@@ -1579,10 +1603,30 @@ class HybridCalculations:
         try:
             if not POLARS_AVAILABLE:
                 return
+            
+            # ✅ FIXED: Handle timestamp conversion properly - handle ISO strings and milliseconds
+            timestamp_ms = tick_data.get('exchange_timestamp_ms') or tick_data.get('timestamp_ms')
+            if timestamp_ms is None:
+                # Try to convert ISO string or other timestamp formats
+                timestamp_val = tick_data.get('exchange_timestamp') or tick_data.get('timestamp')
+                if timestamp_val:
+                    try:
+                        from config.utils.timestamp_normalizer import TimestampNormalizer
+                        timestamp_ms = TimestampNormalizer.to_epoch_ms(timestamp_val)
+                    except Exception:
+                        timestamp_ms = 0
+                else:
+                    timestamp_ms = 0
+            else:
+                # Ensure it's an integer
+                try:
+                    timestamp_ms = int(timestamp_ms)
+                except (TypeError, ValueError):
+                    timestamp_ms = 0
                 
             # Create new tick DataFrame using exact Zerodha field names with consistent data types
             new_tick = pl.DataFrame([{
-                'timestamp': int(tick_data.get('exchange_timestamp_ms', tick_data.get('timestamp', 0))),
+                'timestamp': timestamp_ms,
                 'last_price': float(tick_data.get('last_price', 0.0)),
                 'zerodha_cumulative_volume': int(tick_data.get('zerodha_cumulative_volume', 0)),
                 'zerodha_last_traded_quantity': int(tick_data.get('zerodha_last_traded_quantity', 0)),
@@ -1617,16 +1661,38 @@ class HybridCalculations:
             logger.error(f"Error updating rolling window for {symbol}: {e}")
     
     def _get_historical_bucket_data(self, symbol: str) -> Optional[pl.DataFrame]:
-        """Get historical bucket data from Redis for rolling window initialization"""
+        """Get historical bucket data from Redis for rolling window initialization
+        
+        ✅ FIXED: Per REDIS_STORAGE_SIGNATURE.md, buckets are stored in session data (DB 0)
+        Format: session:{symbol}:{date} -> time_buckets (nested JSON with prices/volumes)
+        """
         try:
             redis_client = getattr(self, 'redis_client', None)
             if not redis_client:
                 logger.info(f"🔍 [HISTORICAL_DEBUG] {symbol} - No Redis client available")
                 return None
             
-            logger.info(f"🔍 [HISTORICAL_DEBUG] {symbol} - Calling get_rolling_window_buckets")
-            # Use the new rolling window method to get historical data
-            historical_buckets = redis_client.get_rolling_window_buckets(symbol, lookback_minutes=60)
+            # ✅ FIXED: Get buckets from session data (DB 0) per REDIS_STORAGE_SIGNATURE.md
+            # Try RobustRedisClient method first (if available)
+            if hasattr(redis_client, 'get_rolling_window_buckets'):
+                logger.info(f"🔍 [HISTORICAL_DEBUG] {symbol} - Using RobustRedisClient.get_rolling_window_buckets")
+                try:
+                    historical_buckets = redis_client.get_rolling_window_buckets(symbol, lookback_minutes=60, max_days_back=None)
+                    if historical_buckets:
+                        logger.info(f"🔍 [HISTORICAL_DEBUG] {symbol} - Got {len(historical_buckets)} buckets from RobustRedisClient")
+                    else:
+                        logger.info(f"🔍 [HISTORICAL_DEBUG] {symbol} - No buckets from RobustRedisClient, trying session data")
+                except Exception as e:
+                    logger.debug(f"🔍 [HISTORICAL_DEBUG] {symbol} - RobustRedisClient method failed: {e}, trying session data")
+                    historical_buckets = None
+            else:
+                historical_buckets = None
+            
+            # ✅ FIXED: Fallback to session data (DB 0) per REDIS_STORAGE_SIGNATURE.md
+            if not historical_buckets:
+                logger.info(f"🔍 [HISTORICAL_DEBUG] {symbol} - Reading buckets from session data (DB 0)")
+                historical_buckets = self._get_buckets_from_session_data(redis_client, symbol)
+            
             if not historical_buckets:
                 logger.info(f"🔍 [HISTORICAL_DEBUG] {symbol} - No historical buckets returned")
                 return None
@@ -1650,16 +1716,31 @@ class HybridCalculations:
                     else:
                         timestamp_ms = 0
                     
-                    # Map bucket data to expected fields (bucket data has different structure)
+                    # ✅ FIXED: Map bucket data from session data structure per REDIS_STORAGE_SIGNATURE.md
+                    # Session buckets have: close, bucket_incremental_volume, count, last_timestamp, hour, minute_bucket
+                    last_price = bucket.get('close') or bucket.get('last_price', 0.0)
+                    bucket_incremental = bucket.get('bucket_incremental_volume', 0)
+                    bucket_cumulative = bucket.get('bucket_cumulative_volume') or bucket.get('zerodha_cumulative_volume', 0)
+                    
+                    # Use last_timestamp if available, otherwise use timestamp field
+                    if not timestamp_str:
+                        timestamp_str = bucket.get('last_timestamp', '')
+                        if timestamp_str:
+                            try:
+                                dt = datetime.fromisoformat(timestamp_str.replace('+05:30', ''))
+                                timestamp_ms = int(dt.timestamp() * 1000)
+                            except Exception:
+                                timestamp_ms = 0
+                    
                     bucket_data.append({
                         'timestamp': timestamp_ms,
-                        'last_price': float(bucket.get('last_price', 0.0)),
-                        'zerodha_cumulative_volume': int(bucket.get('volume_traded_for_the_day', 0)),  # Use volume_traded_for_the_day
-                        'zerodha_last_traded_quantity': int(bucket.get('bucket_incremental_volume', 0)),  # Use bucket_incremental_volume
-                        'high': float(bucket.get('last_price', 0.0)),  # Use last_price as high/low fallback
-                        'low': float(bucket.get('last_price', 0.0)),   # Use last_price as high/low fallback
-                        'bucket_incremental_volume': int(bucket.get('bucket_incremental_volume', 0)),
-                        'bucket_cumulative_volume': int(bucket.get('volume_traded_for_the_day', 0))  # Use volume_traded_for_the_day
+                        'last_price': float(last_price),
+                        'zerodha_cumulative_volume': int(bucket_cumulative),
+                        'zerodha_last_traded_quantity': int(bucket.get('count', 0)),  # Use count as quantity
+                        'high': float(last_price),  # Use close/last_price as high/low fallback
+                        'low': float(last_price),   # Use close/last_price as low fallback
+                        'bucket_incremental_volume': int(bucket_incremental),
+                        'bucket_cumulative_volume': int(bucket_cumulative)
                     })
                 except Exception as e:
                     logger.debug(f"Error processing bucket data: {e}")
@@ -1675,6 +1756,100 @@ class HybridCalculations:
         except Exception as e:
             logger.error(f"Error getting historical bucket data for {symbol}: {e}")
             return None
+    
+    def _get_buckets_from_session_data(self, redis_client, symbol: str, lookback_minutes: int = 60) -> List[Dict[str, Any]]:
+        """Get buckets from session data (DB 0) per REDIS_STORAGE_SIGNATURE.md
+        
+        Format: session:{symbol}:{date} -> time_buckets (nested JSON with prices/volumes)
+        """
+        try:
+            from datetime import datetime, timedelta
+            import pytz
+            import json
+            
+            ist = pytz.timezone("Asia/Kolkata")
+            now = datetime.now(ist)
+            cutoff_ts = (now - timedelta(minutes=lookback_minutes)).timestamp()
+            
+            # Try current date and recent dates
+            dates_to_try = [
+                now.strftime("%Y-%m-%d"),  # Today
+                (now - timedelta(days=1)).strftime("%Y-%m-%d"),  # Yesterday
+                (now - timedelta(days=2)).strftime("%Y-%m-%d"),  # Day before
+            ]
+            
+            # Also try symbol variants (original, underlying)
+            symbols_to_try = [symbol]
+            # Try to extract underlying symbol
+            underlying_symbol = symbol
+            if '25NOV' in symbol or '25DEC' in symbol or '25JAN' in symbol:
+                underlying_symbol = symbol.replace('25NOV', '').replace('25DEC', '').replace('25JAN', '')
+                underlying_symbol = underlying_symbol.replace('CE', '').replace('PE', '').replace('FUT', '')
+                if underlying_symbol and underlying_symbol != symbol:
+                    symbols_to_try.append(underlying_symbol)
+            
+            # Get DB 0 client for session data
+            session_client = None
+            if hasattr(redis_client, 'get_client'):
+                session_client = redis_client.get_client(0)
+            elif hasattr(redis_client, 'redis_client'):
+                session_client = redis_client.redis_client
+                # Ensure we're on DB 0
+                if hasattr(session_client, 'select'):
+                    session_client.select(0)
+            else:
+                session_client = redis_client
+            
+            buckets_data = []
+            
+            # Try session data first (where buckets are actually stored)
+            for try_symbol in symbols_to_try:
+                for date_str in dates_to_try:
+                    session_key = f"session:{try_symbol}:{date_str}"
+                    try:
+                        session_data_str = session_client.get(session_key)
+                        if session_data_str:
+                            if isinstance(session_data_str, bytes):
+                                session_data_str = session_data_str.decode('utf-8')
+                            session_data = json.loads(session_data_str) if isinstance(session_data_str, str) else session_data_str
+                            time_buckets = session_data.get('time_buckets', {})
+                            
+                            if time_buckets:
+                                logger.info(f"✅ [HISTORICAL_DEBUG] {symbol} -> Found {len(time_buckets)} buckets in {session_key}")
+                                # Convert time_buckets to list of bucket data
+                                for bucket_key, bucket_data in time_buckets.items():
+                                    if isinstance(bucket_data, dict):
+                                        # Extract timestamp from bucket
+                                        last_ts_str = bucket_data.get('last_timestamp', '')
+                                        if last_ts_str:
+                                            try:
+                                                bucket_ts = datetime.fromisoformat(last_ts_str.replace('+05:30', '')).timestamp()
+                                                if bucket_ts >= cutoff_ts:
+                                                    buckets_data.append(bucket_data)
+                                            except Exception:
+                                                pass
+                                        else:
+                                            # Include bucket even without timestamp (within date range)
+                                            buckets_data.append(bucket_data)
+                                if buckets_data:
+                                    break  # Found buckets, no need to check other dates
+                    except Exception as e:
+                        logger.debug(f"Session lookup failed for {session_key}: {e}")
+                        continue
+                
+                if buckets_data:
+                    break  # Found buckets, no need to check other symbols
+            
+            if buckets_data:
+                logger.info(f"✅ [HISTORICAL_DEBUG] {symbol} -> Retrieved {len(buckets_data)} buckets from session data")
+                return buckets_data
+            
+            logger.debug(f"🔍 [HISTORICAL_DEBUG] {symbol} -> No buckets found in session data")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error getting buckets from session data for {symbol}: {e}")
+            return []
     
     def _calculate_realtime_indicators(self, symbol: str, window: pl.DataFrame, tick_data: Dict) -> Dict:
         """Calculate real-time indicators using rolling window with Redis fallback"""
@@ -2757,38 +2932,53 @@ class EnhancedGreekCalculator:
     
     def black_scholes_greeks(self, spot: float, strike: float, dte_years: float,
                             risk_free: float, volatility: float, option_type: str) -> dict:
-        """Black-Scholes Greek calculations"""
+        """Black-Scholes Greek calculations using py_vollib (standardized library)"""
         if dte_years <= 0 or volatility <= 0:
             return self._zero_greeks()
         
         try:
-            from math import log, sqrt, exp
-            
-            d1 = (log(spot / strike) + (risk_free + 0.5 * volatility**2) * dte_years) / (volatility * sqrt(dte_years))
-            d2 = d1 - volatility * sqrt(dte_years)
-            
-            if option_type.lower() == 'call':
-                delta = norm.cdf(d1)
-                theta = (-spot * norm.pdf(d1) * volatility / (2 * sqrt(dte_years)) 
-                        - risk_free * strike * exp(-risk_free * dte_years) * norm.cdf(d2)) / 365
-            else:  # put
-                delta = norm.cdf(d1) - 1
-                theta = (-spot * norm.pdf(d1) * volatility / (2 * sqrt(dte_years)) 
-                        + risk_free * strike * exp(-risk_free * dte_years) * norm.cdf(-d2)) / 365
-            
-            gamma = norm.pdf(d1) / (spot * volatility * sqrt(dte_years))
-            vega = spot * norm.pdf(d1) * sqrt(dte_years) / 100
-            rho = (strike * dte_years * exp(-risk_free * dte_years) * 
-                  (norm.cdf(d2) if option_type.lower() == 'call' else -norm.cdf(-d2))) / 100
-            
-            return {
-                'delta': delta,
-                'gamma': gamma,
-                'theta': theta,
-                'vega': vega,
-                'rho': rho,
-                'dte_years': dte_years
-            }
+            # Use py_vollib for standardized, tested Greek calculations
+            if PY_VOLLIB_AVAILABLE:
+                # py_vollib uses 'c' for call, 'p' for put
+                flag = 'c' if option_type.lower() in ['call', 'ce'] else 'p'
+                
+                return {
+                    'delta': delta(flag, spot, strike, dte_years, risk_free, volatility),
+                    'gamma': gamma(flag, spot, strike, dte_years, risk_free, volatility),
+                    'theta': theta(flag, spot, strike, dte_years, risk_free, volatility),
+                    'vega': vega(flag, spot, strike, dte_years, risk_free, volatility),
+                    'rho': rho(flag, spot, strike, dte_years, risk_free, volatility),
+                    'dte_years': dte_years
+                }
+            else:
+                # Fallback to manual calculation if py_vollib not available
+                from math import log, sqrt, exp
+                
+                d1 = (log(spot / strike) + (risk_free + 0.5 * volatility**2) * dte_years) / (volatility * sqrt(dte_years))
+                d2 = d1 - volatility * sqrt(dte_years)
+                
+                if option_type.lower() in ['call', 'ce']:
+                    delta_val = norm.cdf(d1)
+                    theta_val = (-spot * norm.pdf(d1) * volatility / (2 * sqrt(dte_years)) 
+                            - risk_free * strike * exp(-risk_free * dte_years) * norm.cdf(d2)) / 365
+                else:  # put
+                    delta_val = norm.cdf(d1) - 1
+                    theta_val = (-spot * norm.pdf(d1) * volatility / (2 * sqrt(dte_years)) 
+                            + risk_free * strike * exp(-risk_free * dte_years) * norm.cdf(-d2)) / 365
+                
+                gamma_val = norm.pdf(d1) / (spot * volatility * sqrt(dte_years))
+                vega_val = spot * norm.pdf(d1) * sqrt(dte_years) / 100
+                rho_val = (strike * dte_years * exp(-risk_free * dte_years) * 
+                      (norm.cdf(d2) if option_type.lower() in ['call', 'ce'] else -norm.cdf(-d2))) / 100
+                
+                return {
+                    'delta': delta_val,
+                    'gamma': gamma_val,
+                    'theta': theta_val,
+                    'vega': vega_val,
+                    'rho': rho_val,
+                    'dte_years': dte_years
+                }
             
         except Exception as e:
             logger.error(f"Greek calculation error: {e}")

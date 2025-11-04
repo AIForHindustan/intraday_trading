@@ -203,8 +203,31 @@ class ParallelBinaryIngestionDriver:
         self.verbose = verbose
         self.min_file_age_seconds = max(0, min_file_age_seconds)
 
-        cache_manager = TokenCacheManager(cache_path=token_cache_path)
+        # Use token_lookup_enriched.json if no path provided (most comprehensive)
+        if token_cache_path is None:
+            enriched_path = Path("core/data/token_lookup_enriched.json")
+            merged_path = Path("zerodha_token_list/all_extracted_tokens_merged.json")
+            default_path = Path("core/data/token_lookup.json")
+            
+            # Prefer enriched > merged > default
+            if enriched_path.exists():
+                token_cache_path = str(enriched_path)
+                if verbose:
+                    print(f"📋 Using token cache: {token_cache_path}")
+            elif merged_path.exists():
+                token_cache_path = str(merged_path)
+                if verbose:
+                    print(f"📋 Using token cache: {token_cache_path}")
+            else:
+                token_cache_path = str(default_path)
+                if verbose:
+                    print(f"⚠️  Using default token cache (may not exist): {token_cache_path}")
+
+        cache_manager = TokenCacheManager(cache_path=token_cache_path, verbose=verbose)
         self.token_cache_path = str(cache_manager.cache_path)
+        
+        if verbose and cache_manager.token_map:
+            print(f"✅ Token cache loaded: {len(cache_manager.token_map):,} instruments")
 
     def discover_files(self, directories: Iterable[str]) -> List[Path]:
         """Return sorted file list recursively scanning provided directories."""

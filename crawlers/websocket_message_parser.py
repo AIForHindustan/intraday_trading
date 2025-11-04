@@ -20,7 +20,8 @@ class ZerodhaBinaryParser:
     ):
         self.logger = logging.getLogger(__name__)
         self.instrument_mapper = instrument_mapper or InstrumentMapper()
-        self.redis_client = getattr(redis_client, "redis_client", redis_client)
+        # ✅ Use the client directly, no wrapping
+        self.redis_client = redis_client
 
     def parse_binary_message(self, binary_data: bytes) -> List[Dict[str, Any]]:
         """Parse Zerodha WebSocket binary message structure into packet blobs."""
@@ -165,20 +166,22 @@ class ZerodhaWebSocketMessageParser:
 
     def __init__(self, instrument_info: Dict[int, Dict], redis_client=None):
         self.instrument_info = instrument_info
+        
+        # ✅ Use the client directly, no wrapping
         self.redis_client = redis_client
+        
         self.logger = logging.getLogger(__name__)
         self.instrument_mapper = InstrumentMapper(instrument_info)
-        # Binary parser only needs Redis for intraday crawlers (for logging unknown tokens)
-        # File-only crawlers (data_mining, research) should pass redis_client=None
-        redis_for_parser = None
-        if redis_client:
-            redis_for_parser = getattr(redis_client, "redis_client", redis_client)
+        
+        # ✅ Remove the redis_for_parser duplication
         self.binary_parser = ZerodhaBinaryParser(
-            self.instrument_mapper, redis_for_parser
+            self.instrument_mapper, 
+            redis_client  # Pass the same client
         )
-        # Only initialize volume calculator with Redis for intraday crawlers
+        
+        # ✅ Initialize volume calculator with same client
         if redis_client:
-            self.volume_calculator = CorrectVolumeCalculator(getattr(redis_client, "redis_client", redis_client))
+            self.volume_calculator = CorrectVolumeCalculator(redis_client)
         else:
             self.volume_calculator = None
         # ✅ LEGACY REMOVED: Volume tracking now handled by VolumeStateManager (single source of truth)
@@ -277,11 +280,9 @@ class ZerodhaWebSocketMessageParser:
 
             tick = self._normalize_volume_at_ingestion(packet)
 
-            # Provide canonical aliases for downstream compatibility
-            tick["last_price"] = tick.get("last_price", last_traded_price)
-            tick["last_traded_price"] = tick.get("last_price")
-            tick["cumulative_volume"] = tick.get("cumulative_volume", cumulative_volume)
-            tick["zerodha_cumulative_volume"] = tick.get("cumulative_volume")
+            # ✅ REMOVED: Backward compatibility aliases - normalization method already sets canonical fields
+            # The _normalize_volume_at_ingestion() method sets all canonical field names
+            # Downstream code should use canonical field names from field mapping
 
             return tick
         except Exception as e:
@@ -311,7 +312,14 @@ class ZerodhaWebSocketMessageParser:
         - Volume profile updates happen automatically during incremental volume calculation
         - POC, Value Area, and support/resistance levels are calculated in real-time
         - No additional code needed here - integration is seamless
+        
+        NOTE: For file-only crawlers (data_mining, research), this method skips Redis operations
+        and only sets basic volume fields to avoid unnecessary Redis connections.
         """
+        # SKIP volume normalization for file-only crawlers (no Redis client)
+        if self.redis_client is None:
+            return tick_data  # Skip all Redis operations
+        
         try:
             from redis_files.volume_state_manager import get_volume_manager
             
@@ -349,8 +357,8 @@ class ZerodhaWebSocketMessageParser:
             except (TypeError, ValueError):
                 cumulative_int = 0
 
-            # SINGLE CALCULATION POINT: WebSocket Parser ONLY - Calculate incremental volume
-            volume_manager = get_volume_manager()
+            # ✅ Pass the existing Redis client to volume manager
+            volume_manager = get_volume_manager(redis_client=self.redis_client)
             incremental = volume_manager.calculate_incremental(
                 instrument_token=str(tick_data.get('instrument_token', symbol)),
                 current_cumulative=cumulative_int,

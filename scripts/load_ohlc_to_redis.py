@@ -121,6 +121,7 @@ def _push_interval_data(
         conn.execute_command("TS.ADD", series_key, timestamp_ms, close_price)
         ts_count += 1
 
+        # ✅ FIXED: ALWAYS use maxlen to prevent unbounded stream growth
         conn.xadd(
             stream_key,
             {

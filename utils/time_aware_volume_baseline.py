@@ -80,6 +80,8 @@ class TimeAwareVolumeBaseline:
         self.redis = redis_client
         self.base_baselines = {}  # symbol -> 1-minute baseline
         self._volume_averages: Optional[Dict[str, Dict[str, float]]] = None
+        # Handle None redis_client gracefully (for file-only crawlers)
+        self.has_redis = redis_client is not None
 
         # Market session definitions (Indian Market 9:15-15:30)
         # VIX INTEGRATION MATHEMATICS:
@@ -190,11 +192,15 @@ class TimeAwareVolumeBaseline:
         """Get 1-minute baseline volume for symbol"""
         storage_symbol = normalize_symbol(_resolve_base_symbol(symbol))
 
-        # Try Redis first
-        baseline_key = f"volume:baseline:{storage_symbol}:1min"
-        baseline = self.redis.get(baseline_key)
-        if baseline:
-            return float(baseline)
+        # Try Redis first (only if Redis client is available)
+        if self.has_redis and self.redis:
+            try:
+                baseline_key = f"volume:baseline:{storage_symbol}:1min"
+                baseline = self.redis.get(baseline_key)
+                if baseline:
+                    return float(baseline)
+            except Exception as e:
+                logger.debug(f"Failed to get baseline from Redis for {symbol}: {e}")
 
         # Calculate from available data
         return self._calculate_1min_baseline(symbol)
@@ -203,58 +209,88 @@ class TimeAwareVolumeBaseline:
         """Calculate 1-minute baseline from available bucket data"""
         storage_symbol = normalize_symbol(_resolve_base_symbol(symbol))
 
-        redis_client = self.redis.get_client(0)
+        # Check if Redis is available
+        if not self.has_redis or not self.redis:
+            logger.debug(f"No Redis client available for baseline calculation for {symbol}")
+            return self._get_symbol_type_baseline(symbol)
+        
+        try:
+            redis_client = self.redis.get_client(0)
+            if redis_client is None:
+                logger.debug(f"Redis client for DB 0 is None for {symbol}")
+                return self._get_symbol_type_baseline(symbol)
+        except Exception as e:
+            logger.debug(f"Failed to get Redis client for baseline calculation: {e}")
+            return self._get_symbol_type_baseline(symbol)
 
         # First try recent 1-minute history (fastest, most current)
         volumes: List[float] = []
-        history_patterns = [
-            f"bucket_incremental_volume:history:1min:{storage_symbol}",
-            f"bucket_incremental_volume:history:1min:1min:{storage_symbol}",
-        ]
+        if redis_client is not None:
+            try:
+                history_patterns = [
+                    f"bucket_incremental_volume:history:1min:{storage_symbol}",
+                    f"bucket_incremental_volume:history:1min:1min:{storage_symbol}",
+                ]
 
-        for pattern in history_patterns:
-            for key in redis_client.scan_iter(pattern):
-                history_entries = redis_client.lrange(key, 0, 119)
-                for entry in history_entries:
+                for pattern in history_patterns:
                     try:
-                        payload = json.loads(entry)
-                        vol = float(payload.get("bucket_incremental_volume", 0))
-                        if vol > 0:
-                            volumes.append(vol)
-                    except Exception:
+                        for key in redis_client.scan_iter(pattern):
+                            history_entries = redis_client.lrange(key, 0, 119)
+                            for entry in history_entries:
+                                try:
+                                    payload = json.loads(entry)
+                                    vol = float(payload.get("bucket_incremental_volume", 0))
+                                    if vol > 0:
+                                        volumes.append(vol)
+                                except Exception:
+                                    continue
+                        if volumes:
+                            break
+                    except Exception as e:
+                        logger.debug(f"Failed to scan history pattern {pattern}: {e}")
                         continue
-            if volumes:
-                break
+            except Exception as e:
+                logger.debug(f"Error accessing Redis history for baseline calculation: {e}")
 
         if volumes:
             return sum(volumes) / len(volumes)
 
         # Fallback: look for stored baselines in Redis
-        bucket_pattern = f"volume:baseline:{storage_symbol}:*"
-        bucket_keys = list(redis_client.scan_iter(bucket_pattern))
+        if redis_client is not None:
+            try:
+                bucket_pattern = f"volume:baseline:{storage_symbol}:*"
+                bucket_keys = list(redis_client.scan_iter(bucket_pattern))
 
-        if not bucket_keys:
-            return 0.0
-
-        # Convert all buckets to 1-minute equivalent and average
-        total_1min_volume = 0
-        count = 0
+                if bucket_keys:
+                    # Convert all buckets to 1-minute equivalent and average
+                    total_1min_volume = 0
+                    count = 0
+                    
+                    for key in bucket_keys:
+                        try:
+                            key_str = key.decode() if isinstance(key, bytes) else key
+                            resolution = key_str.split(":")[-2]  # Extract resolution like "5min"
+                            volume_value = redis_client.get(key)
+                            if volume_value is None:
+                                continue
+                            volume = float(volume_value)
+                            
+                            # Convert to 1-minute equivalent
+                            if resolution in self.BUCKET_MULTIPLIERS:
+                                volume_1min = volume / self.BUCKET_MULTIPLIERS[resolution]
+                                total_1min_volume += volume_1min
+                                count += 1
+                        except Exception as e:
+                            logger.debug(f"Error processing bucket key {key}: {e}")
+                            continue
+                    
+                    if count > 0:
+                        return total_1min_volume / count
+            except Exception as e:
+                logger.debug(f"Error accessing Redis baselines: {e}")
         
-        for key in bucket_keys:
-            key_str = key.decode() if isinstance(key, bytes) else key
-            resolution = key_str.split(":")[-2]  # Extract resolution like "5min"
-            volume_value = redis_client.get(key)
-            if volume_value is None:
-                continue
-            volume = float(volume_value)
-            
-            # Convert to 1-minute equivalent
-            if resolution in self.BUCKET_MULTIPLIERS:
-                volume_1min = volume / self.BUCKET_MULTIPLIERS[resolution]
-                total_1min_volume += volume_1min
-                count += 1
-        
-        return total_1min_volume / count if count > 0 else 0.0
+        # Final fallback: return symbol type baseline
+        return self._get_symbol_type_baseline(symbol)
 
     def _get_vix_multiplier(self, vix_regime: str) -> float:
         """

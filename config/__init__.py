@@ -16,7 +16,7 @@ Created: October 9, 2025
 
 # Import Redis configuration from core
 try:
-    from config.redis_config import REDIS_DATABASES, get_redis_config, get_database_for_data_type, get_ttl_for_data_type
+    from redis_files.redis_config import REDIS_DATABASES, get_redis_config, get_database_for_data_type, get_ttl_for_data_type
     REDIS_CONFIG_AVAILABLE = True
 except ImportError:
     REDIS_CONFIG_AVAILABLE = False

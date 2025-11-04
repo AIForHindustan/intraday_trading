@@ -951,9 +951,13 @@ class ICTLiquidityDetector:
         if not session_date or not self.redis_client:
             return None
         try:
+            from utils.yaml_field_loader import resolve_session_field
+            
             data = self.redis_client.get_cumulative_data(symbol, session_date)
-            if data and data.get("high_price") not in (None, float("-inf")):
-                return float(data.get("high_price"))
+            # Use canonical field name 'high' (resolved from 'high_price' if needed)
+            high_field = resolve_session_field('high_price')
+            if data and data.get(high_field) not in (None, float("-inf")):
+                return float(data.get(high_field))
         except Exception:
             pass
         return None
@@ -962,9 +966,13 @@ class ICTLiquidityDetector:
         if not session_date or not self.redis_client:
             return None
         try:
+            from utils.yaml_field_loader import resolve_session_field
+            
             data = self.redis_client.get_cumulative_data(symbol, session_date)
-            if data and data.get("low_price") not in (None, float("inf")):
-                return float(data.get("low_price"))
+            # Use canonical field name 'low' (resolved from 'low_price' if needed)
+            low_field = resolve_session_field('low_price')
+            if data and data.get(low_field) not in (None, float("inf")):
+                return float(data.get(low_field))
         except Exception:
             pass
         return None
@@ -976,11 +984,16 @@ class ICTLiquidityDetector:
             return None, None
         for s in session_dates:
             try:
+                from utils.yaml_field_loader import resolve_session_field
+                
                 data = self.redis_client.get_cumulative_data(symbol, s)
                 if not data:
                     continue
-                hp = data.get("high_price")
-                lp = data.get("low_price")
+                # Use canonical field names
+                high_field = resolve_session_field('high_price')
+                low_field = resolve_session_field('low_price')
+                hp = data.get(high_field)
+                lp = data.get(low_field)
                 if isinstance(hp, (int, float)):
                     highs.append(float(hp))
                 if isinstance(lp, (int, float)):

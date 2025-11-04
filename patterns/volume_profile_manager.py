@@ -40,14 +40,37 @@ class VolumeProfileManager:
     SINGLE SOURCE OF TRUTH for volume profile calculations across the entire system.
     Integrates with VolumeStateManager and uses canonical field names from field mapping.
     
-    Redis Database: DB 2 (analytics) - Stores all volume profile data (consolidated from DB 5)
-    Key Patterns:
-    - volume_profile:session:SYMBOL:YYYY-MM-DD (Hash)
-    - volume_profile:poc:SYMBOL (Hash) 
-    - volume_profile:nodes:SYMBOL (Hash)
-    - volume_profile:distribution:SYMBOL:YYYY-MM-DD (Hash)
-    - volume_profile:patterns:SYMBOL:daily (Sorted Set)
-    - volume_profile:historical:SYMBOL (List)
+    Redis Storage Configuration:
+    - Database: DB 2 (analytics) - Stores all volume profile data (consolidated from DB 5)
+    - TTL: 24 hours (86400 seconds) for all keys
+    
+    Redis Key Patterns:
+    - volume_profile:poc:SYMBOL (Hash) - Primary POC storage
+      Fields: poc_price, poc_volume, value_area_high, value_area_low, profile_strength, exchange_timestamp
+    - volume_profile:session:SYMBOL:YYYY-MM-DD (Hash) - Full profile data with date
+      Contains: All fields from get_profile_data() including price_volume_distribution
+    - volume_profile:distribution:SYMBOL:YYYY-MM-DD (Hash) - Price-volume bins
+      Format: {price: volume, price: volume, ...} for histogram/chart rendering
+    - volume_profile:nodes:SYMBOL (Hash) - Support/resistance levels
+      Fields: support_levels (JSON array), resistance_levels (JSON array), exchange_timestamp
+    - volume_profile:patterns:SYMBOL:daily (Sorted Set) - Historical patterns by timestamp
+    - volume_profile:historical:SYMBOL (List) - Last 24 hours of profile data (FIFO queue)
+    
+    POC Storage Details:
+    - Primary Location: Redis DB 2, key: volume_profile:poc:SYMBOL
+    - Access Method: Hash with fields stored as strings (converted from float/int)
+    - Update Frequency: Every 100 ticks or 1 minute (whichever comes first)
+    - Fallback Access: Dashboard reads from DB 2 first, then DB 1 if not found
+    
+    Output Signature:
+    - get_profile_data() returns dict with price_volume_distribution field (bin volumes)
+    - get_trading_nodes() passes through price_volume_distribution if available
+    - get_volume_nodes() returns data with price_volume_distribution via get_trading_nodes()
+    
+    See also:
+    - patterns/VOLUME_PROFILE_AUDIT.md - Comprehensive audit of volume profile logic
+    - patterns/VOLUME_PROFILE_FIXES_APPLIED.md - List of fixes applied
+    - patterns/VOLUME_PROFILE_OVERRIDE_ANALYSIS.md - Override analysis and verification
     """
     
     def __init__(self, redis_client, token_resolver=None):
@@ -472,8 +495,8 @@ class VolumeProfileManager:
             if redis_client is None:
                 redis_client = self.redis_client
             
-            # Get underlying Redis client for DB 1 (OHLC data in realtime)
-            ohlc_client = redis_client.get_client(1) if hasattr(redis_client, 'get_client') else redis_client
+            # ✅ FIXED: Get underlying Redis client for DB 2 (OHLC data in analytics per redis_config.py)
+            ohlc_client = redis_client.get_client(2) if hasattr(redis_client, 'get_client') else redis_client
             
             # Get all OHLC latest keys
             ohlc_keys = ohlc_client.keys('ohlc_latest:*')
@@ -831,6 +854,7 @@ class SymbolVolumeProfile:
         profile_range = value_area_high - value_area_low
         
         # Return with canonical field names
+        # ✅ Include bin volumes (price-volume distribution) for consumers
         return {
             'poc_price': poc_price,
             'poc_volume': poc_volume,
@@ -841,7 +865,8 @@ class SymbolVolumeProfile:
             'profile_range': profile_range,
             'session_start': self.session_start.isoformat(),
             'exchange_timestamp': datetime.now().isoformat(),  # Canonical timestamp field
-            'calculation_method': 'custom_mathematical'
+            'calculation_method': 'custom_mathematical',
+            'price_volume_distribution': self.price_volume.copy()  # ✅ Include bin volumes (price → volume dict)
         }
     
     def _calculate_basic_profile(self) -> Dict:
@@ -869,6 +894,7 @@ class SymbolVolumeProfile:
                 break
                 
         # Return with canonical field names
+        # ✅ Include bin volumes (price-volume distribution) for consumers
         return {
             'poc_price': poc_price,
             'poc_volume': self.price_volume[poc_price],
@@ -878,7 +904,8 @@ class SymbolVolumeProfile:
             'price_levels': len(self.price_volume),
             'profile_range': max(value_area_prices) - min(value_area_prices) if value_area_prices else 0,
             'calculation_method': 'basic_fallback',
-            'exchange_timestamp': datetime.now().isoformat()  # Canonical timestamp field
+            'exchange_timestamp': datetime.now().isoformat(),  # Canonical timestamp field
+            'price_volume_distribution': self.price_volume.copy()  # ✅ Include bin volumes (price → volume dict)
         }
     
     def get_trading_nodes(self) -> Dict:
@@ -895,7 +922,8 @@ class SymbolVolumeProfile:
         support, resistance = self._find_support_resistance()
         
         # Return with canonical field names for pattern detection
-        return {
+        # ✅ Include bin volumes if available (from get_profile_data)
+        result = {
             'poc_price': profile_data['poc_price'],
             'value_area_high': profile_data['value_area_high'],
             'value_area_low': profile_data['value_area_low'],
@@ -904,6 +932,12 @@ class SymbolVolumeProfile:
             'profile_strength': self._calculate_profile_strength(profile_data),
             'exchange_timestamp': datetime.now().isoformat()  # Canonical timestamp field
         }
+        
+        # Pass through bin volumes if available (for consumers who need full distribution)
+        if 'price_volume_distribution' in profile_data:
+            result['price_volume_distribution'] = profile_data['price_volume_distribution']
+        
+        return result
     
     def _find_support_resistance(self) -> Tuple[List, List]:
         """Identify support and resistance levels from volume profile"""

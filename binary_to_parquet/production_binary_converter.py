@@ -34,6 +34,7 @@ else:
 if TYPE_CHECKING:
     from token_cache import TokenCacheManager
 from singleton_db import DatabaseConnectionManager
+from binary_to_parquet.enhanced_metadata_calculator import EnhancedMetadataCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,23 @@ COLUMN_ORDER = [
     "ask_5_price",
     "ask_5_quantity",
     "ask_5_orders",
+    # Technical Indicators
+    "rsi_14",
+    "sma_20",
+    "ema_12",
+    "bollinger_upper",
+    "bollinger_middle",
+    "bollinger_lower",
+    "macd",
+    "macd_signal",
+    "macd_histogram",
+    # Option Greeks (NULL for non-options)
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "rho",
+    "implied_volatility",
     "packet_type",
     "data_quality",
     "session_type",
@@ -127,6 +145,23 @@ FLOAT_COLUMNS = {
     "average_traded_price",
     *(f"bid_{level}_price" for level in range(1, 6)),
     *(f"ask_{level}_price" for level in range(1, 6)),
+    # Technical Indicators
+    "rsi_14",
+    "sma_20",
+    "ema_12",
+    "bollinger_upper",
+    "bollinger_middle",
+    "bollinger_lower",
+    "macd",
+    "macd_signal",
+    "macd_histogram",
+    # Option Greeks
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "rho",
+    "implied_volatility",
 }
 INT64_COLUMNS = {
     "instrument_token",
@@ -233,6 +268,25 @@ def ensure_production_schema(conn: duckdb.DuckDBPyConnection) -> None:
         ask_4_price DOUBLE, ask_4_quantity BIGINT, ask_4_orders INTEGER,
         ask_5_price DOUBLE, ask_5_quantity BIGINT, ask_5_orders INTEGER,
 
+        -- Technical Indicators
+        rsi_14 DOUBLE,
+        sma_20 DOUBLE,
+        ema_12 DOUBLE,
+        bollinger_upper DOUBLE,
+        bollinger_middle DOUBLE,
+        bollinger_lower DOUBLE,
+        macd DOUBLE,
+        macd_signal DOUBLE,
+        macd_histogram DOUBLE,
+
+        -- Option Greeks (NULL for non-options)
+        delta DOUBLE,
+        gamma DOUBLE,
+        theta DOUBLE,
+        vega DOUBLE,
+        rho DOUBLE,
+        implied_volatility DOUBLE,
+
         packet_type VARCHAR,
         data_quality VARCHAR,
         session_type VARCHAR,
@@ -281,6 +335,7 @@ class ProductionZerodhaBinaryConverter:
         self._arrow_schema: Optional[pa.Schema] = None
         self._missing_token_counts: Dict[int, int] = defaultdict(int)
         self._logged_missing_tokens: Set[int] = set()
+        self._metadata_calculator = EnhancedMetadataCalculator()  # For indicators and Greeks
         if self.db_path and ensure_schema:
             with DatabaseConnectionManager.connection_scope(self.db_path) as conn:
                 ensure_production_schema(conn)
@@ -361,7 +416,8 @@ class ProductionZerodhaBinaryConverter:
         total_packets = 0
         successful_inserts = 0
         error_count = 0
-        max_errors_before_abort = 50
+        skipped_count = 0  # Track skipped packets separately
+        max_errors_before_abort = 500  # Increased threshold - skip validation is not an error
 
         try:
             raw_data = path.read_bytes()
@@ -370,26 +426,31 @@ class ProductionZerodhaBinaryConverter:
 
             logger.info("Processing %s: %s packets", path, total_packets)
 
-            batch_size = 500
+            batch_size = 5000  # Increased from 500 to reduce transaction overhead
             for batch_index, start in enumerate(range(0, total_packets, batch_size), start=1):
                 batch = packets[start : start + batch_size]
-                batch_success, batch_errors = self._process_batch_with_error_isolation(conn, list(batch), path)
+                batch_success, batch_errors, batch_skipped = self._process_batch_with_error_isolation(conn, list(batch), path)
                 successful_inserts += batch_success
                 error_count += batch_errors
+                skipped_count += batch_skipped
                 logger.info(
-                    "Batch %s for %s: %s/%s succeeded, %s errors (total errors %s)",
+                    "Batch %s for %s: %s/%s succeeded, %s errors, %s skipped (total errors %s, skipped %s)",
                     batch_index,
                     path.name,
                     batch_success,
                     len(batch),
                     batch_errors,
+                    batch_skipped,
                     error_count,
+                    skipped_count,
                 )
+                # Only abort on actual errors, not skipped packets (invalid timestamps, etc.)
                 if error_count > max_errors_before_abort:
                     logger.warning(
-                        "Aborting %s due to excessive errors (%s)",
+                        "Aborting %s due to excessive errors (%s actual errors, %s skipped)",
                         path.name,
                         error_count,
+                        skipped_count,
                     )
                     break
 
@@ -422,6 +483,100 @@ class ProductionZerodhaBinaryConverter:
 
     def _detect_packet_format(self, raw_data: bytes) -> List[Dict]:
         """Detect frame format and parse accordingly."""
+        # Check for 8-byte header (00 00 01 99 + 4 bytes) - zerodha_websocket format
+        if len(raw_data) >= 8:
+            header_bytes = struct.unpack(">HH", raw_data[0:4])
+            if header_bytes == (0, 0x0199):  # 00 00 01 99 pattern
+                # Skip 8-byte header
+                data_after_header = raw_data[8:]
+                
+                # Skip ALL JSON metadata blocks if present (starts with '{')
+                offset = 0
+                json_block_count = 0
+                max_json_search = 2000  # Only search first 2KB for JSON blocks
+                
+                while offset < len(data_after_header) and offset < max_json_search:
+                    if data_after_header[offset] == 0x7b:  # '{'
+                        # Found JSON start, find matching closing brace
+                        json_start = offset
+                        json_end = offset
+                        brace_count = 0
+                        started = False
+                        
+                        while json_end < len(data_after_header) and json_end < json_start + 5000:
+                            if data_after_header[json_end] == 0x7b:  # '{'
+                                brace_count += 1
+                                started = True
+                            elif data_after_header[json_end] == 0x7d:  # '}'
+                                brace_count -= 1
+                                if started and brace_count == 0:
+                                    # Found complete JSON block
+                                    offset = json_end + 1
+                                    json_block_count += 1
+                                    logger.debug(f"Skipped JSON block {json_block_count} (offset {json_start}-{json_end+1})")
+                                    
+                                    # Skip null bytes after JSON
+                                    while offset < len(data_after_header) and offset < max_json_search and data_after_header[offset] == 0:
+                                        offset += 1
+                                    break
+                            json_end += 1
+                        else:
+                            # JSON not properly closed, break to avoid infinite loop
+                            break
+                    else:
+                        # Not at JSON start - if we've already found JSON blocks and moved far enough, stop
+                        if json_block_count > 0 and offset > 500:
+                            # We've skipped JSON blocks, likely past all JSON now
+                            break
+                        offset += 1
+                
+                if json_block_count > 0:
+                    logger.debug(f"Skipped {json_block_count} JSON metadata blocks, binary data starts at offset {offset}")
+                
+                # Check if remaining data is websocket-framed or length-prefixed
+                if offset < len(data_after_header):
+                    data_after_json = data_after_header[offset:]
+                    
+                    # Binary data may have additional header (0-20 bytes) before actual packets
+                    # Try parsing from different offsets to find packet start
+                    best_packets = []
+                    best_offset = 0
+                    
+                    # Test offsets: 0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18 (comprehensive range)
+                    for skip_bytes in [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18]:
+                        if skip_bytes >= len(data_after_json):
+                            continue
+                        
+                        test_data = data_after_json[skip_bytes:]
+                        
+                        # Try length-prefixed first (most common format)
+                        packets_lp = self._parse_length_prefixed_packets(test_data)
+                        if len(packets_lp) > len(best_packets):
+                            best_packets = packets_lp
+                            best_offset = skip_bytes
+                            logger.debug(f"Found {len(packets_lp)} packets with {skip_bytes}-byte skip (length-prefixed)")
+                        
+                        # Try raw stream
+                        packets_rs = self._parse_raw_packet_stream(test_data)
+                        if len(packets_rs) > len(best_packets):
+                            best_packets = packets_rs
+                            best_offset = skip_bytes
+                            logger.debug(f"Found {len(packets_rs)} packets with {skip_bytes}-byte skip (raw stream)")
+                    
+                    if len(best_packets) > 10:
+                        if best_offset > 0:
+                            logger.debug(f"Using {best_offset}-byte skip to skip binary header, found {len(best_packets)} packets")
+                        return best_packets
+                    
+                    # Fallback: try websocket frames
+                    if self._looks_like_websocket_frame(data_after_json):
+                        logger.debug("Detected zerodha_websocket format: 8-byte header + JSON + websocket frames")
+                        return self._parse_websocket_frames(data_after_json)
+                    
+                    # Final fallback: parse from start (legacy behavior)
+                    return self._parse_raw_packet_stream(raw_data)
+        
+        # Standard websocket frame check
         if self._looks_like_websocket_frame(raw_data):
             return self._parse_websocket_frames(raw_data)
         return self._parse_raw_packet_stream(raw_data)
@@ -432,6 +587,10 @@ class ProductionZerodhaBinaryConverter:
         try:
             num_packets = struct.unpack(">H", data[0:2])[0]
             first_packet_length = struct.unpack(">H", data[2:4])[0]
+            # Files starting with 00 00 01 99 are NOT websocket frames
+            # They have a 4-byte header that should be skipped
+            if num_packets == 0:
+                return False
             if num_packets <= 0 or num_packets > 10_000:
                 return False
             if first_packet_length not in VALID_PACKET_LENGTHS:
@@ -463,12 +622,156 @@ class ProductionZerodhaBinaryConverter:
         except struct.error as exc:
             logger.warning("WebSocket frame parse error: %s", exc)
         return packets
-
+    
+    def _parse_length_prefixed_packets(self, data: bytes) -> List[Dict]:
+        """Parse length-prefixed packets (no packet count header, just 2-byte length + data).
+        
+        Includes fallback logic to try different alignments if token looks like a timestamp.
+        """
+        packets: List[Dict] = []
+        position = 0
+        data_len = len(data)
+        consecutive_failures = 0
+        max_consecutive_failures = 5
+        
+        while position + 2 < data_len:
+            # Read packet length (2 bytes, big-endian)
+            try:
+                packet_length = struct.unpack(">H", data[position:position+2])[0]
+            except struct.error:
+                break
+            
+            position += 2
+            
+            # Validate packet length
+            if packet_length not in VALID_PACKET_LENGTHS:
+                # Not a valid packet, try next byte (might be misaligned)
+                position -= 1
+                consecutive_failures += 1
+                if consecutive_failures > max_consecutive_failures:
+                    break
+                continue
+            
+            # Check if we have enough data
+            if position + packet_length > data_len:
+                break
+            
+            # Parse the packet
+            packet_data = data[position:position+packet_length]
+            packet = self._parse_single_packet(packet_data, packet_length)
+            
+            if packet:
+                # Validate token
+                token = packet.get("instrument_token", 0)
+                
+                # Check if token looks like a timestamp (misaligned packet)
+                is_timestamp_like = (
+                    (10_000_000 <= token < 100_000_000) or  # 10M-100M: epoch seconds (1970-1973)
+                    (token >= 1_000_000_000)  # >= 1e9: definitely timestamp
+                )
+                
+                if is_timestamp_like:
+                    # Try fallback: attempt to find actual token by checking nearby positions
+                    fallback_packet = self._try_find_actual_token(data, position, packet_length)
+                    if fallback_packet:
+                        token = fallback_packet.get("instrument_token", 0)
+                        logger.debug(f"Fixed misaligned packet: original token {packet.get('instrument_token')} -> actual token {token}")
+                        packet = fallback_packet
+                
+                # Final validation
+                if 50 <= token < 50_000_000:
+                    packets.append(packet)
+                    consecutive_failures = 0  # Reset on success
+                else:
+                    # Invalid token even after fallback
+                    logger.debug(f"Skipping packet with invalid token: {token}")
+                    consecutive_failures += 1
+                    if consecutive_failures > max_consecutive_failures:
+                        logger.warning(f"Too many consecutive failures, stopping at position {position}")
+                        break
+            else:
+                consecutive_failures += 1
+                if consecutive_failures > max_consecutive_failures:
+                    break
+            
+            position += packet_length
+        
+        return packets
+    
+    def _try_find_actual_token(self, data: bytes, current_pos: int, packet_length: int) -> Optional[Dict]:
+        """Try to find actual token by checking nearby byte offsets.
+        
+        This handles misaligned packets where we're reading a timestamp field as token.
+        """
+        # Try offsets: -4, -8, -12, -16 (common misalignment patterns)
+        # But ensure we don't go before packet start
+        packet_start = current_pos - 2  # Before length prefix
+        test_offsets = [-16, -12, -8, -4, 4, 8, 12, 16]
+        
+        for offset in test_offsets:
+            test_pos = current_pos + offset
+            # Ensure we're still within reasonable bounds and have enough data
+            if test_pos < packet_start or test_pos + packet_length > len(data):
+                continue
+            
+            # Try to parse as packet at this offset
+            packet_data = data[test_pos:test_pos+packet_length]
+            test_packet = self._parse_single_packet(packet_data, packet_length)
+            
+            if test_packet:
+                test_token = test_packet.get("instrument_token", 0)
+                # Check if this looks like a valid token
+                if 50 <= test_token < 50_000_000:
+                    # Additional validation: check if other fields make sense
+                    # Timestamps should be > 1e15 (nanoseconds) or > 1e9 (seconds)
+                    exchange_ts = test_packet.get("exchange_timestamp", 0)
+                    if exchange_ts == 0 or exchange_ts > 1_000_000_000:  # Valid timestamp range
+                        return test_packet
+        
+        return None
+    
     def _parse_raw_packet_stream(self, data: bytes) -> List[Dict]:
         packets: List[Dict] = []
         position = 0
         data_len = len(data)
+        
+        # Check for header patterns and determine skip offset
+        header_skip = 0
+        if data_len >= 8:
+            header_bytes = struct.unpack(">HH", data[0:4])
+            if header_bytes == (0, 0x0199):  # 00 00 01 99 pattern
+                # Check if valid token is at offset 4 or offset 8
+                token_at_4 = struct.unpack(">I", data[4:8])[0] if data_len >= 8 else 0
+                token_at_8 = struct.unpack(">I", data[8:12])[0] if data_len >= 12 else 0
+                
+                # Valid token range: 50 to 10^9
+                if 50 <= token_at_8 < 10**9:
+                    # Valid token at offset 8 - use 8-byte header skip
+                    header_skip = 8
+                    logger.debug("Detected 8-byte header (00 00 01 99 + 4 bytes), skipping first 8 bytes")
+                elif 50 <= token_at_4 < 10**9:
+                    # Valid token at offset 4 - use 4-byte header skip
+                    header_skip = 4
+                    logger.debug("Detected 4-byte header (00 00 01 99), skipping first 4 bytes")
+                else:
+                    # Try default 4-byte skip
+                    header_skip = 4
+                    logger.debug("Detected 00 00 01 99 pattern, defaulting to 4-byte skip")
+        
+        if header_skip > 0:
+            data = data[header_skip:]
+            data_len = len(data)
+            position = 0
+        
+        # Find the first valid packet boundary by checking for reasonable instrument_token values
+        # Timestamps are typically > 1e9 (seconds) or > 1e12 (milliseconds), tokens are usually < 1e9
+        initial_offset = self._find_first_valid_packet_offset(data)
+        position = initial_offset
+        
+        if initial_offset > 0:
+            logger.debug(f"Found packet boundary at offset {initial_offset}")
 
+        consecutive_failures = 0
         while position + 8 <= data_len:
             parsed = False
             for packet_length in VALID_PACKET_LENGTHS:
@@ -477,13 +780,76 @@ class ProductionZerodhaBinaryConverter:
                     continue
                 packet = self._parse_single_packet(data[position:end_pos], packet_length)
                 if packet:
-                    packets.append(packet)
-                    position = end_pos
-                    parsed = True
-                    break
+                    # Validate that instrument_token is reasonable (not a timestamp)
+                    token = packet.get("instrument_token", 0)
+                    # Accept tokens in reasonable range (50-1e9) - allow small tokens for indices/special instruments
+                    # Reject tokens >= 1e9 as they're likely timestamps
+                    if 50 <= token < 10**9:
+                        packets.append(packet)
+                        position = end_pos
+                        parsed = True
+                        consecutive_failures = 0
+                        break
+            
             if not parsed:
                 position += 1
+                consecutive_failures += 1
+                # If we've had too many consecutive failures after finding initial offset, stop
+                if initial_offset > 0 and consecutive_failures > 50:
+                    logger.debug(f"Stopping at position {position} after {consecutive_failures} consecutive failures")
+                    break
+                # If we're still searching for initial offset, continue
+                if initial_offset == 0 and position > 200:
+                    break
+        
         return packets
+    
+    def _find_first_valid_packet_offset(self, data: bytes) -> int:
+        """Find the first valid packet boundary by checking for reasonable instrument_token AND timestamp values."""
+        data_len = len(data)
+        
+        # Scan first 200 bytes to find a valid packet start
+        # Try offsets in order, prioritizing smaller offsets
+        best_offset = 0
+        best_score = 0
+        
+        for offset in range(0, min(200, data_len - 8)):
+            for packet_length in VALID_PACKET_LENGTHS:
+                if offset + packet_length > data_len:
+                    continue
+                
+                # Try to parse as this packet type
+                packet = self._parse_single_packet(data[offset:offset+packet_length], packet_length)
+                if packet:
+                    token = packet.get("instrument_token", 0)
+                    # Check token validity
+                    token_valid = 50 <= token < 10**9
+                    
+                    # Check timestamp validity (if present)
+                    timestamp_ns = packet.get("exchange_timestamp", 0) or packet.get("last_traded_timestamp", 0)
+                    # Valid timestamps are in nanoseconds: typically 1e15 to 1e18 (2020-2100 range)
+                    timestamp_valid = timestamp_ns >= 1e15 and timestamp_ns < 3e18
+                    
+                    # Score: prefer packets with both valid token AND valid timestamp
+                    score = 0
+                    if token_valid:
+                        score += 1
+                    if timestamp_valid:
+                        score += 2  # Timestamp validation is more important
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_offset = offset
+                        if score >= 3:  # Both valid - this is perfect
+                            logger.debug(f"Found valid packet start at offset {offset} with token {token} and timestamp {timestamp_ns} (packet_length={packet_length})")
+                            return offset
+        
+        if best_score > 0:
+            logger.debug(f"Found best packet start at offset {best_offset} (score={best_score})")
+            return best_offset
+        
+        logger.debug("No valid packet boundary found in first 200 bytes, defaulting to offset 0")
+        return 0  # Default to start of file if no valid boundary found
 
     def _parse_single_packet(self, packet_data: bytes, packet_length: int) -> Optional[Dict]:
         if packet_length == 184:
@@ -515,6 +881,16 @@ class ProductionZerodhaBinaryConverter:
                         "orders": orders,
                     }
                 )
+            # Timestamp handling: Use last_traded_timestamp (fields[11]) as primary,
+            # fall back to exchange_timestamp (fields[15]) if last_traded is zero
+            # This handles cases where timestamp is at different positions
+            last_traded_ts = self._coerce_timestamp_ns(fields[11])
+            exchange_ts = self._coerce_timestamp_ns(fields[15])
+            
+            # Use whichever timestamp is valid, prefer exchange_timestamp if both are valid
+            final_timestamp = exchange_ts if exchange_ts > 0 else last_traded_ts
+            final_exchange_timestamp = exchange_ts if exchange_ts > 0 else last_traded_ts
+            
             return {
                 "instrument_token": fields[0],
                 "last_price": fields[1],
@@ -527,11 +903,11 @@ class ProductionZerodhaBinaryConverter:
                 "high": fields[8],
                 "low": fields[9],
                 "close": fields[10],
-                "last_traded_timestamp": self._coerce_timestamp_ns(fields[11]),
+                "last_traded_timestamp": last_traded_ts,
                 "open_interest": fields[12],
                 "oi_day_high": fields[13],
                 "oi_day_low": fields[14],
-                "exchange_timestamp": self._coerce_timestamp_ns(fields[15]),
+                "exchange_timestamp": final_exchange_timestamp,
                 "market_depth": depth_entries,
                 "packet_type": "full",
                 "data_quality": "complete",
@@ -609,29 +985,33 @@ class ProductionZerodhaBinaryConverter:
         conn: duckdb.DuckDBPyConnection,
         batch: List[Dict],
         file_path: Path,
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, int, int]:
+        """Process batch and return (success_count, error_count, skipped_count)"""
         if not batch:
-            return 0, 0
+            return 0, 0, 0
 
-        enriched_records, errors = self._enrich_packets(batch, file_path, conn)
+        enriched_records, errors, skipped = self._enrich_packets(batch, file_path, conn)
         if not enriched_records:
-            return 0, max(errors, len(batch))
+            # If all were skipped, return skipped count; if all were errors, return error count
+            return 0, errors, skipped
 
         try:
             arrow_table = self._records_to_arrow_table(enriched_records)
             inserted = self._write_arrow_table(conn, arrow_table)
-            return inserted, errors
+            return inserted, errors, skipped
         except Exception as exc:  # noqa: BLE001
             logger.warning("Batch insert failed for %s: %s", file_path.name, exc)
-            return 0, len(batch)
+            return 0, errors + len(batch), skipped  # Count insert failure as errors
 
     def _enrich_packets(
         self,
         batch: List[Dict],
         file_path: Path,
         conn: Optional[duckdb.DuckDBPyConnection],
-    ) -> Tuple[List[Dict], int]:
+    ) -> Tuple[List[Dict], int, int]:
+        """Return (enriched_records, error_count, skipped_count)"""
         errors = 0
+        skipped = 0
         enriched_records: List[Dict] = []
 
         for packet in batch:
@@ -648,10 +1028,19 @@ class ProductionZerodhaBinaryConverter:
             if not enriched:
                 errors += 1
                 continue
+            
+            # Skip packets with invalid timestamps (exchange_timestamp_ns = 0 or None)
+            # This matches the parquet processing logic which skips rows without valid timestamps
+            # This is NOT an error - it's a data quality check
+            exchange_timestamp_ns = enriched.get("exchange_timestamp_ns", 0)
+            if not exchange_timestamp_ns or exchange_timestamp_ns == 0:
+                skipped += 1
+                logger.debug(f"Skipping packet with invalid timestamp (token={enriched.get('instrument_token')})")
+                continue
 
             enriched_records.append(enriched)
 
-        return enriched_records, errors
+        return enriched_records, errors, skipped
 
     def _write_arrow_table(
         self,
@@ -667,7 +1056,7 @@ class ProductionZerodhaBinaryConverter:
             conn.register(view_name, arrow_table)
             conn.execute("BEGIN TRANSACTION")
             conn.execute(
-                f"INSERT INTO tick_data_corrected ({column_list}) "
+                f"INSERT OR REPLACE INTO tick_data_corrected ({column_list}) "
                 f"SELECT {column_list} FROM {view_name}"
             )
             conn.execute("COMMIT")
@@ -842,6 +1231,7 @@ class ProductionZerodhaBinaryConverter:
         self,
         conn: Optional[duckdb.DuckDBPyConnection],
         instrument_token: int,
+        packet: Optional[Dict] = None,
     ) -> Dict:
         cached = self._token_metadata_cache.get(instrument_token)
         if cached:
@@ -860,6 +1250,17 @@ class ProductionZerodhaBinaryConverter:
             "is_expired": False,
         }
 
+        # Check if packet has pre-enriched metadata from JSONL (has symbol that's not UNKNOWN)
+        if packet:
+            jsonl_symbol = packet.get("symbol")
+            if jsonl_symbol and isinstance(jsonl_symbol, str) and not jsonl_symbol.startswith("UNKNOWN"):
+                metadata["symbol"] = jsonl_symbol
+                # Also use segment/instrument_type if present in packet
+                if packet.get("segment"):
+                    metadata["segment"] = packet.get("segment")
+                if packet.get("instrument_type"):
+                    metadata["instrument_type"] = packet.get("instrument_type")
+
         if self.token_cache:
             cache_info = self.token_cache.get_instrument_info(instrument_token)
             for key in ("symbol", "exchange", "segment", "instrument_type", "expiry", "strike_price", "option_type", "lot_size", "tick_size", "is_expired"):
@@ -867,7 +1268,9 @@ class ProductionZerodhaBinaryConverter:
                     continue
                 value = cache_info.get(key)
                 if value is not None:
-                    metadata[key] = value
+                    # Only override if we don't already have a value (prefer JSONL over cache)
+                    if metadata.get(key) is None or (key == "symbol" and metadata[key].startswith("UNKNOWN")):
+                        metadata[key] = value
 
         db_row = None
         if conn is not None:
@@ -910,8 +1313,28 @@ class ProductionZerodhaBinaryConverter:
         expiry = metadata.get("expiry")
         if isinstance(expiry, str):
             try:
-                metadata["expiry"] = datetime.strptime(expiry[:10], "%Y-%m-%d").date()
-            except ValueError:
+                # Try multiple date formats
+                # Format 1: YYYY-MM-DD
+                try:
+                    metadata["expiry"] = datetime.strptime(expiry[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    # Format 2: DD-MMM-YYYY (e.g., "29-Dec-2025")
+                    try:
+                        metadata["expiry"] = datetime.strptime(expiry, "%d-%b-%Y").date()
+                    except ValueError:
+                        # Format 3: DD/MM/YYYY
+                        try:
+                            metadata["expiry"] = datetime.strptime(expiry, "%d/%m/%Y").date()
+                        except ValueError:
+                            # Format 4: YYYYMMDD
+                            try:
+                                if len(expiry) >= 8 and expiry[:8].isdigit():
+                                    metadata["expiry"] = datetime.strptime(expiry[:8], "%Y%m%d").date()
+                                else:
+                                    metadata["expiry"] = None
+                            except ValueError:
+                                metadata["expiry"] = None
+            except Exception:
                 metadata["expiry"] = None
         elif isinstance(expiry, datetime):
             metadata["expiry"] = expiry.date()
@@ -955,7 +1378,7 @@ class ProductionZerodhaBinaryConverter:
         if token is None:
             return None
 
-        metadata = self._get_token_metadata(conn, token)
+        metadata = self._get_token_metadata(conn, token, packet)
 
         symbol = metadata.get("symbol")
         if not symbol or (isinstance(symbol, str) and symbol.startswith("UNKNOWN_")):
@@ -973,9 +1396,22 @@ class ProductionZerodhaBinaryConverter:
         price_divisor = self._get_price_divisor_safe(metadata)
         exchange_ts_ns = packet.get("exchange_timestamp") or 0
         last_traded_ts_ns = packet.get("last_traded_timestamp") or 0
+        
+        # Use last_traded_timestamp as fallback if exchange_timestamp is 0 or invalid
+        if exchange_ts_ns == 0 and last_traded_ts_ns > 0:
+            exchange_ts_ns = last_traded_ts_ns
 
+        # Convert nanoseconds to datetime, with fallback to current timestamp if invalid
         exchange_ts = self._ns_to_timestamp(exchange_ts_ns)
+        last_traded_ts = self._ns_to_timestamp(last_traded_ts_ns)
+        
+        # If exchange_timestamp conversion failed, try last_traded_timestamp, then current time
         processed_ts = datetime.utcnow()
+        if not exchange_ts:
+            if last_traded_ts:
+                exchange_ts = last_traded_ts
+            else:
+                exchange_ts = processed_ts
 
         enriched = {
             **packet,
@@ -993,7 +1429,7 @@ class ProductionZerodhaBinaryConverter:
             "exchange_timestamp_ns": exchange_ts_ns,
             "exchange_timestamp": exchange_ts,
             "last_traded_timestamp_ns": last_traded_ts_ns,
-            "last_traded_timestamp": self._ns_to_timestamp(last_traded_ts_ns),
+            "last_traded_timestamp": last_traded_ts if last_traded_ts else exchange_ts,  # Fallback to exchange_ts if invalid
             "last_price": self._scale_price(packet.get("last_price"), price_divisor),
             "open_price": self._scale_price(packet.get("open"), price_divisor),
             "high_price": self._scale_price(packet.get("high"), price_divisor),
@@ -1016,6 +1452,22 @@ class ProductionZerodhaBinaryConverter:
         }
 
         enriched.update(self._flatten_market_depth(packet.get("market_depth", []), price_divisor))
+        
+        # Calculate and add technical indicators
+        price_data = {
+            'last_price': enriched.get('last_price'),
+            'open_price': enriched.get('open_price'),
+            'high_price': enriched.get('high_price'),
+            'low_price': enriched.get('low_price'),
+            'close_price': enriched.get('close_price'),
+        }
+        indicators = self._metadata_calculator.calculate_indicators(token, price_data)
+        enriched.update(indicators)
+        
+        # Calculate and add option Greeks (if option)
+        greeks = self._metadata_calculator.calculate_greeks(metadata, price_data)
+        enriched.update(greeks)
+        
         return enriched
 
     # ------------------------------------------------------------------
@@ -1054,22 +1506,50 @@ class ProductionZerodhaBinaryConverter:
         return float(value) / float(divisor)
 
     def _coerce_timestamp_ns(self, value: int) -> int:
+        """Convert timestamp to nanoseconds, handling various input formats.
+        
+        NOTE: This method assumes the input is already in a reasonable epoch format.
+        Small values (< 1e9) are likely NOT epoch timestamps and should be handled differently.
+        """
         if value is None:
             return 0
+        
+        # Handle overflow values (like 4294967295 from uint32 max) - these are likely wrong
+        if value >= 2**32 - 1000 and value <= 2**32 + 1000:
+            return 0  # Mark as invalid
+        
         if value >= 10**15:  # Already nanoseconds
+            # Check for overflow/obviously wrong values
+            if value > 3 * 10**18:  # Beyond reasonable future (year 2100+)
+                return 0
             return value
         if value >= 10**12:  # milliseconds
             return int(value * 1_000_000)
         if value >= 10**9:  # seconds
             return int(value * 1_000_000_000)
-        return int(value)
+        
+        # Values < 1e9 are likely NOT epoch timestamps - return 0 to mark as invalid
+        # These will be handled by fallback to 'timestamp' field during enrichment
+        return 0
 
     def _ns_to_timestamp(self, nanoseconds: int) -> Optional[datetime]:
-        if not nanoseconds:
+        """Convert nanoseconds to datetime, with validation."""
+        if not nanoseconds or nanoseconds == 0:
             return None
+        
+        # Check for obviously invalid values (overflow, too small, too large)
+        if nanoseconds < 1_000_000_000:  # Less than 1 second in nanoseconds
+            return None
+        if nanoseconds > 3 * 10**18:  # Beyond year 2100 (likely overflow)
+            return None
+        
         seconds = nanoseconds / 1_000_000_000
         try:
-            return datetime.utcfromtimestamp(seconds)
+            dt = datetime.utcfromtimestamp(seconds)
+            # Validate that timestamp is in reasonable range (2020-2100)
+            if dt.year < 2020 or dt.year > 2100:
+                return None
+            return dt
         except (OverflowError, ValueError):
             return None
 

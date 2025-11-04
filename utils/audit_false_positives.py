@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""Audit recent volume-spike alerts against actual outcomes."""
+"""
+Alert Accuracy Audit Tool
+==========================
+
+Analyzes recent volume-spike alerts to identify false positives and validate alert accuracy.
+
+What it does:
+- Audits recent volume-spike alerts stored in Redis
+- Compares reported volume ratios with recomputed values
+- Tracks actual price movement after alerts (30-minute window)
+- Identifies false positives (alerts that didn't result in meaningful price movement)
+- Provides detailed audit report for tuning alert thresholds
+
+Use cases:
+- Validate alert system accuracy
+- Identify patterns in false positives
+- Tune volume ratio thresholds
+- Debug alert validation logic
+
+Usage:
+    python utils/audit_false_positives.py
+    python -m utils.audit_false_positives
+"""
 
 import json
 from datetime import datetime, timedelta

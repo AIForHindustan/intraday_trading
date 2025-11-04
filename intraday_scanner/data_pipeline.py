@@ -16,7 +16,309 @@ from datetime import datetime
 from pathlib import Path
 import os
 import sys
-from typing import Any, Dict
+import atexit
+import signal
+from typing import Any, Dict, List
+import asyncio
+
+# Process-specific Redis client caching (prevents connection pool exhaustion)
+# Use RedisManager82 for Redis 8.2 optimized connection management
+from redis_files.redis_manager import RedisManager82
+
+# ✅ SOLUTION 2: Robust Stream Consumer for handling pending messages and connection resilience
+class RobustStreamConsumer:
+    """
+    Robust Redis stream consumer with automatic reconnection and backlog handling.
+    Processes both pending and new messages to prevent backlog accumulation.
+    """
+    
+    def __init__(self, stream_key: str, group_name: str, consumer_name: str, db: int = 1):
+        """
+        Initialize robust stream consumer.
+        
+        Args:
+            stream_key: Redis stream key name
+            group_name: Consumer group name
+            consumer_name: Consumer name (unique per process)
+            db: Redis database number (default: 1 for realtime)
+        """
+        self.stream_key = stream_key
+        self.group_name = group_name
+        self.consumer_name = consumer_name
+        self.db = db
+        self.redis_client = None
+        self.logger = logging.getLogger(__name__)
+        self._reconnect()
+    
+    def _reconnect(self):
+        """Recreate Redis client on connection issues"""
+        try:
+            if self.redis_client:
+                try:
+                    self.redis_client.close()
+                except:
+                    pass
+        except:
+            pass
+        
+        # ✅ SOLUTION 4: Use RedisManager82 with optimized pool size from PROCESS_POOL_CONFIG
+        # process_name="stream_consumer" will use 10 connections from PROCESS_POOL_CONFIG
+        self.redis_client = RedisManager82.get_client(
+            process_name="stream_consumer",
+            db=self.db,
+            max_connections=None  # Use PROCESS_POOL_CONFIG value (10 connections)
+        )
+        
+        # Ensure consumer group exists
+        try:
+            groups = self.redis_client.xinfo_groups(self.stream_key)
+            group_exists = any(
+                g.get('name') == self.group_name if isinstance(g.get('name'), str) 
+                else g.get('name', b'').decode('utf-8') == self.group_name
+                for g in groups
+            )
+            if not group_exists:
+                self.redis_client.xgroup_create(
+                    name=self.stream_key,
+                    groupname=self.group_name,
+                    id='0',  # Start from beginning to catch pending messages
+                    mkstream=True
+                )
+                self.logger.info(f"✅ Created consumer group '{self.group_name}' for '{self.stream_key}'")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "busygroup" in error_str or "already exists" in error_str:
+                pass  # Group already exists
+            elif "no such key" in error_str:
+                # Stream doesn't exist yet, will be created on first XADD
+                pass
+            else:
+                self.logger.warning(f"⚠️ Error checking/creating consumer group: {e}")
+    
+    def process_messages(self, process_callback):
+        """
+        Process messages with automatic reconnection and backlog handling.
+        
+        Args:
+            process_callback: Callback function(message_data) to process each message
+        """
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
+        while True:
+            try:
+                # First, process any pending messages (backlog recovery)
+                pending_messages = None
+                try:
+                    pending_messages = self.redis_client.xreadgroup(
+                        groupname=self.group_name,
+                        consumername=self.consumer_name,
+                        streams={self.stream_key: '0'},  # '0' = pending messages
+                        count=100,  # Process up to 100 pending messages per batch
+                        block=1000  # 1 second timeout
+                    )
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "no such key" in error_str or "no such stream" in error_str:
+                        # Stream doesn't exist yet, skip pending read
+                        pending_messages = None
+                    else:
+                        raise
+                
+                # Process new messages
+                new_messages = None
+                try:
+                    new_messages = self.redis_client.xreadgroup(
+                        groupname=self.group_name,
+                        consumername=self.consumer_name,
+                        streams={self.stream_key: '>'},  # '>' = new messages only
+                        count=50,  # Process up to 50 new messages per batch
+                        block=2000  # 2 second timeout
+                    )
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "no such key" in error_str or "no such stream" in error_str:
+                        # Stream doesn't exist yet, skip new read
+                        new_messages = None
+                    else:
+                        raise
+                
+                # Combine both batches
+                all_messages = []
+                if pending_messages:
+                    all_messages.extend(pending_messages)
+                if new_messages:
+                    all_messages.extend(new_messages)
+                
+                if not all_messages:
+                    continue  # No messages, continue loop
+                
+                # Process messages and ACK them
+                processed_count = 0
+                ack_ids = []
+                
+                for stream_data in all_messages:
+                    if not stream_data or len(stream_data) < 2:
+                        continue
+                    
+                    stream_name_bytes, stream_messages = stream_data[0], stream_data[1]
+                    
+                    # Decode stream name if bytes
+                    if isinstance(stream_name_bytes, bytes):
+                        stream_name = stream_name_bytes.decode('utf-8')
+                    else:
+                        stream_name = str(stream_name_bytes)
+                    
+                    for message_id, message_data in stream_messages:
+                        try:
+                            # Process message using callback
+                            process_callback(message_data)
+                            
+                            # Track for ACK
+                            ack_ids.append((stream_name, message_id))
+                            processed_count += 1
+                            
+                        except Exception as e:
+                            self.logger.error(f"Error processing message {message_id}: {e}")
+                            # Still ACK to prevent infinite reprocessing
+                            ack_ids.append((stream_name, message_id))
+                
+                # Batch ACK all processed messages
+                if ack_ids:
+                    try:
+                        for stream_name, message_id in ack_ids:
+                            self.redis_client.xack(stream_name, self.group_name, message_id)
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Error ACKing messages: {e}")
+                
+                if processed_count > 0:
+                    self.logger.debug(f"✅ Processed {processed_count} messages from {self.stream_key}")
+                
+                # Reset error counter on success
+                consecutive_errors = 0
+                
+            except redis.ConnectionError as e:
+                consecutive_errors += 1
+                self.logger.error(f"❌ Redis connection error ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    self.logger.error(f"❌ Max consecutive errors reached. Stopping consumer.")
+                    break
+                
+                time.sleep(5)
+                self._reconnect()
+                
+            except Exception as e:
+                consecutive_errors += 1
+                error_str = str(e).lower()
+                
+                if "too many connections" in error_str:
+                    self.logger.warning(f"⚠️ Too many connections - will retry after delay")
+                    time.sleep(5)
+                    self._reconnect()
+                elif "no such key" in error_str or "no such stream" in error_str:
+                    # Stream doesn't exist yet, wait and retry
+                    time.sleep(2)
+                    consecutive_errors = 0  # Don't count as error
+                else:
+                    self.logger.error(f"❌ Stream processing error: {e}")
+                    time.sleep(1)
+                    
+                if consecutive_errors >= max_consecutive_errors:
+                    self.logger.error(f"❌ Max consecutive errors reached. Stopping consumer.")
+                    break
+
+# Module-level cached clients for process-specific connection pools
+_redis_clients_cache: Dict[int, redis.Redis] = {}
+_clients_lock = threading.Lock()
+
+def get_cached_redis_client(db: int = 1) -> redis.Redis:
+    """
+    Get a cached Redis client for the intraday_scanner process.
+    Uses RedisManager82 (Redis 8.2 optimized) connection pool to prevent connection exhaustion.
+    
+    Args:
+        db: Redis database number (default: 1 for realtime)
+        
+    Returns:
+        redis.Redis: Cached Redis client instance for this process+db
+        
+    Note:
+        Pool size is automatically optimized based on PROCESS_POOL_CONFIG
+        (20 connections for "intraday_scanner" process)
+    """
+    global _redis_clients_cache, _clients_lock
+    
+    with _clients_lock:
+        if db not in _redis_clients_cache:
+            # Use RedisManager82 for Redis 8.2 optimized connection management
+            # ✅ SOLUTION 4: Use PROCESS_POOL_CONFIG (30 connections for intraday_scanner)
+            _redis_clients_cache[db] = RedisManager82.get_client(
+                process_name="intraday_scanner",
+                db=db,
+                max_connections=None  # Use PROCESS_POOL_CONFIG value (30 connections)
+            )
+    
+    return _redis_clients_cache[db]
+
+
+def cleanup_redis_connections():
+    """
+    Cleanup function to close all cached Redis connections properly.
+    Called on process exit to prevent connection leaks.
+    Uses RedisManager82 cleanup for proper pool management.
+    """
+    global _redis_clients_cache, _clients_lock
+    
+    with _clients_lock:
+        # Use RedisManager82 cleanup for process-specific pools
+        try:
+            RedisManager82.cleanup(process_name="intraday_scanner")
+        except Exception:
+            pass
+        
+        # Also cleanup cached clients
+        for db, client in _redis_clients_cache.items():
+            try:
+                # Close the client connection (releases connections back to pool)
+                if client:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                # Ignore errors during cleanup - best effort
+                pass
+        
+        # Clear the cache
+        _redis_clients_cache.clear()
+
+
+def _signal_handler(signum, frame):
+    """
+    Handle termination signals gracefully by cleaning up Redis connections.
+    
+    For SIGTERM: Cleanup and exit gracefully (used by process managers)
+    For SIGINT: Cleanup only (application will handle the rest)
+    """
+    cleanup_redis_connections()
+    # Don't re-raise - let the application handle shutdown naturally
+
+
+# Register cleanup handlers for graceful connection closure
+atexit.register(cleanup_redis_connections)
+# Register signal handlers for clean shutdown
+try:
+    signal.signal(signal.SIGTERM, _signal_handler)
+except (ValueError, OSError):
+    # SIGTERM might not be available on all platforms
+    pass
+
+try:
+    signal.signal(signal.SIGINT, _signal_handler)
+except (ValueError, OSError):
+    # SIGINT might not be available in all contexts
+    pass
 
 import numpy as np
 
@@ -130,6 +432,26 @@ class DataPipeline:
         # Setup logging first
         self._setup_logging()
 
+        # ✅ TIER 2: Initialize historical archive (async, non-blocking)
+        # Must be after _setup_logging() so logger is available
+        self.historical_archive_enabled = self.config.get('enable_historical_archive', True)
+        self.historical_archive = None
+        if self.historical_archive_enabled:
+            try:
+                from utils.historical_archive import get_historical_archive
+                postgres_config = self.config.get('postgres_config', {})
+                self.historical_archive = get_historical_archive(
+                    postgres_config=postgres_config,
+                    batch_size=self.config.get('archive_batch_size', 1000),
+                    batch_interval=self.config.get('archive_batch_interval', 5.0),
+                    enable_postgres=self.config.get('enable_postgres_archive', False),
+                    fallback_to_parquet=True
+                )
+                self.logger.info("✅ Historical archive initialized (Tier 2)")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Historical archive unavailable: {e}. Continuing without archival.")
+                self.historical_archive = None
+
         # Enhanced spoofing detector state
         self.spoofing_detector = None
         self.spoofing_enabled = False
@@ -147,37 +469,43 @@ class DataPipeline:
         # Spoofing blocks - symbol -> block expiry time
         self.spoofing_blocks = {}
 
-        # Redis connection using centralized configuration
+        # ✅ SOLUTION 4: Use RedisManager82 for process-specific connection pools
+        # ✅ FIXED: Create wrapper to add store_by_data_type method to raw Redis client
         if redis_client:
-            self.redis_client = redis_client
+            # If already has store_by_data_type, use it; otherwise wrap it
+            if hasattr(redis_client, 'store_by_data_type'):
+                self.redis_client = redis_client
+            else:
+                # Wrap with a simple wrapper that adds store_by_data_type
+                self.redis_client = self._wrap_redis_client(redis_client)
         else:
-            # Use centralized Redis configuration
-            from redis_files.redis_client import get_redis_client
-            self.redis_client = get_redis_client(config=self.config)
-            if not self.redis_client:
-                logger.error("❌ Failed to initialize Redis client")
+            # Use RedisManager82 with PROCESS_POOL_CONFIG (30 connections for intraday_scanner)
+            raw_client = RedisManager82.get_client(
+                process_name="intraday_scanner",
+                db=0,  # Default DB for primary client
+                max_connections=None  # Use PROCESS_POOL_CONFIG value
+            )
+            if not raw_client:
+                self.logger.error("❌ Failed to initialize Redis client")
                 raise RuntimeError("Redis client initialization failed")
+            
+            # ✅ FIXED: Wrap raw Redis client to add store_by_data_type method
+            self.redis_client = self._wrap_redis_client(raw_client)
         
         # Initialize Redis storage layer
         from redis_files.redis_storage import RedisStorage
         self.redis_storage = RedisStorage(self.redis_client)
         
-        # Cache Redis clients upfront to avoid repeated get_client() calls
-        # This prevents connection pool exhaustion
-        self.realtime_client = None
-        self.news_client = None
-        if hasattr(self.redis_client, 'get_client'):
-            try:
-                self.realtime_client = self.redis_client.get_client(1)  # DB 1 for realtime
-                if not self.realtime_client:
-                    self.realtime_client = self.redis_client.get_client(0)
-                # Cache news client (also uses DB 1)
-                self.news_client = self.realtime_client
-            except Exception as e:
-                self.logger.warning(f"Failed to cache Redis clients: {e}")
-                self.realtime_client = self.redis_client
-                self.news_client = self.redis_client
-        else:
+        # Cache Redis clients upfront using process-specific connection pools
+        # This prevents connection pool exhaustion by using isolated pools per process
+        try:
+            # Use cached optimized process-specific client for DB 1 (realtime)
+            self.realtime_client = get_cached_redis_client(db=1)
+            # News client uses same DB 1, so reuse the cached client
+            self.news_client = self.realtime_client
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize process-specific Redis clients: {e}")
+            # Fallback to shared client if process-specific fails
             self.realtime_client = self.redis_client
             self.news_client = self.redis_client
         
@@ -191,7 +519,73 @@ class DataPipeline:
 
         # Legacy spoofing detector removed - no longer needed
         self.spoofing_detector = None
-        self.spoofing_enabled = False
+
+        # Partial message buffers to recover from split/corrupt pubsub payloads
+        self.partial_message_buffers: Dict[str, str] = {}
+        self.max_partial_buffer = int(self.config.get("max_partial_buffer", 8192))
+
+    def _wrap_redis_client(self, raw_client):
+        """
+        ✅ FIXED: Wrap raw Redis client to add store_by_data_type method.
+        This allows using store_by_data_type with RedisManager82 clients.
+        """
+        from redis_files.redis_config import get_database_for_data_type, get_ttl_for_data_type
+        
+        class RedisClientWrapper:
+            def __init__(self, client):
+                self.client = client
+                # Cache DB clients for different databases
+                self._db_clients = {}
+            
+            def __getattr__(self, name):
+                # Delegate all other methods to the underlying client
+                return getattr(self.client, name)
+            
+            def _get_client_for_db(self, db_num):
+                """Get client for specific database"""
+                if db_num not in self._db_clients:
+                    # Get client for this DB using RedisManager82
+                    db_client = RedisManager82.get_client(
+                        process_name="intraday_scanner",
+                        db=db_num,
+                        max_connections=None
+                    )
+                    self._db_clients[db_num] = db_client
+                return self._db_clients[db_num]
+            
+            def store_by_data_type(self, data_type: str, key: str, value: str, ttl: int = None):
+                """Store data in appropriate database based on type"""
+                try:
+                    db_num = get_database_for_data_type(data_type)
+                    if ttl is None:
+                        ttl = get_ttl_for_data_type(data_type)
+                    
+                    db_client = self._get_client_for_db(db_num)
+                    
+                    # Store with TTL
+                    if ttl and ttl > 0:
+                        db_client.setex(key, ttl, value)
+                    else:
+                        db_client.set(key, value)
+                    
+                    return True
+                except Exception as e:
+                    self.logger.error(f"❌ Error storing {key} via store_by_data_type: {e}")
+                    return False
+            
+            def retrieve_by_data_type(self, key: str, data_type: str):
+                """Retrieve data from appropriate database based on type"""
+                try:
+                    db_num = get_database_for_data_type(data_type)
+                    db_client = self._get_client_for_db(db_num)
+                    return db_client.get(key)
+                except Exception as e:
+                    self.logger.debug(f"Error retrieving {key} via retrieve_by_data_type: {e}")
+                    return None
+        
+        wrapper = RedisClientWrapper(raw_client)
+        wrapper.logger = self.logger
+        return wrapper
 
         # Partial message buffers to recover from split/corrupt pubsub payloads
         self.partial_message_buffers: Dict[str, str] = {}
@@ -199,7 +593,8 @@ class DataPipeline:
 
         # Tick buffer for processing (unbounded to avoid gating streaming data)
         self.tick_buffer = deque()
-        self.buffer_lock = threading.Lock()
+        if not hasattr(self, 'buffer_lock'):
+            self.buffer_lock = threading.Lock()
 
         # Queue-based tick processing for timeout support
         self.tick_queue = queue.Queue()
@@ -274,28 +669,290 @@ class DataPipeline:
             return
 
         self.logger.info("🚀 Starting data pipeline...")
-        # Initialize performance sink and patch realtime Redis client (non-invasive)
-        try:
-            from redis_files.perf_probe import PerfSink, patch_redis_client
-            if not hasattr(self, 'perf') or self.perf is None:
-                try:
-                    rt_client = self.redis_client.get_client(1) if hasattr(self, 'redis_client') else None
-                except Exception:
-                    rt_client = None
-                self.perf = PerfSink(redis_client=rt_client)
-                if rt_client is not None:
-                    try:
-                        patch_redis_client(self.perf, rt_client)
-                    except Exception:
-                        pass
-        except Exception:
-            self.perf = None
+        # perf_probe removed - no longer using performance monitoring monkey patches
+        self.perf = None
         
         # Start consuming in a separate thread
         import threading
-        self.consumer_thread = threading.Thread(target=self.start_consuming, daemon=True)
+        # Use streams instead of Pub/Sub for better performance
+        use_streams = self.config.get("use_redis_streams", True)  # Default to streams
+        if use_streams:
+            self.consumer_thread = threading.Thread(target=self.start_consuming_streams, daemon=True)
+            self.logger.info("📡 Using Redis Streams (XREADGROUP) for data ingestion")
+        else:
+            self.consumer_thread = threading.Thread(target=self.start_consuming, daemon=True)
+            self.logger.info("📡 Using Redis Pub/Sub for data ingestion")
         self.consumer_thread.start()
         
+    def start_consuming_streams(self):
+        """
+        ✅ SOLUTION 2: Start consuming from Redis streams using RobustStreamConsumer.
+        This replaces the inefficient Pub/Sub polling and handles pending messages.
+        """
+        import os
+        
+        # ✅ FIXED: Set running flag so the loop doesn't exit immediately
+        self.running = True
+        
+        # Use DB 1 for streams (realtime)
+        try:
+            from redis_files.redis_config import get_database_for_data_type
+            realtime_db = get_database_for_data_type("stream_data")
+        except Exception:
+            realtime_db = 1
+        
+        # ✅ SOLUTION 2: Use RobustStreamConsumer for ticks:intraday:processed
+        consumer_name = f"scanner_{os.getpid()}"
+        group_name = "scanner_group"
+        stream_key = 'ticks:intraday:processed'
+        
+        self.logger.info(f"📡 Starting robust stream consumer: {consumer_name} for {stream_key}")
+        
+        # Create robust consumer
+        consumer = RobustStreamConsumer(
+            stream_key=stream_key,
+            group_name=group_name,
+            consumer_name=consumer_name,
+            db=realtime_db
+        )
+        
+        # Define message processing callback
+        def process_message_callback(message_data: dict):
+            """Process a single message from the stream"""
+            try:
+                # ✅ FIXED: Ensure required attributes are initialized
+                if not hasattr(self, 'last_tick_hash'):
+                    self.last_tick_hash = {}
+                if not hasattr(self, 'batch_lock'):
+                    import threading
+                    self.batch_lock = threading.Lock()
+                if not hasattr(self, 'batch_buffer'):
+                    self.batch_buffer = []
+                
+                # Parse stream message
+                parsed_data = self._parse_stream_message(stream_key, message_data)
+                if parsed_data:
+                    # Process tick directly through existing pipeline
+                    self._process_market_tick(parsed_data)
+                    self.last_heartbeat = time.time()
+            except Exception as e:
+                self.logger.error(f"Error processing message in callback: {e}")
+                import traceback
+                self.logger.debug(traceback.format_exc())
+        
+        # Start processing messages (RobustStreamConsumer.process_messages is blocking)
+        try:
+            consumer.process_messages(process_callback=process_message_callback)
+        except KeyboardInterrupt:
+            self.logger.info("🛑 Stream consumer interrupted")
+        except Exception as e:
+            self.logger.error(f"❌ Unexpected error in stream consumer: {e}")
+        finally:
+            self.logger.info("🛑 Robust stream consumer stopped")
+            self.running = False
+    
+    def _parse_stream_message(self, stream_name: str, message_data: dict) -> dict:
+        """Parse Redis stream message data into tick dict"""
+        try:
+            # ✅ Check if message_data is valid
+            if not message_data or not isinstance(message_data, dict):
+                self.logger.debug(f"⚠️ Invalid message_data: type={type(message_data)}, value={message_data}")
+                return None
+            
+            # ✅ Handle empty dicts gracefully (common in stream processing)
+            if len(message_data) == 0:
+                self.logger.debug(f"⚠️ Empty message_data received for {stream_name}")
+                return None
+            
+            # Stream messages have bytes keys, decode them
+            parsed = {}
+            try:
+                for key, value in message_data.items():
+                    try:
+                        if isinstance(key, bytes):
+                            key_str = key.decode('utf-8')
+                        else:
+                            key_str = str(key)
+                        
+                        if isinstance(value, bytes):
+                            try:
+                                # Try to decode as UTF-8 string
+                                value_str = value.decode('utf-8')
+                                # For 'data' field in ticks:intraday:processed, keep as string for JSON parsing below
+                                if key_str == 'data' and stream_name == 'ticks:intraday:processed':
+                                    parsed[key_str] = value_str
+                                elif value_str.startswith('{') or value_str.startswith('['):
+                                    # For other fields, auto-parse JSON if possible
+                                    try:
+                                        parsed[key_str] = json.loads(value_str)
+                                    except:
+                                        parsed[key_str] = value_str
+                                else:
+                                    parsed[key_str] = value_str
+                            except Exception as decode_err:
+                                # Keep as bytes if decode fails
+                                self.logger.debug(f"Failed to decode value for key {key_str}: {decode_err}")
+                                parsed[key_str] = value
+                        else:
+                            parsed[key_str] = value
+                    except Exception as key_err:
+                        self.logger.error(f"❌ Error processing key {key} in stream message: {key_err}")
+                        continue
+            except Exception as items_err:
+                self.logger.error(f"❌ Error iterating message_data.items(): {items_err}, message_data type: {type(message_data)}")
+                return None
+            
+            # ✅ CRITICAL FIX: For ticks:intraday:processed, the 'data' field contains JSON string with tick data
+            # The crawler publishes as: {"data": json.dumps(intraday_tick)}
+            if stream_name == 'ticks:intraday:processed' and 'data' in parsed:
+                data_value = parsed['data']
+                # Handle both string and bytes
+                if isinstance(data_value, bytes):
+                    try:
+                        data_str = data_value.decode('utf-8')
+                    except Exception:
+                        self.logger.error(f"Failed to decode data field as UTF-8")
+                        return None
+                elif isinstance(data_value, str):
+                    data_str = data_value
+                else:
+                    self.logger.error(f"Unexpected data field type: {type(data_value)}")
+                    return None
+                
+                # Parse the JSON string to get the actual tick data
+                try:
+                    tick_data = json.loads(data_str)
+                    # ✅ The tick data already has symbol from websocket parser
+                    if 'symbol' not in tick_data or not tick_data.get('symbol'):
+                        # Fallback: resolve from instrument_token if symbol missing
+                        if 'instrument_token' in tick_data and tick_data['instrument_token']:
+                            try:
+                                from crawlers.utils.instrument_mapper import InstrumentMapper
+                                mapper = InstrumentMapper()
+                                resolved_symbol = mapper.token_to_symbol(tick_data['instrument_token'])
+                                if resolved_symbol and not resolved_symbol.startswith('UNKNOWN'):
+                                    tick_data['symbol'] = resolved_symbol
+                            except Exception:
+                                pass
+                    return tick_data
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"Failed to parse JSON from data field: {e}, preview: {data_str[:200]}")
+                    return None
+                except Exception as e:
+                    self.logger.error(f"Error parsing data field: {e}")
+                    return None
+            
+            # For other streams or if no 'data' field, try other field names
+            for field_name in ['tick_data', 'payload']:
+                if field_name in parsed:
+                    data_value = parsed[field_name]
+                    if isinstance(data_value, bytes):
+                        try:
+                            data_str = data_value.decode('utf-8')
+                        except Exception:
+                            continue
+                    elif isinstance(data_value, str):
+                        data_str = data_value
+                    else:
+                        continue
+                    
+                    try:
+                        tick_data = json.loads(data_str)
+                        return tick_data
+                    except Exception:
+                        continue
+            
+            # If we get here and it's ticks:intraday:processed, we failed to parse the 'data' field
+            if stream_name == 'ticks:intraday:processed':
+                self.logger.error(f"❌ Failed to parse ticks:intraday:processed - missing or invalid 'data' field. Parsed keys: {list(parsed.keys())}, message_data type: {type(message_data)}, message_data keys: {list(message_data.keys()) if isinstance(message_data, dict) else 'N/A'}")
+                return None
+            
+            # For other streams, return parsed dict as-is
+            return parsed
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing stream message: {e}")
+            return None
+    
+    def _read_ticks_optimized(self):
+        """
+        Optimized tick reading using XREADGROUP (replaces Pub/Sub polling).
+        Reads from Redis streams with consumer groups for reliability.
+        """
+        import os
+        
+        # Get Redis client for DB 1 (streams)
+        if not hasattr(self, 'realtime_client') or not self.realtime_client:
+            return None
+        
+        try:
+            # Use dedicated consumer group for data pipeline
+            group_name = 'data_pipeline_group'
+            consumer_name = f"pipeline_{os.getpid()}"
+            
+            # Ensure consumer group exists
+            try:
+                groups = self.realtime_client.xinfo_groups('ticks:raw:binary')
+                group_exists = any(g.get('name') == group_name for g in groups)
+                if not group_exists:
+                    self.realtime_client.xgroup_create(
+                        name='ticks:raw:binary',
+                        groupname=group_name,
+                        id='$',
+                        mkstream=True
+                    )
+            except Exception:
+                # Group exists or stream doesn't exist yet
+                pass
+            
+            # Read from streams using XREADGROUP (blocking, efficient)
+            messages = self.realtime_client.xreadgroup(
+                groupname=group_name,
+                consumername=consumer_name,
+                streams={'ticks:raw:binary': '>', 'ticks:intraday:processed': '>'},
+                count=25,      # Process 25 messages per batch (adjust based on load)
+                block=1000,    # Block for 1 second (efficient blocking, no polling)
+                noack=False    # Require explicit acknowledgment
+            )
+            
+            return messages if messages else None
+            
+        except redis.ConnectionError:
+            raise  # Re-raise connection errors
+        except Exception as e:
+            error_str = str(e).lower()
+            if "no such key" in error_str or "no such stream" in error_str:
+                # Stream not ready yet, return None (will retry)
+                return None
+            elif "unknown consumer group" in error_str:
+                # Try to create group
+                try:
+                    self.realtime_client.xgroup_create(
+                        name='ticks:raw:binary',
+                        groupname=group_name,
+                        id='0',
+                        mkstream=True
+                    )
+                    # Retry read
+                    return self._read_ticks_optimized()
+                except:
+                    return None
+            else:
+                # Log non-critical errors
+                self.logger.debug(f"Stream read error (non-critical): {e}")
+                return None
+    
+    def _process_binary_stream_tick(self, stream_data: dict):
+        """Process binary stream tick (from ticks:raw:binary)"""
+        try:
+            # Binary stream has: binary_data (base64), instrument_token, timestamp, mode, source
+            # For now, we'll skip binary processing and wait for processed stream
+            # Or you can decode binary_data here if needed
+            self.logger.debug(f"Received binary stream tick: {stream_data.get('instrument_token')}")
+            # TODO: Add binary decoding logic if needed
+        except Exception as e:
+            self.logger.error(f"Error processing binary stream tick: {e}")
+
     def start_consuming(self):
         """Start consuming from Redis channels"""
         self.running = True
@@ -311,6 +968,9 @@ class DataPipeline:
             "premarket.orders",  # Pre-market data
             "alerts.manager",  # Spoofing alerts from crawler
         ]
+        
+        # Store subscribed channels for reconnection
+        self.subscribed_channels = self.channels.copy()
 
         try:
             # Ensure Redis client is connected
@@ -320,7 +980,7 @@ class DataPipeline:
             # Create pubsub instance bound to realtime DB client to avoid DB switching side-effects
             # Use redis_config to get the correct database for stream_data
             try:
-                from config.redis_config import get_database_for_data_type
+                from redis_files.redis_config import get_database_for_data_type
                 realtime_db = get_database_for_data_type("stream_data")
             except Exception:
                 realtime_db = 1
@@ -328,13 +988,12 @@ class DataPipeline:
             # Store realtime_db as instance variable for reconnection
             self.realtime_db = realtime_db
             
-            # Use cached realtime_client if realtime_db is 1, otherwise get client (but prefer cached)
+            # Use cached optimized process-specific client (always use cached, no get_client() calls)
             if realtime_db == 1:
                 dedicated_client = self.realtime_client
             else:
-                dedicated_client = self.redis_client.get_client(realtime_db)
-            if dedicated_client is None and hasattr(self.redis_client, 'redis_client') and self.redis_client.redis_client:
-                dedicated_client = self.redis_client.redis_client
+                # For other databases, get cached optimized client for that DB
+                dedicated_client = get_cached_redis_client(db=realtime_db)
             if dedicated_client is None:
                 raise RuntimeError("No Redis client available for Pub/Sub")
             self.pubsub = dedicated_client.pubsub()
@@ -362,13 +1021,12 @@ class DataPipeline:
                         
                         # Try to recreate pubsub connection
                         try:
-                            # Use cached client if realtime_db is 1
+                            # Use cached optimized process-specific client (no get_client() calls)
                             if self.realtime_db == 1:
                                 dedicated_client = self.realtime_client
                             else:
-                                dedicated_client = self.redis_client.get_client(self.realtime_db)
-                            if dedicated_client is None and hasattr(self.redis_client, 'redis_client') and self.redis_client.redis_client:
-                                dedicated_client = self.redis_client.redis_client
+                                # Get cached optimized client for this database
+                                dedicated_client = get_cached_redis_client(db=self.realtime_db)
                             if dedicated_client:
                                 # Test connection
                                 dedicated_client.ping()
@@ -389,32 +1047,65 @@ class DataPipeline:
                             time.sleep(2)
                             continue
 
-                    # Get message with timeout
+                    # ✅ OPTIMIZED: Use XREADGROUP instead of Pub/Sub polling
+                    # This replaces inefficient get_message(timeout=1.0) polling
                     try:
-                        message = self.pubsub.get_message(timeout=1.0)
+                        messages = self._read_ticks_optimized()
+                        if messages:
+                            for stream_name, stream_messages in messages:
+                                for message_id_bytes, message_data in stream_messages:
+                                    message_id = message_id_bytes.decode('utf-8') if isinstance(message_id_bytes, bytes) else str(message_id_bytes)
+                                    try:
+                                        # Parse stream message
+                                        parsed_data = self._parse_stream_message(stream_name, message_data)
+                                        if parsed_data:
+                                            # Convert to Pub/Sub message format for compatibility
+                                            fake_message = {
+                                                "type": "message",
+                                                "channel": stream_name.encode() if isinstance(stream_name, str) else stream_name,
+                                                "data": json.dumps(parsed_data) if isinstance(parsed_data, dict) else str(parsed_data)
+                                            }
+                                            message_count += 1
+                                            self._process_message(fake_message)
+                                            
+                                            # Acknowledge successful processing
+                                            if hasattr(self, 'realtime_client') and self.realtime_client:
+                                                try:
+                                                    self.realtime_client.xack(stream_name, 'data_pipeline_group', message_id)
+                                                except Exception as ack_err:
+                                                    self.logger.debug(f"ACK error (non-critical): {ack_err}")
+                                    except Exception as msg_err:
+                                        self.logger.error(f"❌ Error processing stream message: {msg_err}")
+                                        continue
+                            
+                            consecutive_errors = 0  # Reset on successful batch
+                            if message_count <= 5 or message_count % 100 == 0:
+                                # Count total messages in batch
+                                total_msgs = sum(len(stream_data[1]) if len(stream_data) >= 2 else 0 for stream_data in messages)
+                                self.logger.debug(f"✅ Processed {total_msgs} messages from streams")
+                        else:
+                            # No messages (normal with blocking read)
+                            consecutive_errors = 0
                     except redis.ConnectionError as conn_err:
-                        self.logger.warning(f"⚠️ Redis connection error during get_message: {conn_err}")
+                        self.logger.warning(f"⚠️ Redis connection error during stream read: {conn_err}")
                         consecutive_errors += 1
                         if consecutive_errors >= max_consecutive_errors:
                             break
-                        # Force pubsub recreation
-                        self.pubsub = None
                         time.sleep(1)
                         continue
-                    
-                    if message and message["type"] == "message":
-                        message_count += 1
-                        consecutive_errors = 0  # Reset on successful message
-                        if message_count <= 5 or message_count % 100 == 0:
-                            pass
-                        self._process_message(message)
-                    elif message and message["type"] == "subscribe":
-                        # Log successful subscription
-                        if message_count == 0:
-                            channel = message.get('channel', b'')
-                            if isinstance(channel, bytes):
-                                channel = channel.decode('utf-8', errors='ignore')
-                            self.logger.debug(f"📡 Subscription confirmed: {channel}")
+                    except Exception as stream_err:
+                        error_str = str(stream_err).lower()
+                        if "timeout" in error_str or "no such key" in error_str:
+                            # Normal timeout or stream not ready, continue
+                            consecutive_errors = 0
+                            continue
+                        else:
+                            self.logger.warning(f"⚠️ Stream reading error: {stream_err}")
+                            consecutive_errors += 1
+                            if consecutive_errors >= max_consecutive_errors:
+                                break
+                            time.sleep(1)
+                            continue
 
                     # Periodic cleanup of old dedup hashes
                     self._cleanup_old_hashes()
@@ -465,16 +1156,42 @@ class DataPipeline:
                         time.sleep(0.5)  # Reduced sleep for faster recovery
 
         except redis.ConnectionError as e:
+            error_msg = str(e).lower()
             if self.logger and self.logger.handlers:
                 self.logger.error(f"❌ Redis connection error: {e}")
             self.stats["errors"] += 1
-            # Attempt reconnection
-            time.sleep(2)
-            if self.running:
+            
+            # CRITICAL: Handle "Too many connections" with exponential backoff
+            # If we hit connection limit, don't create MORE connections by reconnecting immediately
+            if "too many connections" in error_msg:
+                if not hasattr(self, '_connection_limit_backoff'):
+                    self._connection_limit_backoff = 5  # Start with 5 seconds
+                else:
+                    # Exponential backoff: 5s, 10s, 20s, 30s max
+                    self._connection_limit_backoff = min(self._connection_limit_backoff * 2, 30)
+                
                 if self.logger and self.logger.handlers:
-                    self.logger.info("🔄 Attempting to reconnect and resubscribe...")
-                # Recursively restart consuming (will recreate pubsub)
-                self.start_consuming()
+                    self.logger.warning(f"⚠️ Connection limit reached - backing off for {self._connection_limit_backoff}s (stopping pipeline to prevent cascade)")
+                
+                # CRITICAL: Don't try to reconnect immediately - that creates MORE connections
+                # Stop the pipeline and let the health monitor in scanner_main.py restart it
+                # after connections have time to close and backoff delay has passed
+                if self.logger and self.logger.handlers:
+                    self.logger.error("🛑 Stopping pipeline to prevent connection cascade - health monitor will restart after backoff")
+                # Don't recursively call start_consuming() - that creates MORE connections
+                # The outer health monitor will detect stopped pipeline and restart with proper delay
+                return  # Exit start_consuming() - pipeline will be restarted by health monitor
+            else:
+                # Normal connection error (not "too many connections")
+                # Reset backoff for normal errors
+                self._connection_limit_backoff = 1
+                # Attempt reconnection with normal delay
+                time.sleep(2)
+                if self.running:
+                    if self.logger and self.logger.handlers:
+                        self.logger.info("🔄 Attempting to reconnect and resubscribe...")
+                    # Recursively restart consuming (will recreate pubsub)
+                    self.start_consuming()
         except Exception as e:
             # Handle protocol errors specifically
             error_msg = str(e)
@@ -640,7 +1357,19 @@ class DataPipeline:
     def _process_market_tick(self, data):
         """Process market tick data with unified schema validation and cleaning"""
         start_time = time.time()
-        symbol = data.get("symbol", data.get("tradingsymbol", "UNKNOWN"))
+        # ✅ DEBUG: Log what we receive before symbol extraction
+        incoming_symbol = data.get("symbol", "NOT_FOUND")
+        incoming_token = data.get("instrument_token", "NOT_FOUND")
+        if incoming_symbol == "NOT_FOUND" or incoming_symbol == "UNKNOWN" or not incoming_symbol:
+            self.logger.warning(f"🔍 [TICK_DEBUG] Before extraction: symbol={incoming_symbol}, token={incoming_token}, keys={list(data.keys())[:10]}")
+        
+        # ✅ FIXED: Use _extract_symbol which includes token resolution
+        symbol = self._extract_symbol(data)
+        if not symbol or symbol == "UNKNOWN":
+            # Fallback to direct extraction if token resolution failed
+            symbol = data.get("symbol", data.get("tradingsymbol", "UNKNOWN"))
+            if symbol == "UNKNOWN":
+                self.logger.warning(f"🔍 [TICK_DEBUG] After extraction: symbol still UNKNOWN, original data keys: {list(data.keys())[:15]}")
 
         # Apply comprehensive mapping only if schema is available; otherwise skip
         mapped_tick = data
@@ -678,6 +1407,16 @@ class DataPipeline:
         # Ensure numeric types are normalized for all downstream consumers
         self._normalize_numeric_types(cleaned_tick)
 
+        # ✅ TIER 2: Archive to historical storage (non-blocking, queue-based)
+        # Archive AFTER cleaning/validation to ensure we store complete, validated data
+        # This is non-blocking and won't slow down real-time pattern detection
+        if self.historical_archive and symbol and symbol != "UNKNOWN":
+            try:
+                # Archive the cleaned tick data (includes all normalized fields)
+                self.historical_archive.archive_tick(cleaned_tick)
+            except Exception as e:
+                self.logger.debug(f"Archive failed (non-critical): {e}")
+
         # Validate bucket_incremental_volume normalization is preserved from ingestion
         try:
             self.process_tick(cleaned_tick)
@@ -708,7 +1447,10 @@ class DataPipeline:
             self._process_tick_for_patterns(cleaned_tick)
         except Exception as e:
             self.logger.error(f"Error in pattern processing: {e}")
-            
+        
+        # Note: Archive happens in _process_market_tick after cleaning/validation
+        # This ensures we archive complete, validated data without duplicates
+        
         if (
             len(self.batch_buffer) >= self.batch_size
             or (time.time() - self.last_batch_time) > self.batch_timeout
@@ -730,16 +1472,8 @@ class DataPipeline:
             # and set bucket_incremental_volume, incremental_volume, and volume fields
             self.logger.debug(f"Using pre-calculated volume from WebSocket parser")
             
-            # Calculate indicators and patterns under a slow-tick guard
-            perf = getattr(self, 'perf', None)
-            try:
-                from redis_files.perf_probe import slow_tick_guard
-            except Exception:
-                slow_tick_guard = None
-
-            ctx = slow_tick_guard(perf, symbol, threshold_ms=50) if slow_tick_guard and perf else None
-            if ctx:
-                ctx.__enter__()
+            # Calculate indicators and patterns
+            # perf_probe removed - no longer using slow_tick_guard context manager
             try:
                 if hasattr(self, 'tick_processor') and self.tick_processor:
                     indicators = self.tick_processor.process_tick(symbol, tick_data)
@@ -763,9 +1497,11 @@ class DataPipeline:
                                             pattern['indicators'] = {}
                                         # Merge calculated indicators into pattern
                                         pattern['indicators'].update(indicators)
-                                        # Also add top-level fields for easy access
+                                        # Also add top-level fields for easy access (including Greeks for options)
                                         for indicator_key in ['rsi', 'macd', 'ema_5', 'ema_10', 'ema_20', 'ema_50', 'ema_100', 'ema_200', 
-                                                             'atr', 'vwap', 'bollinger_bands', 'volume_profile', 'volume_ratio', 'price_change']:
+                                                             'atr', 'vwap', 'bollinger_bands', 'volume_profile', 'volume_ratio', 'price_change',
+                                                             # Greeks for options (so they're at top level in alerts)
+                                                             'delta', 'gamma', 'theta', 'vega', 'rho', 'dte_years', 'trading_dte']:
                                             if indicator_key in indicators and indicator_key not in pattern:
                                                 pattern[indicator_key] = indicators[indicator_key]
                                     self.logger.info(f"🔍 DEBUG: Calling alert_manager.send_alert for {symbol}: {pattern.get('pattern', 'UNKNOWN')}")
@@ -780,9 +1516,8 @@ class DataPipeline:
                         self.logger.warning(f"No indicators calculated for {symbol}")
                 else:
                     self.logger.warning(f"No tick processor available")
-            finally:
-                if ctx:
-                    ctx.__exit__(None, None, None)
+            except Exception as e:
+                self.logger.error(f"Error calculating indicators: {e}")
                 
         except Exception as e:
             self.logger.error(f"Error in _process_tick_for_patterns: {e}")
@@ -864,10 +1599,74 @@ class DataPipeline:
 
 
 
+    def _get_stream_maxlen(self, stream_key: str) -> int:
+        """
+        Determine appropriate maxlen for Redis stream based on stream type.
+        ALWAYS use maxlen in XADD operations to prevent unbounded stream growth.
+        
+        Args:
+            stream_key: Redis stream key name
+            
+        Returns:
+            int: Maximum number of messages to keep in stream
+        """
+        # Main streams - match optimizer targets
+        if stream_key == 'ticks:intraday:processed':
+            return 5000  # Match optimizer target
+        elif stream_key == 'ticks:raw:binary':
+            return 10000  # Match optimizer target
+        elif stream_key == 'alerts:stream':
+            return 1000  # Match optimizer target
+        elif stream_key.startswith('ticks:'):
+            # Per-symbol streams - keep smaller to prevent memory bloat
+            return 1000
+        else:
+            # Default for unknown streams
+            return 10000
+    
+    def _publish_to_stream_with_maxlen(self, redis_client, stream_key: str, stream_data: dict) -> bool:
+        """
+        Publish to Redis stream with ALWAYS applying maxlen parameter.
+        This prevents unbounded stream growth at the source.
+        
+        Args:
+            redis_client: Redis client instance
+            stream_key: Stream key name
+            stream_data: Data to publish
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            maxlen = self._get_stream_maxlen(stream_key)
+            redis_client.xadd(
+                stream_key,
+                stream_data,
+                maxlen=maxlen,
+                approximate=True  # Faster trimming, slight approximation acceptable
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"Stream publish error for {stream_key}: {e}")
+            return False
+
     def _flush_batch(self):
         """Flush batch buffer to main buffer and queue"""
         if not self.batch_buffer:
             return
+        
+        # ✅ FIXED: Ensure all required attributes are initialized
+        if not hasattr(self, 'buffer_lock'):
+            import threading
+            self.buffer_lock = threading.Lock()
+        if not hasattr(self, 'tick_buffer'):
+            from collections import deque
+            self.tick_buffer = deque()
+        if not hasattr(self, 'batch_buffer'):
+            self.batch_buffer = []
+        if not hasattr(self, 'tick_queue'):
+            import queue
+            self.tick_queue = queue.Queue()
 
         with self.buffer_lock:
             # Extend tick buffer with batch
@@ -915,44 +1714,115 @@ class DataPipeline:
                         'timestamp': str(int(time.time() * 1000)),
                         'symbol': symbol
                     }
-                    realtime_client.xadd(stream_key, stream_data)
-                    self.stats["ticks_published_to_stream"] = self.stats.get("ticks_published_to_stream", 0) + 1
+                    try:
+                        # ✅ FIXED: ALWAYS use maxlen in XADD to prevent unbounded stream growth
+                        if self._publish_to_stream_with_maxlen(realtime_client, stream_key, stream_data):
+                            self.stats["ticks_published_to_stream"] = self.stats.get("ticks_published_to_stream", 0) + 1
+                    except redis.ConnectionError as conn_err:
+                        if "Too many connections" in str(conn_err):
+                            # Don't log every single tick failure - just increment error counter
+                            self.stats["connection_errors"] = self.stats.get("connection_errors", 0) + 1
+                            # Log only once per 100 errors to avoid log spam
+                            if self.stats.get("connection_errors", 0) % 100 == 1:
+                                self.logger.warning(f"⚠️ Connection pool exhausted (suppressing further logs until resolved)")
+                        else:
+                            raise  # Re-raise non-connection errors
                 except Exception as e:
-                    self.logger.error(f"Failed to publish tick to stream: {e}")
+                    # Handle other errors (but not connection exhaustion)
+                    if "Too many connections" not in str(e):
+                        self.logger.error(f"Failed to publish tick to stream: {e}")
+                    # Increment error counter silently for connection exhaustion
+                    self.stats["errors"] = self.stats.get("errors", 0) + 1
             
             # Process ticks with HybridCalculations batch processing
             try:
                 if symbol_ticks:
-                    batch_results = self.hybrid_calculations.batch_process_symbols(symbol_ticks, max_ticks_per_symbol=50)
-                    self.stats["batch_indicators_calculated"] = self.stats.get("batch_indicators_calculated", 0) + len(batch_results)
+                    self.logger.info(f"📊 Processing batch: {len(symbol_ticks)} symbols, {sum(len(ticks) for ticks in symbol_ticks.values())} total ticks")
+                    # ✅ SIMPLIFIED CACHING: Use process_batch_indicators to only store fresh calculations
+                    all_results = self.process_batch_indicators(symbol_ticks)
+                    self.stats["batch_indicators_calculated"] = self.stats.get("batch_indicators_calculated", 0) + len(all_results)
                     
-                    # ✅ FIXED: Store calculated indicators in Redis
-                    self._store_calculated_indicators(batch_results)
+                    if all_results:
+                        self.logger.info(f"✅ Processed indicators for {len(all_results)} symbols (fresh + cached): {list(all_results.keys())[:5]}")
+                    else:
+                        self.logger.warning(f"⚠️ process_batch_indicators returned empty results for {len(symbol_ticks)} symbols")
                     
             except Exception as e:
-                self.logger.error(f"Failed to process batch with HybridCalculations: {e}")
+                self.logger.error(f"❌ Failed to process batch with HybridCalculations: {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
         
         self.batch_buffer.clear()
         self.last_batch_time = time.time()
         self.stats["batches_processed"] += 1
 
+    def process_batch_indicators(self, symbol_data: Dict[str, List[Dict]]) -> Dict[str, Dict]:
+        """
+        ✅ SIMPLIFIED CACHING: Process batch indicators with intelligent storage.
+        Only stores fresh calculations (cached results are skipped).
+        
+        Args:
+            symbol_data: Dict mapping symbol -> list of tick data
+            
+        Returns:
+            Dict mapping symbol -> calculated indicators (fresh + cached combined)
+        """
+        # Get calculations (fresh + cached)
+        all_results = self.hybrid_calculations.batch_process_symbols(symbol_data, max_ticks_per_symbol=50)
+        
+        # ✅ STORE ONLY FRESH CALCULATIONS: Check which symbols had fresh calculations
+        fresh_results = {}
+        if hasattr(self.hybrid_calculations, '_fresh_calculations'):
+            for symbol in self.hybrid_calculations._fresh_calculations:
+                if symbol in all_results:
+                    fresh_results[symbol] = all_results[symbol]
+        
+        # Store ONLY fresh calculations to Redis
+        if fresh_results:
+            self._store_calculated_indicators(fresh_results)
+            self.logger.debug(f"💾 Stored {len(fresh_results)} fresh indicator sets to Redis (skipped {len(all_results) - len(fresh_results)} cached)")
+        
+        # Return combined results (fresh + cached)
+        return all_results
+
     def _store_calculated_indicators(self, batch_results: dict) -> None:
-        """Store calculated indicators in Redis following redis_config.py database segmentation"""
-        if not batch_results or not self.redis_client:
+        """
+        ✅ STORE ONLY WHEN NEEDED: Store calculated indicators in Redis.
+        Only stores to Redis when we have fresh calculations (not from cache).
+        Stores to DB 5 using "indicators_cache" data type.
+        """
+        if not batch_results:
+            self.logger.debug("⚠️ _store_calculated_indicators: batch_results is empty")
+            return
+        
+        if not self.redis_client:
+            self.logger.warning("⚠️ _store_calculated_indicators: redis_client is None")
             return
         
         try:
             import json
             import time
             
+            storage_count = 0
+            
             for symbol, indicators in batch_results.items():
                 if not indicators:
                     continue
                 
-                # Store technical indicators using store_by_data_type (follows redis_config.py)
+                # ✅ Only store if this was a fresh calculation (not from cache)
+                if not self._was_fresh_calculation(symbol):
+                    continue
+                
+                # Store technical indicators
+                greeks_to_store = {}
+                
                 for indicator_name, value in indicators.items():
-                    if indicator_name in ['rsi', 'atr', 'ema_20', 'ema_50', 'vwap', 'macd', 'bollinger_bands']:
+                    # Store technical indicators
+                    if indicator_name in ['rsi', 'atr', 'ema_20', 'ema_50', 'vwap', 'macd', 'bollinger_bands', 
+                                         'ema_5', 'ema_10', 'ema_100', 'ema_200']:
                         try:
+                            redis_key = f"indicators:{symbol}:{indicator_name}"
+                            
                             # Store as JSON for complex indicators (MACD, Bollinger Bands)
                             if isinstance(value, dict):
                                 indicator_data = {
@@ -961,43 +1831,89 @@ class DataPipeline:
                                     'symbol': symbol,
                                     'indicator_type': indicator_name
                                 }
-                                redis_key = f"indicators:{symbol}:{indicator_name}"
-                                
-                                # Store in realtime database (DB 1) using store_by_data_type
-                                self.redis_client.store_by_data_type("analysis_cache", redis_key, json.dumps(indicator_data))
-                                
+                                # ✅ Store to DB 5 using "indicators_cache" data type
+                                result = self.redis_client.store_by_data_type(
+                                    "indicators_cache",  # DB 5
+                                    redis_key, 
+                                    json.dumps(indicator_data),
+                                    ttl=300  # 5 minutes to match calculation cache
+                                )
                             else:
                                 # Store simple numeric values
-                                redis_key = f"indicators:{symbol}:{indicator_name}"
-                                
-                                # Store in realtime database (DB 1) using store_by_data_type
-                                self.redis_client.store_by_data_type("analysis_cache", redis_key, str(value))
+                                # ✅ Store to DB 5 using "indicators_cache" data type
+                                result = self.redis_client.store_by_data_type(
+                                    "indicators_cache",  # DB 5
+                                    redis_key, 
+                                    str(value),
+                                    ttl=300  # 5 minutes to match calculation cache
+                                )
+                            
+                            if result:
+                                storage_count += 1
+                                self.logger.debug(f"✅ Stored {indicator_name} for {symbol}")
+                            else:
+                                self.logger.warning(f"❌ Failed to store {indicator_name} for {symbol} (store_by_data_type returned False)")
                                 
                         except Exception as e:
-                            self.logger.debug(f"Failed to store {indicator_name} for {symbol}: {e}")
+                            self.logger.error(f"❌ Exception storing {indicator_name} for {symbol}: {e}")
+                            import traceback
+                            self.logger.debug(traceback.format_exc())
+                    
+                    # Collect Greeks for storage (delta, gamma, theta, vega, rho)
+                    elif indicator_name in ['delta', 'gamma', 'theta', 'vega', 'rho']:
+                        greeks_to_store[indicator_name] = value
                 
-                # Store bucket_incremental_volume ratio in analytics database (DB 2) using store_by_data_type
-                if 'volume_ratio' in indicators:
+                # Store Greeks as a combined dict (preferred) and individually (fallback)
+                if greeks_to_store:
                     try:
-                        volume_ratio_data = {
-                            'volume_ratio': indicators['volume_ratio'],
+                        # Store combined Greeks dict
+                        greeks_data = {
+                            'value': greeks_to_store,
                             'timestamp': int(time.time() * 1000),
                             'symbol': symbol,
-                            'data_type': 'volume_metrics'
+                            'indicator_type': 'greeks'
                         }
-                        redis_key = f"volume_ratio:{symbol}:latest"
+                        redis_key = f"indicators:{symbol}:greeks"
+                        # ✅ Store to DB 5 using "indicators_cache" data type
+                        self.redis_client.store_by_data_type(
+                            "indicators_cache",  # DB 5
+                            redis_key, 
+                            json.dumps(greeks_data),
+                            ttl=300  # 5 minutes to match calculation cache
+                        )
                         
-                        # Store in analytics database (DB 2) using store_by_data_type
-                        self.redis_client.store_by_data_type("metrics_cache", redis_key, json.dumps(volume_ratio_data))
+                        # Also store individual Greeks for backward compatibility
+                        for greek_name, greek_value in greeks_to_store.items():
+                            greek_key = f"indicators:{symbol}:{greek_name}"
+                            # ✅ Store to DB 5 using "indicators_cache" data type
+                            self.redis_client.store_by_data_type(
+                                "indicators_cache",  # DB 5
+                                greek_key, 
+                                str(greek_value),
+                                ttl=300  # 5 minutes to match calculation cache
+                            )
                         
+                        storage_count += len(greeks_to_store)
+                        self.logger.debug(f"✅ Stored Greeks for {symbol}: {list(greeks_to_store.keys())}")
                     except Exception as e:
-                        self.logger.debug(f"Failed to store volume_ratio for {symbol}: {e}")
+                        self.logger.debug(f"Failed to store Greeks for {symbol}: {e}")
             
-            self.stats["indicators_stored_in_redis"] = self.stats.get("indicators_stored_in_redis", 0) + len(batch_results)
-            self.logger.debug(f"Stored indicators for {len(batch_results)} symbols in Redis (DB 1: realtime, DB 2: analytics)")
+            if storage_count > 0:
+                self.logger.info(f"💾 Stored {storage_count} fresh indicators to Redis DB 5")
             
         except Exception as e:
             self.logger.error(f"Failed to store calculated indicators in Redis: {e}")
+    
+    def _was_fresh_calculation(self, symbol: str) -> bool:
+        """
+        Check if the last calculation was fresh or cached.
+        Uses the _fresh_calculations set from HybridCalculations.
+        """
+        if not hasattr(self.hybrid_calculations, '_fresh_calculations'):
+            return False
+        
+        # Check if symbol is in the fresh calculations set
+        return symbol in self.hybrid_calculations._fresh_calculations
 
     def _get_news_for_symbol(self, symbol):
         """
@@ -1451,17 +2367,20 @@ class DataPipeline:
             or sym_str == "UNKNOWN"
         ):
             tok = tick_data.get("instrument_token")
-            try:
-                # 🚀 OPTIMIZED: Use instrument mapper to resolve token to symbol
-                from crawlers.utils.instrument_mapper import InstrumentMapper
-                mapper = InstrumentMapper()
-                resolved = mapper.token_to_symbol(tok)
-            except Exception:
-                resolved = None
-            if resolved:
-                symbol = resolved
-                # Store the resolved symbol back into the tick data
-                tick_data['symbol'] = resolved
+            # ✅ FIXED: Only resolve if instrument_token exists and is not None
+            if tok is not None and tok != "":
+                try:
+                    # 🚀 OPTIMIZED: Use instrument mapper to resolve token to symbol
+                    from crawlers.utils.instrument_mapper import InstrumentMapper
+                    mapper = InstrumentMapper()
+                    resolved = mapper.token_to_symbol(tok)
+                    if resolved and not resolved.startswith("UNKNOWN"):
+                        symbol = resolved
+                        # Store the resolved symbol back into the tick data
+                        tick_data['symbol'] = resolved
+                except Exception as e:
+                    self.logger.debug(f"Token resolution failed for token {tok}: {e}")
+                    resolved = None
 
         # Debug logging for missing symbols
         if not symbol or symbol == "UNKNOWN":
@@ -1667,6 +2586,8 @@ class DataPipeline:
         
         # Debug logging for volume data from WebSocket Parser
         if bucket_incremental_volume > 0:
+            import logging
+            logger = logging.getLogger(__name__)
             logger.info(f"🔧 [VOLUME_FIX] {symbol}: cumulative={current_cumulative}, incremental={bucket_incremental_volume} (from WebSocket Parser)")
         
         # Initialize bucket-level fields (will be updated in bucket_incremental_volume context step)
@@ -2155,6 +3076,14 @@ class DataPipeline:
         """Stop the data pipeline gracefully"""
         self.running = False
 
+        # ✅ TIER 2: Stop historical archive and flush remaining data
+        if self.historical_archive:
+            try:
+                self.historical_archive.stop()
+                self.logger.info("✅ Historical archive stopped and flushed")
+            except Exception as e:
+                self.logger.warning(f"Error stopping historical archive: {e}")
+
         # Flush any remaining batch
         with self.batch_lock:
             if self.batch_buffer:
@@ -2499,13 +3428,37 @@ class DataPipeline:
             self.stats["errors"] += 1
 
     def _process_news_from_symbol_keys(self):
-        """Process news from symbol-specific keys (gift_nifty_gap.py format)"""
+        """Process news from symbol-specific keys (gift_nifty_gap.py format)
+        
+        ✅ STANDARDIZED: Uses direct key lookups for known symbols instead of pattern matching.
+        ❌ FORBIDDEN: .keys("news:symbol:*") pattern matching removed per Redis key standards.
+        """
         try:
-            # Get all news symbol keys
-            news_keys = self.redis_client.keys("news:symbol:*")
-            self.logger.debug(f"🔍 Found {len(news_keys)} news symbol keys: {news_keys}")
+            # ✅ STANDARDIZED: Use direct key lookups for known symbols
+            # Get symbols from active universe or tick data, not pattern matching
+            symbols_to_check = set()
             
-            for news_key in news_keys:
+            # Collect symbols from current tick data being processed
+            if hasattr(self, 'batch_buffer') and self.batch_buffer:
+                for tick in self.batch_buffer.values():
+                    for symbol_tick in tick:
+                        symbol = symbol_tick.get('symbol') or ''
+                        if symbol:
+                            symbols_to_check.add(symbol)
+            
+            # Also check symbols from recent ticks cache
+            if hasattr(self, 'last_processed_symbols'):
+                symbols_to_check.update(self.last_processed_symbols)
+            
+            if not symbols_to_check:
+                self.logger.debug("No symbols available for news lookup")
+                return
+            
+            self.logger.debug(f"🔍 Checking news for {len(symbols_to_check)} known symbols (direct lookup)")
+            
+            for symbol in symbols_to_check:
+                # ✅ Direct key lookup per symbol
+                news_key = f"news:symbol:{symbol}"
                 try:
                     # Get the latest news item from the sorted set
                     news_items = self.redis_client.zrange(news_key, -1, -1)
@@ -3357,6 +4310,8 @@ class NewsIntegratedPatternDetector:
                         pattern.get('symbol', symbol), news_context
                     )
                 except Exception as dispatch_error:
+                    import logging
+                    logger = logging.getLogger(__name__)
                     logger.debug(f"MathDispatcher news impact error for {symbol}: {dispatch_error}")
 
             if news_boost is None:
