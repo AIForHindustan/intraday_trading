@@ -93,3 +93,10 @@ statistical_model_data_*.json
 test_*.py
 *_test.py
 
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env.local
+frontend/package-lock.json
+
