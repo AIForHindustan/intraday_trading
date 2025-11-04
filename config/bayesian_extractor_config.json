@@ -1,0 +1,49 @@
+{
+  "extraction": {
+    "redis_host": "localhost",
+    "redis_port": 6379,
+    "databases": [0, 5, 6],
+    "read_only": true,
+    "connection_timeout": 5,
+    "socket_timeout": 5
+  },
+  "export": {
+    "directory": "research_data/bayesian_extracts",
+    "format": "json",
+    "compress_old_files": true,
+    "max_file_age_days": 30,
+    "create_daily_summaries": true
+  },
+  "schedule": {
+    "mode": "continuous",
+    "export_interval_seconds": 120,
+    "market_hours_only": true,
+    "pre_market_extract": "08:45",
+    "post_market_extract": "15:45",
+    "end_of_day_extract": "16:00"
+  },
+  "validation": {
+    "enabled": true,
+    "fail_on_validation_error": false,
+    "log_validation_details": true,
+    "min_buckets_per_symbol": 5,
+    "max_time_gap_minutes": 10,
+    "min_volume_threshold": 0,
+    "max_volume_ratio": 100.0
+  },
+  "data_quality": {
+    "check_timestamp_continuity": true,
+    "check_volume_integrity": true,
+    "check_symbol_consistency": true,
+    "check_missing_buckets": true,
+    "check_data_completeness": true,
+    "check_market_hours_coverage": true,
+    "check_volume_anomalies": true
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/bayesian_extractor.log",
+    "max_file_size_mb": 10,
+    "backup_count": 5
+  }
+}
