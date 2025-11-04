@@ -150,9 +150,12 @@ class AlertValidator:
                         (now - timedelta(days=2)).strftime('%Y-%m-%d'),  # Day before
                     ]
                     
+                    # ✅ Use RedisKeyStandards for consistent key naming
+                    from redis_files.redis_key_standards import RedisKeyStandards
+                    
                     # Try each date
                     for date_str in dates_to_try:
-                        session_key = f"session:{symbol}:{date_str}"
+                        session_key = RedisKeyStandards.get_session_key(symbol, date_str)
                         session_data = db0_client.get(session_key)
                         
                         if session_data:
@@ -190,8 +193,11 @@ class AlertValidator:
                     # ✅ PRIORITY 2: DB 2 - OHLC latest snapshot
                     db2_client = self.get_client(2)
                     
+                    # ✅ Use RedisKeyStandards for consistent key naming
+                    from redis_files.redis_key_standards import RedisKeyStandards
+                    
                     # Try ohlc_latest hash key (DB 2)
-                    ohlc_key = f"ohlc_latest:{symbol}"
+                    ohlc_key = RedisKeyStandards.get_ohlc_latest_key(symbol)
                     ohlc_data = db2_client.hgetall(ohlc_key)
                     
                     if ohlc_data:
@@ -220,8 +226,11 @@ class AlertValidator:
                             underlying = base_symbol if base_symbol else symbol
                         
                         # ✅ FIXED: Check recent dates for underlying symbol too
+                        # ✅ Use RedisKeyStandards for consistent key naming
+                        from redis_files.redis_key_standards import RedisKeyStandards
+                        
                         for date_str in dates_to_try:
-                            underlying_session_key = f"session:{underlying}:{date_str}"
+                            underlying_session_key = RedisKeyStandards.get_session_key(underlying, date_str)
                             underlying_session = db0_client.get(underlying_session_key)
                             if underlying_session:
                                 try:
@@ -246,7 +255,9 @@ class AlertValidator:
                                     continue
                         
                         # Try underlying in DB 2 OHLC
-                        underlying_key = f"ohlc_latest:{underlying}"
+                        # ✅ Use RedisKeyStandards for consistent key naming
+                        from redis_files.redis_key_standards import RedisKeyStandards
+                        underlying_key = RedisKeyStandards.get_ohlc_latest_key(underlying)
                         underlying_data = db2_client.hgetall(underlying_key)
                         if underlying_data:
                             last_price = underlying_data.get(b'last_price') or underlying_data.get('last_price')
@@ -601,7 +612,9 @@ class AlertValidator:
                 
                 # Try cache first unless forced to use buckets
                 if not force_buckets:
-                    key = f"metrics:{symbol}:{window}min"
+                    # ✅ Use RedisKeyStandards for consistent key naming
+                    from redis_files.redis_key_standards import RedisKeyStandards
+                    key = RedisKeyStandards.get_metrics_key(symbol, window)
                     # ✅ FIXED: Metrics cache is in DB 2 (analytics) per REDIS_STORAGE_SIGNATURE.md
                     store_client = self.metrics_store_client or RedisManager82.get_client(
                         process_name="alert_validator",
@@ -708,9 +721,12 @@ class AlertValidator:
             buckets_data = []
             
             # Try session data first (where buckets are actually stored)
+            # ✅ Use RedisKeyStandards for consistent key naming
+            from redis_files.redis_key_standards import RedisKeyStandards
+            
             for try_symbol in symbols_to_try:
                 for date_str in dates_to_try:
-                    session_key = f"session:{try_symbol}:{date_str}"
+                    session_key = RedisKeyStandards.get_session_key(try_symbol, date_str)
                     try:
                         # Use DB 0 client for session data
                         session_client = self.redis_client if hasattr(self.redis_client, 'get') else RedisManager82.get_client(
@@ -963,9 +979,12 @@ class AlertValidator:
             # Indicator names (from HybridCalculations)
             indicator_names = ['rsi', 'atr', 'vwap', 'ema_20', 'ema_50', 'macd', 'bollinger_bands']
             
+            # ✅ Use RedisKeyStandards for consistent key naming
+            from redis_files.redis_key_standards import RedisKeyStandards
+            
             for variant in symbol_variants:
                 for indicator_name in indicator_names:
-                    redis_key = f"indicators:{variant}:{indicator_name}"
+                    redis_key = RedisKeyStandards.get_indicator_key(variant, indicator_name, use_cache=False)
                     try:
                         value = redis_db1.get(redis_key)
                         if value:
@@ -1029,9 +1048,12 @@ class AlertValidator:
                 f"NFO:{symbol.split(':')[-1]}" if ':' not in symbol else symbol,
             ]
             
+            # ✅ Use RedisKeyStandards for consistent key naming
+            from redis_files.redis_key_standards import RedisKeyStandards
+            
             for variant in symbol_variants:
                 # Try combined greeks first
-                greeks_key = f"indicators:{variant}:greeks"
+                greeks_key = RedisKeyStandards.get_greeks_key(variant)
                 try:
                     greeks_data = redis_db1.get(greeks_key)
                     if greeks_data:
@@ -1045,8 +1067,9 @@ class AlertValidator:
                     pass
                 
                 # Try individual Greeks
+                # ✅ Use RedisKeyStandards for consistent key naming (already imported above)
                 for greek_name in ['delta', 'gamma', 'theta', 'vega', 'rho']:
-                    greek_key = f"indicators:{variant}:{greek_name}"
+                    greek_key = RedisKeyStandards.get_indicator_key(variant, greek_name, use_cache=False)
                     try:
                         greek_value = redis_db1.get(greek_key)
                         if greek_value:

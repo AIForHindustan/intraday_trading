@@ -2,9 +2,14 @@
 """
 Redis-Only Pattern Memory Validator for Independent Alert Validation
 Completely separate from main system - relies only on Redis data
+
+INDEPENDENT SYSTEM:
+- Runs independently with alert_validator (not in main loop)
+- Uses DB 3 (independent_validator_db) - isolated from main system
+- Stores signal quality, pattern performance, and validation metrics
+- TTL: 7 days (604800 seconds) per redis_config.py
 """
 
-import redis
 import json
 import time
 import logging
@@ -57,10 +62,23 @@ class PatternConfidenceEngine:
     - Dynamic penalty/boost system
     - Multi-timeframe agreement scoring
     - Completely independent from main system
+    
+    INDEPENDENT SYSTEM:
+    - Initializes its own Redis client (DB 3) - isolated from main system
+    - Uses RedisManager82 for process-specific connection pools
+    - Stores to DB 3 (independent_validator_db) with 7-day TTL
+    - Does not mix with main system data (DBs 0, 1, 2, 4, 5)
     """
     
-    def __init__(self, redis_client, config: Dict = None):
-        self.redis = redis_client
+    def __init__(self, config: Dict = None, redis_host: str = 'localhost', redis_port: int = 6379):
+        """
+        Initialize independent Redis client for validator system.
+        
+        Args:
+            config: Optional configuration dict
+            redis_host: Redis host (default: localhost)
+            redis_port: Redis port (default: 6379)
+        """
         self.signal_quality: Dict[str, SignalQuality] = {}
         self.setup_logging()
         
@@ -68,9 +86,30 @@ class PatternConfidenceEngine:
         self.config = config or {}
         self.recency_config = self.config.get('recency_boost', {})
         
-        # Debug logging for Redis client
-        self.logger.info(f"🔧 Redis-Only PatternConfidenceEngine initialized")
-        self.logger.info(f"   Redis client: {type(redis_client)}")
+        # ✅ INDEPENDENT: Initialize own Redis client for DB 3 (isolated from main system)
+        from redis_files.redis_manager import RedisManager82
+        from redis_files.redis_config import REDIS_DATABASES
+        
+        self.redis = RedisManager82.get_client(
+            process_name="independent_validator",
+            db=3,  # DB 3 - independent_validator_db (isolated from main system)
+            host=redis_host,
+            port=redis_port,
+            max_connections=None  # Use PROCESS_POOL_CONFIG value
+        )
+        
+        if not self.redis:
+            raise RuntimeError("Failed to initialize independent Redis client for validator (DB 3)")
+        
+        # ✅ Use centralized TTL from redis_config.py via get_ttl_for_data_type()
+        from redis_files.redis_config import get_ttl_for_data_type
+        self.ttl = get_ttl_for_data_type("signal_quality")  # DB 3: 604800 seconds (7 days)
+        
+        # Debug logging
+        self.logger.info(f"🔧 Independent PatternConfidenceEngine initialized")
+        self.logger.info(f"   Redis DB: 3 (independent_validator_db)")
+        self.logger.info(f"   TTL: {self.ttl} seconds ({self.ttl / 86400:.1f} days)")
+        self.logger.info(f"   Redis client: {type(self.redis)}")
         self.logger.info(f"   Recency boost config: {self.recency_config}")
         
         # Confidence calculation parameters
@@ -99,8 +138,9 @@ class PatternConfidenceEngine:
         if key not in self.signal_quality:
             self.signal_quality[key] = SignalQuality(symbol, pattern_type)
             
-            # Try to load historical data from Redis
-            historical_key = f"signal_quality:{key}"
+            # ✅ Use RedisKeyStandards for consistent key naming
+            from redis_files.redis_key_standards import RedisKeyStandards
+            historical_key = RedisKeyStandards.get_signal_quality_key(symbol, pattern_type)
             historical_data = self.redis.get(historical_key)
             if historical_data:
                 try:
@@ -128,9 +168,11 @@ class PatternConfidenceEngine:
         
         sq.confidence_history.append(confidence)
         
-        # Save to Redis for persistence
+        # ✅ INDEPENDENT: Save to Redis DB 3 with configured TTL
+        # ✅ Use RedisKeyStandards for consistent key naming
+        from redis_files.redis_key_standards import RedisKeyStandards
         try:
-            key = f"signal_quality:{symbol}:{pattern_type}"
+            key = RedisKeyStandards.get_signal_quality_key(symbol, pattern_type)
             data = {
                 'total_signals': sq.total_signals,
                 'successful_signals': sq.successful_signals,
@@ -138,7 +180,8 @@ class PatternConfidenceEngine:
                 'confidence_history': list(sq.confidence_history),
                 'last_updated': datetime.now().isoformat()
             }
-            self.redis.setex(key, 86400 * 7, json.dumps(data))  # Keep for 1 week
+            # Use TTL from redis_config.py (7 days = 604800 seconds)
+            self.redis.setex(key, self.ttl, json.dumps(data))
         except Exception as e:
             self.logger.error(f"Error saving signal quality: {e}")
     
@@ -633,13 +676,18 @@ class PatternConfidenceEngine:
                 'confidence_consistency': signal_quality.confidence_consistency
             }
             
-            # Store in Redis for statistical model building
-            redis_key = f"pattern_performance:{symbol}:{pattern_type}"
+            # ✅ INDEPENDENT: Store in Redis DB 3 for statistical model building
+            # ✅ Use RedisKeyStandards for consistent key naming
+            from redis_files.redis_key_standards import RedisKeyStandards
+            
+            redis_key = RedisKeyStandards.get_pattern_performance_key(symbol, pattern_type)
             self.redis.lpush(redis_key, json.dumps(performance_data))
             self.redis.ltrim(redis_key, 0, 999)  # Keep last 1000 samples
+            # Set TTL on list (7 days)
+            self.redis.expire(redis_key, self.ttl)
             
             # Store aggregated performance metrics
-            aggregated_key = f"pattern_metrics:{symbol}:{pattern_type}"
+            aggregated_key = RedisKeyStandards.get_pattern_metrics_key(symbol, pattern_type)
             aggregated_data = {
                 'total_signals': signal_quality.total_signals,
                 'successful_signals': signal_quality.successful_signals,
@@ -649,6 +697,8 @@ class PatternConfidenceEngine:
                 'last_updated': time.time()
             }
             self.redis.hset(aggregated_key, mapping=aggregated_data)
+            # Set TTL on hash (7 days)
+            self.redis.expire(aggregated_key, self.ttl)
             
         except Exception as e:
             self.logger.error(f"Error tracking pattern performance: {e}")

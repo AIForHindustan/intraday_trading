@@ -61,6 +61,19 @@ class RedisKeyStandards:
         # Metrics
         'metrics': 'metrics:{symbol}:{window}min',
         'volume_averages': 'volume_averages:{symbol}',
+        
+        # Alert validation metadata (DB 0)
+        'alert_metadata': 'alert:metadata:{alert_id}',
+        'alert_performance_stats': 'alert_performance:stats',
+        'alert_performance_pattern': 'alert_performance:stats:{pattern}',
+        'alert_performance_patterns_set': 'alert_performance:patterns',  # Set of known patterns
+        'alert_rolling_windows': 'alert:rolling_windows',
+        'alert_charts': 'alert:charts',
+        
+        # Independent validator system (DB 3)
+        'signal_quality': 'signal_quality:{symbol}:{pattern_type}',
+        'pattern_performance': 'pattern_performance:{symbol}:{pattern_type}',
+        'pattern_metrics': 'pattern_metrics:{symbol}:{pattern_type}',
     }
     
     @staticmethod
@@ -124,6 +137,56 @@ class RedisKeyStandards:
     def get_session_key(symbol: str, date: str) -> str:
         """Get session key - direct lookup"""
         return f"session:{symbol}:{date}"
+    
+    @staticmethod
+    def get_alert_metadata_key(alert_id: str) -> str:
+        """Get alert metadata key - direct lookup (DB 0)"""
+        return f"alert:metadata:{alert_id}"
+    
+    @staticmethod
+    def get_alert_performance_stats_key() -> str:
+        """Get alert performance stats key - direct lookup (DB 0)"""
+        return "alert_performance:stats"
+    
+    @staticmethod
+    def get_alert_performance_pattern_key(pattern: str) -> str:
+        """Get alert performance pattern-specific stats key - direct lookup (DB 0)"""
+        return f"alert_performance:stats:{pattern}"
+    
+    @staticmethod
+    def get_alert_performance_patterns_set_key() -> str:
+        """Get alert performance patterns Set key - direct lookup (DB 0)"""
+        return "alert_performance:patterns"
+    
+    @staticmethod
+    def get_signal_quality_key(symbol: str, pattern_type: str) -> str:
+        """Get signal quality key - direct lookup (DB 3 - independent validator)"""
+        return f"signal_quality:{symbol}:{pattern_type}"
+    
+    @staticmethod
+    def get_pattern_performance_key(symbol: str, pattern_type: str) -> str:
+        """Get pattern performance key - direct lookup (DB 3 - independent validator)"""
+        return f"pattern_performance:{symbol}:{pattern_type}"
+    
+    @staticmethod
+    def get_pattern_metrics_key(symbol: str, pattern_type: str) -> str:
+        """Get pattern metrics key - direct lookup (DB 3 - independent validator)"""
+        return f"pattern_metrics:{symbol}:{pattern_type}"
+    
+    @staticmethod
+    def get_ohlc_latest_key(symbol: str) -> str:
+        """Get OHLC latest key - direct lookup (DB 2 - analytics)"""
+        return f"ohlc_latest:{symbol}"
+    
+    @staticmethod
+    def get_volume_averages_key(symbol: str) -> str:
+        """Get volume averages key - direct lookup"""
+        return f"volume_averages:{symbol}"
+    
+    @staticmethod
+    def get_metrics_key(symbol: str, window: int) -> str:
+        """Get metrics key - direct lookup (DB 2 - analytics)"""
+        return f"metrics:{symbol}:{window}min"
     
     @staticmethod
     def validate_no_pattern_matching(client, operation_description: str = ""):

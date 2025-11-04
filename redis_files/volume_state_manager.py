@@ -13,8 +13,12 @@ class VolumeStateManager:
     """
     
     def __init__(self, redis_client: redis.Redis, token_resolver=None):
-        # Ensure we use DB 0 (system) for session data and volume state
-        # VolumeStateManager stores: volume_state:* (session metadata) and session:* keys
+        """
+        Initialize VolumeStateManager with proper DB separation:
+        - DB 0 (system): Session state and volume_state metadata (session_data)
+        - DB 2 (analytics): Volume profile data (analytics_data) - passed to VolumeProfileManager
+        """
+        # ✅ DB 0: Session state and volume_state metadata (session_data)
         if redis_client and hasattr(redis_client, 'get_client'):
             try:
                 self.redis = redis_client.get_client(0)  # DB 0: system (session_data)
@@ -25,20 +29,43 @@ class VolumeStateManager:
             self.redis = redis_client  # Fallback for raw redis-py clients
         else:
             self.redis = None  # No Redis client available
+        
+        # ✅ DB 2: Analytics client for volume profile data (analytics_data)
+        # Volume profile data belongs to DB 2 (analytics/historical) per redis_config.py
+        self.redis_analytics = None
+        if redis_client and hasattr(redis_client, 'get_client'):
+            try:
+                self.redis_analytics = redis_client.get_client(2)  # DB 2: analytics (volume profiles)
+                logger.debug("✅ DB 2 (analytics) client initialized for volume profile storage")
+            except Exception as e:
+                logger.warning(f"Failed to get Redis client for DB 2: {e}")
+                self.redis_analytics = None
+        elif redis_client:
+            # For raw redis-py clients, try to select DB 2
+            try:
+                self.redis_analytics = redis_client
+                self.redis_analytics.select(2)  # Select DB 2 for volume profiles
+                logger.debug("✅ DB 2 (analytics) selected for volume profile storage")
+            except Exception as e:
+                logger.warning(f"Failed to select DB 2 for volume profiles: {e}")
+                self.redis_analytics = None
+        
         self.token_resolver = token_resolver
         self.local_cache: Dict[str, Dict] = {}  # instrument -> {last_cumulative, session_date}
         
-        # NEW: Volume Profile Integration (only if Redis is available)
+        # ✅ Volume Profile Integration: Use DB 2 (analytics) client for volume profile storage
         self.volume_profile_manager = None
-        if self.redis is not None:
+        if self.redis_analytics is not None:
             self._initialize_volume_profile_manager()
     
     def _initialize_volume_profile_manager(self):
-        """Initialize VolumeProfileManager with proper error handling"""
+        """Initialize VolumeProfileManager with DB 2 (analytics) client for volume profile storage"""
         try:
             from patterns.volume_profile_manager import VolumeProfileManager
-            self.volume_profile_manager = VolumeProfileManager(self.redis, self.token_resolver)
-            logger.info("✅ VolumeProfileManager integrated with VolumeStateManager")
+            # ✅ Pass DB 2 (analytics) client to VolumeProfileManager
+            # VolumeProfileManager expects DB 2 for analytics/historical data per redis_config.py
+            self.volume_profile_manager = VolumeProfileManager(self.redis_analytics, self.token_resolver)
+            logger.info("✅ VolumeProfileManager integrated with VolumeStateManager (DB 2 analytics)")
         except Exception as e:
             logger.warning(f"⚠️ VolumeProfileManager not available: {e}")
             self.volume_profile_manager = None
@@ -97,12 +124,15 @@ class VolumeStateManager:
         state['last_cumulative'] = current_cumulative
         
         # Persist to Redis (survives process restarts) - only if Redis is available
+        # ✅ Use centralized TTL from redis_config.py
         if self.redis is not None:
             try:
+                from redis_files.redis_config import get_ttl_for_data_type
                 self.redis.hset(state_key, 'last_cumulative', current_cumulative)
                 self.redis.hset(state_key, 'session_date', current_date)
-                # Set 24-hour TTL to auto-cleanup
-                self.redis.expire(state_key, 86400)
+                # Use centralized TTL for session_data (DB 0: 57600 seconds = 16 hours)
+                session_ttl = get_ttl_for_data_type("session_data")
+                self.redis.expire(state_key, session_ttl)
             except Exception as e:
                 logger.debug(f"Failed to persist state to Redis for {instrument_token}: {e}")
         
@@ -194,7 +224,11 @@ class VolumeStateManager:
             combined_incremental = ce_incremental + pe_incremental
             combined_cumulative = ce_volume + pe_volume
             
-            # Store straddle-specific metrics in Redis DB 1 (realtime) - real-time trading data
+            # ✅ Straddle volumes: Store in DB 2 (analytics) for consistency with volume profile data
+            # Straddle volumes are analytics/historical data, not real-time trading signals
+            # ✅ Use centralized TTL from redis_config.py
+            from redis_files.redis_config import get_ttl_for_data_type
+            
             straddle_key = f"straddle_volume:{underlying_symbol}:{exchange_timestamp.strftime('%Y%m%d')}"
             straddle_data = {
                 'ce_incremental': ce_incremental,
@@ -207,24 +241,36 @@ class VolumeStateManager:
                 'underlying': underlying_symbol
             }
             
-            # Get realtime client (DB 1) for straddle volume data
-            if hasattr(self, '_redis_wrapper') and hasattr(self._redis_wrapper, 'get_client'):
-                realtime_client = self._redis_wrapper.get_client(1)  # DB 1: realtime
-                if realtime_client:
-                    # Store in Redis DB 1 (realtime) with 1-hour TTL
+            # Get centralized TTL for analytics_data (DB 2: 57600 seconds = 16 hours)
+            analytics_ttl = get_ttl_for_data_type("analytics_data")
+            
+            # ✅ Use DB 2 (analytics) for straddle volume data - consistent with volume profile storage
+            if self.redis_analytics is not None:
+                # Store in Redis DB 2 (analytics) with centralized TTL
+                for key, value in straddle_data.items():
+                    self.redis_analytics.hset(straddle_key, key, value)
+                self.redis_analytics.expire(straddle_key, analytics_ttl)
+            elif hasattr(self, '_redis_wrapper') and hasattr(self._redis_wrapper, 'get_client'):
+                # Fallback: Try to get DB 2 client from wrapper
+                analytics_client = self._redis_wrapper.get_client(2)  # DB 2: analytics
+                if analytics_client:
                     for key, value in straddle_data.items():
-                        realtime_client.hset(straddle_key, key, value)
-                    realtime_client.expire(straddle_key, 3600)
+                        analytics_client.hset(straddle_key, key, value)
+                    analytics_client.expire(straddle_key, analytics_ttl)
                 else:
-                    # Fallback to system DB if can't get realtime client
+                    logger.warning(f"Could not get DB 2 client for straddle volume storage, falling back to DB 0")
+                    # Last resort: fallback to system DB (not ideal)
+                    session_ttl = get_ttl_for_data_type("session_data")  # DB 0: 57600 seconds
                     for key, value in straddle_data.items():
                         self.redis.hset(straddle_key, key, value)
-                    self.redis.expire(straddle_key, 3600)
+                    self.redis.expire(straddle_key, session_ttl)
             else:
                 # Fallback for raw redis-py clients
+                logger.warning(f"Using DB 0 fallback for straddle volume (should be DB 2)")
+                session_ttl = get_ttl_for_data_type("session_data")  # DB 0: 57600 seconds
                 for key, value in straddle_data.items():
                     self.redis.hset(straddle_key, key, value)
-                self.redis.expire(straddle_key, 3600)
+                self.redis.expire(straddle_key, session_ttl)
             
             logger.debug(f"Straddle volume tracked: {underlying_symbol} - CE: {ce_incremental}, PE: {pe_incremental}, Combined: {combined_incremental}")
             

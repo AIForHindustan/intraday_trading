@@ -1,5 +1,5 @@
 # High-Performance Intraday Trading System
-*Last Updated: October 31, 2025 - Dashboard & Integration Points Complete* (Time 11:00 PM IST)
+*Last Updated: November 1, 2025 - Statistical Model Integration & Alert Validator Dashboard Wiring*
 
 ## 🧭 End-to-End Audit Playbook (Nightly Reference)
 1. **Environment Baseline** — Activate the project venv and refresh dependencies: `python -m pip install -r requirements_apple_silicon.txt`; confirm `.env`/config secrets align with `config/optimized_field_mapping.yaml`.
@@ -8,7 +8,7 @@
 4. **Pattern & Math Integrity Sweep** — During the scanner dry run, tail logs for `MathDispatcher` warnings (search for “fallback math”) to confirm every detector stays on the shared engine. Any fallback hit requires a docstring + implementation review in `patterns/pattern_mathematics.py` or `core/math_dispatcher.py`.
 5. **Risk & Alerts Validation** — Launch `python -m alert_validation.alert_validator` after market open; confirm the market-hours guard halts processing post 15:30 IST and that the generated report writes to `alert_validator_report_*.md`. Review the risk outputs in `alerts/risk_manager.py` for dispatcher usage.
 6. **Data Quality & Reporting** — Execute `python quality_dashboard.py` for the full snapshot and `python quality_monitor.py` for the quick quality check. Archive the dashboards in `logs/audit/` with timestamps.
-7. **Alert Dashboard Verification** — Start `python alert_validation/alert_dashboard.py` and verify:
+7. **Alert Dashboard Verification** — Start `python aion_alert_dashboard/alert_dashboard.py` and verify:
    - Alerts are loading from `alerts:stream` (check console output)
    - Price charts display full trading session data
    - Technical indicators overlay correctly (VWAP, EMAs, RSI, MACD)
@@ -16,6 +16,9 @@
    - Market indices (VIX, NIFTY 50, BANKNIFTY) refresh every 30s
    - News feed displays with 180-minute TTL filtering
    - Stop loss/target are correctly oriented for SELL vs BUY actions
+   - **Statistical Model Section** displays validation performance metrics
+   - Pattern performance charts show success rates and confidence scores
+   - Forward validation window performance is tracked (1m, 2m, 5m, 10m, 30m, 60m)
 7. **Docstring & Standards Pass** — Run `pydocstyle` (or `ruff check --select D` if available). Update docstrings immediately where violations are flagged, keeping canonical field references consistent with YAML mappings.
 
 > ✅ Log findings in `audit.md` after each nightly run so the subsequent session knows which modules require corrective action.
@@ -146,7 +149,7 @@
 - **Historical Analysis**: Trend analysis with 24-hour lookback for pattern detection
 
 ### **📊 Alert Validation Dashboard**
-- **Primary Source**: `alert_validation/alert_dashboard.py` (AlertValidationDashboard)
+- **Primary Source**: `aion_alert_dashboard/alert_dashboard.py` (AlertValidationDashboard)
 - **Framework**: Dash (Plotly) with Bootstrap components
 - **Port**: 53056 (fixed for external consumer access)
 - **External Access**: ngrok tunnel (https://jere-unporous-magan.ngrok-free.dev)
@@ -156,6 +159,11 @@
   - Volume Profile visualization (POC, Value Area, distribution histogram)
   - Options Greeks display (Delta, Gamma, Theta, Vega, Rho)
   - News enrichment integration
+  - **Statistical Model Integration**: Real-time validation performance metrics from `alert_validator.py`
+    - Validation performance overview (total validations, success rate, avg confidence)
+    - Pattern performance analysis (success rates and confidence by pattern type)
+    - Forward validation window performance (1m, 2m, 5m, 10m, 30m, 60m success rates)
+    - Data source: `validation_results:recent` (Redis DB 1) and `forward_validation:results` (Redis DB 0)
   - Market indices (VIX, NIFTY 50, BANKNIFTY) with 30s auto-refresh
   - Full trading session time series data
   - Action-aware stop loss/target correction (BUY vs SELL)
@@ -269,17 +277,17 @@ Tick Data → Standardized Fields → Volume State → Pattern Analysis → Trad
 ### **7. Redis Multi-Database Architecture**
 ```
 DB 0: System → system_config, metadata, session_data, health_checks, volume baselines
-DB 1: Realtime → alerts:stream, ticks:*, indicators:* (indicators, Greeks), patterns:*, news:*
+DB 1: Realtime → alerts:stream, ticks:*, patterns:*, news:* (NO indicators - indicators moved to DB 5)
 DB 2: Analytics → volume_profile:poc:*, volume_profile:distribution:*, ohlc_daily:*, metrics
-DB 4: Fallback → Additional indicator storage (backup)
-DB 5: Fallback → Additional indicator/Greek storage (backup), ohlc_daily:* (OHLC sorted sets)
+DB 3: Independent Validator → signal_quality, pattern_performance (isolated from main system)
+DB 5: Indicators Cache → indicators:*, Greeks (PRIMARY location per redis_config.py)
 ```
 
 **⚠️ CRITICAL: Redis Storage Schema for Indicators, Greeks, and Volume Profile**
 
 All assistants must know where indicators, Greeks, and volume profile are stored in Redis:
 
-#### **📊 Technical Indicators (DB 1 - Primary)**
+#### **📊 Technical Indicators (DB 5 - PRIMARY) ✅ SINGLE SOURCE OF TRUTH**
 - **Key Pattern**: `indicators:{symbol}:{indicator_name}`
 - **Examples**:
   - `indicators:NFO:NIFTY25DEC26000CE:rsi` → RSI value (float as string)
@@ -289,14 +297,16 @@ All assistants must know where indicators, Greeks, and volume profile are stored
   - `indicators:NFO:NIFTY25DEC26000CE:ema_50` → EMA 50 value (float as string)
   - `indicators:NFO:NIFTY25DEC26000CE:macd` → MACD dict (JSON: `{'value': {'macd': ..., 'signal': ..., 'histogram': ...}, 'timestamp': ..., 'symbol': ...}`)
   - `indicators:NFO:NIFTY25DEC26000CE:bollinger_bands` → BB dict (JSON: `{'value': {'upper': ..., 'middle': ..., 'lower': ...}, ...}`)
-- **Storage Method**: `redis_storage.publish_indicators_to_redis()` stores via `analysis_cache` data type
+- **Storage Method**: Both `redis_storage.publish_indicators_to_redis()` and `data_pipeline._store_calculated_indicators()` store via `indicators_cache` data type (DB 5)
+- **Data Type**: `indicators_cache` → maps to DB 5 per `redis_config.py`
+- **TTL**: 300 seconds (5 minutes) to match calculation cache
 - **Format**: 
   - Simple indicators (RSI, EMA, ATR, VWAP): Stored as string/number
   - Complex indicators (MACD, BB, Volume Profile): Stored as JSON with `{'value': {...}, 'timestamp': ..., 'symbol': ...}`
-- **Fallback DBs**: DB 4 and DB 5 (checked if not found in DB 1)
+- **Fallback**: Dashboard checks DB 5 first, then DB 1 (for backward compatibility during migration)
 - **Calculation**: Pure Python libraries (pandas_ta → pandas → polars → TA-Lib fallback)
 
-#### **📈 Options Greeks (DB 1 - Primary)**
+#### **📈 Options Greeks (DB 5 - PRIMARY) ✅ SINGLE SOURCE OF TRUTH**
 - **Key Patterns**:
   - `indicators:{symbol}:greeks` → Combined Greeks dict (JSON: `{'value': {'delta': ..., 'gamma': ..., 'theta': ..., 'vega': ..., 'rho': ...}, 'timestamp': ..., 'symbol': ...}`)
   - `indicators:{symbol}:delta` → Delta value (float as string)
@@ -307,28 +317,36 @@ All assistants must know where indicators, Greeks, and volume profile are stored
 - **Examples**:
   - `indicators:NFO:NIFTY25DEC26000CE:greeks` → All Greeks combined
   - `indicators:NFO:NIFTY25DEC26000CE:delta` → Individual Delta
-- **Storage Method**: `redis_storage.publish_indicators_to_redis()` stores both combined and individual
+- **Storage Method**: Both `data_pipeline._store_calculated_indicators()` and `redis_storage.publish_indicators_to_redis()` store via `indicators_cache` data type (DB 5)
+- **Data Type**: `indicators_cache` → maps to DB 5 per `redis_config.py`
+- **TTL**: 300 seconds (5 minutes) to match calculation cache
 - **Format**: 
   - Combined: JSON with nested `{'value': {'delta': ..., 'gamma': ..., ...}, ...}`
   - Individual: Float as string
-- **Fallback DBs**: DB 4 and DB 5 (checked if not found in DB 1)
+- **Fallback**: Dashboard checks DB 5 first, then DB 1 (for backward compatibility during migration)
 - **Calculation**: `EnhancedGreekCalculator.black_scholes_greeks()` using `scipy.stats.norm` (pure Python, NO TA-Lib)
 
 #### **📊 Volume Profile (DB 2 - Analytics, DB 1 - Fallback)**
+- **Primary Storage**: Redis DB 2 (analytics), key: `volume_profile:poc:{symbol}` (Hash)
 - **Key Patterns**:
-  - `volume_profile:poc:{symbol}` → Hash with POC/VA data (`poc_price`, `poc_volume`, `value_area_high`, `value_area_low`)
-  - `volume_profile:distribution:{symbol}:{YYYY-MM-DD}` → Hash with daily distribution
+  - `volume_profile:poc:{symbol}` → Hash with POC/VA data (`poc_price`, `poc_volume`, `value_area_high`, `value_area_low`, `profile_strength`, `exchange_timestamp`)
+  - `volume_profile:session:{symbol}:{YYYY-MM-DD}` → Hash with full profile data including `price_volume_distribution` (bin volumes)
+  - `volume_profile:distribution:{symbol}:{YYYY-MM-DD}` → Hash with price-volume bins (`{price: volume, ...}`)
+  - `volume_profile:nodes:{symbol}` → Hash with support/resistance levels
+  - `volume_profile:patterns:{symbol}:daily` → Sorted Set with historical patterns
+  - `volume_profile:historical:{symbol}` → List with last 24 hours (FIFO queue)
   - `indicators:{symbol}:poc_price` → POC price indicator (float as string, stored in DB 1)
-  - `indicators:{symbol}:value_area_high` → Value Area High (float as string)
-  - `indicators:{symbol}:value_area_low` → Value Area Low (float as string)
 - **Examples**:
   - `volume_profile:poc:NFO:NIFTY25DECFUT` → Hash with POC data
   - `indicators:NFO:NIFTY25DECFUT:poc_price` → POC price as indicator
 - **Storage Method**: 
-  - Primary: `VolumeProfileManager` stores in DB 2 (analytics)
+  - Primary: `VolumeProfileManager` stores in DB 2 (analytics), TTL: 24 hours
+  - Update Frequency: Every 100 ticks or 1 minute (whichever comes first)
   - Secondary: `redis_storage.publish_indicators_to_redis()` stores POC/VA in DB 1 as indicators
 - **Format**: Hash (for poc/distribution) or string/JSON (for indicators)
 - **Calculation**: `HybridCalculations.calculate_volume_profile()` using Polars/pandas
+- **Output Signature**: `get_profile_data()` returns dict with `price_volume_distribution` field (bin volumes)
+- **Documentation**: See `patterns/VOLUME_PROFILE_AUDIT.md`, `patterns/VOLUME_PROFILE_FIXES_APPLIED.md`, `patterns/VOLUME_PROFILE_OVERRIDE_ANALYSIS.md`
 
 #### **🔑 Key Access Patterns**
 - **Dashboard**: `alert_dashboard.py` loads from DB 1 (primary), DB 4/5 (fallbacks), DB 2 (volume profile)
@@ -394,17 +412,21 @@ Pattern Detection → Support/Resistance → Historical Analysis → Enhanced Tr
 
 ### **9. Redis Storage Schema for Volume Profile**
 ```
-Volume Profile Storage Keys (Complete Implementation):
-├── volume_profile:session:SYMBOL:YYYY-MM-DD → Hash with full profile data
-├── volume_profile:poc:SYMBOL → Hash with POC/VA for quick access
-├── volume_profile:nodes:SYMBOL → Hash with support/resistance levels
+Volume Profile Storage Keys (Complete Implementation - Redis DB 2):
+├── volume_profile:poc:SYMBOL → Hash with POC/VA for quick access (PRIMARY POC STORAGE)
+│   └─> Fields: poc_price, poc_volume, value_area_high, value_area_low, profile_strength, exchange_timestamp
+├── volume_profile:session:SYMBOL:YYYY-MM-DD → Hash with full profile data (includes price_volume_distribution)
 ├── volume_profile:distribution:SYMBOL:YYYY-MM-DD → Hash with price-volume distribution buckets
+│   └─> Format: {price: volume, price: volume, ...} for histogram/chart rendering
+├── volume_profile:nodes:SYMBOL → Hash with support/resistance levels
 ├── volume_profile:patterns:SYMBOL:daily → Sorted Set with historical patterns (by timestamp)
-└── volume_profile:historical:SYMBOL → List with historical profile data (24h lookback)
+└── volume_profile:historical:SYMBOL → List with historical profile data (24h lookback, FIFO queue)
 
 Pattern Detection Keys:
 ├── patterns:volume_profile:SYMBOL → Hash with detected volume profile patterns
 └── patterns:volume_profile_advanced:SYMBOL → Hash with advanced pattern detection results
+
+Note: All keys have 24-hour TTL (86400 seconds). Dashboard reads from DB 2 first, falls back to DB 1.
 
 Indicator Stream Keys (Real-time):
 ├── indicators:poc_price:SYMBOL → POC price indicator stream
@@ -1196,7 +1218,7 @@ redis-cli info memory
 
 # Check Redis configuration
 python -c "
-from config.redis_config import get_redis_config
+from redis_files.redis_config import get_redis_config
 config = get_redis_config()
 print(f'Redis Config: {config}')
 "
@@ -1644,7 +1666,7 @@ redis-cli --stat
 ### **3. Start Alert Dashboard**
 ```bash
 # Start the dashboard (local access)
-python alert_validation/alert_dashboard.py
+python aion_alert_dashboard/alert_dashboard.py
 
 # Dashboard will be available at:
 # - Local: http://localhost:53056
@@ -1836,4 +1858,36 @@ All Communities (Telegram + Reddit)
 
 ---
 
-*Last updated: October 26, 2025 - Robust Symbol Parsing & End-to-End Extraction Complete*
+---
+
+## 📚 **MODULE DOCUMENTATION**
+
+### **Volume Profile Module** (`patterns/`)
+- **`patterns/VOLUME_PROFILE_AUDIT.md`** - Comprehensive audit of volume profile logic, data flow, and consumer usage
+- **`patterns/VOLUME_PROFILE_FIXES_APPLIED.md`** - Complete list of fixes applied to volume profile calculations
+- **`patterns/VOLUME_PROFILE_OVERRIDE_ANALYSIS.md`** - Detailed override analysis and verification of single source of truth
+
+### **Redis Client Module** (`redis_files/`)
+- **`redis_files/REDIS_CLIENT_ANALYSIS.md`** - Analysis of Redis client structure, circuit breakers, and data flow
+- **`redis_files/REDIS_CLIENT_FIXES_NEEDED.md`** - Identified issues and fixes needed in Redis client
+- **`redis_files/REDIS_STORAGE_ORPHANED_FUNCTIONS.md`** - Audit of orphaned functions in Redis storage module
+- **`redis_files/WEBSOCKET_PARSER_DATA_FLOW_VERIFIED.md`** - Verified data flow from WebSocket parser to Redis storage
+- **`redis_files/CUMULATIVE_VOLUME_CLARIFICATIONS.md`** - Clarifications on cumulative volume data handling
+- **`redis_files/CUMULATIVE_VOLUME_DATA_FLOW.md`** - Complete data flow documentation for cumulative volume
+
+### **Field Mapping & Utilities** (`utils/`)
+- **`utils/FIELD_MAPPING_AUDIT_GUIDE.md`** - Guide for manual field mapping audits and best practices
+- **`utils/FIELD_MISMATCH_ANALYSIS.md`** - Analysis of field name mismatches and mapping overrides
+
+### **Dashboard Module** (`aion_alert_dashboard/`)
+- **`aion_alert_dashboard/DASHBOARD_INTEGRATION.md`** - Dashboard integration guide and API documentation
+- **`aion_alert_dashboard/DASHBOARD_ISSUES_ANALYSIS.md`** - Analysis of dashboard issues and resolutions
+- **`aion_alert_dashboard/NGROK_DASHBOARD_INTEGRATION.md`** - Ngrok tunnel management and dashboard coordination
+- **`STATISTICAL_MODEL_INTEGRATION.md`** - Statistical model integration with alert validator (validation performance, pattern analysis)
+
+### **Alert System** (`alerts/`)
+- **`alerts/DATA_STORAGE_STRATEGY.md`** - Alert data storage strategy and Redis key patterns
+
+---
+
+*Last updated: November 1, 2025 - Statistical Model Integration & Alert Validator Dashboard Wiring*

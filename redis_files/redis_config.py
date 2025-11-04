@@ -173,6 +173,21 @@ REDIS_DATABASES: Dict[int, Dict[str, Any]] = {
         "client_tracking": False,
         "use_json": True,
     },
+    # Independent Validator System (DB 3)
+    # Isolated from main system - runs independently with alert_validator
+    # Stores signal quality, pattern performance, and validation metrics
+    3: {
+        "name": "independent_validator_db",
+        "ttl": 604800,  # 7 days (604800 seconds) - for pattern performance tracking
+        "data_types": [
+            "signal_quality",  # Signal quality tracking per symbol/pattern
+            "pattern_performance",  # Pattern performance metrics
+            "pattern_metrics",  # Aggregated pattern statistics
+            "validator_metadata",  # Independent validator metadata
+        ],
+        "client_tracking": False,
+        "use_json": True,
+    },
 }
 
 

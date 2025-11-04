@@ -963,7 +963,9 @@ class RedisStorage:
             indicators = await self.batch_publish_all_indicators(symbol, tick_data)
             
             if indicators:
-                # Store indicators in Redis (DB 1 - realtime via analysis_cache) for persistence
+                # ✅ SINGLE SOURCE OF TRUTH: Store indicators in DB 5 (indicators_cache_db) per redis_config.py
+                # Data type: "indicators_cache" maps to DB 5 (primary location for indicators and Greeks)
+                # TTL: 300 seconds (5 minutes) to match calculation cache
                 for indicator_name, value in indicators.items():
                     redis_key = f"indicators:{symbol}:{indicator_name}"
                     
@@ -975,9 +977,11 @@ class RedisStorage:
                             'symbol': symbol,
                             'indicator_type': indicator_name
                         }
-                        await self.redis.store_by_data_type("analysis_cache", redis_key, json.dumps(indicator_data))
+                        # ✅ Use indicators_cache (DB 5) - single source of truth
+                        await self.redis.store_by_data_type("indicators_cache", redis_key, json.dumps(indicator_data), ttl=300)
                     elif value is not None and value != {}:  # Simple indicators (RSI, EMA, ATR, VWAP, individual Greeks)
-                        await self.redis.store_by_data_type("analysis_cache", redis_key, str(value))
+                        # ✅ Use indicators_cache (DB 5) - single source of truth
+                        await self.redis.store_by_data_type("indicators_cache", redis_key, str(value), ttl=300)
                 
                 # Additionally store volume profile POC separately for reversal detection
                 if 'volume_profile' in indicators and isinstance(indicators['volume_profile'], dict):
@@ -985,15 +989,18 @@ class RedisStorage:
                     if vp_data.get('poc_price'):
                         # Store POC price individually for easy dashboard access
                         poc_key = f"indicators:{symbol}:poc_price"
-                        await self.redis.store_by_data_type("analysis_cache", poc_key, str(vp_data['poc_price']))
+                        # ✅ Use indicators_cache (DB 5) - single source of truth
+                        await self.redis.store_by_data_type("indicators_cache", poc_key, str(vp_data['poc_price']), ttl=300)
                     if vp_data.get('value_area_high'):
                         vah_key = f"indicators:{symbol}:value_area_high"
-                        await self.redis.store_by_data_type("analysis_cache", vah_key, str(vp_data['value_area_high']))
+                        # ✅ Use indicators_cache (DB 5) - single source of truth
+                        await self.redis.store_by_data_type("indicators_cache", vah_key, str(vp_data['value_area_high']), ttl=300)
                     if vp_data.get('value_area_low'):
                         val_key = f"indicators:{symbol}:value_area_low"
-                        await self.redis.store_by_data_type("analysis_cache", val_key, str(vp_data['value_area_low']))
+                        # ✅ Use indicators_cache (DB 5) - single source of truth
+                        await self.redis.store_by_data_type("indicators_cache", val_key, str(vp_data['value_area_low']), ttl=300)
                 
-                logger.info(f"✅ Stored {len(indicators)} indicators in Redis cache for {symbol} (including volume profile POC and Greeks)")
+                logger.info(f"✅ Stored {len(indicators)} indicators in Redis DB 5 (indicators_cache) for {symbol} (including volume profile POC and Greeks)")
                 
         except Exception as e:
             logger.error(f"Error publishing indicators for {symbol}: {e}")

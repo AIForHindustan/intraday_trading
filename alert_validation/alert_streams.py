@@ -42,14 +42,66 @@ except ImportError:
 
 
 class AlertStream:
-    """Redis-backed alert stream helper."""
+    """
+    Redis-backed alert stream helper.
+    
+    ✅ Uses RedisManager82 for centralized connection management:
+    - Connection pooling (process-specific pools)
+    - Circuit breaker support
+    - Proper DB routing per redis_config.py
+    - No raw redis.Redis() clients
+    """
 
-    def __init__(self, redis_client):
-        self.redis = redis_client
+    def __init__(self, redis_client=None):
+        """
+        Initialize AlertStream with centralized Redis client management.
+        
+        Args:
+            redis_client: Optional Redis client (if provided, will extract underlying client if wrapped).
+                        If None, creates new client via RedisManager82.
+        """
+        # ✅ Use RedisManager82 for centralized connection management
+        from redis_files.redis_manager import RedisManager82
+        
+        # Extract underlying client if wrapped (RobustRedisClient, etc.)
+        if redis_client:
+            # Try to get underlying client if wrapped
+            if hasattr(redis_client, 'redis_client'):
+                # RobustRedisClient or similar wrapper
+                underlying = redis_client.redis_client
+                if hasattr(underlying, 'get_client'):
+                    # Get DB 0 client from wrapper
+                    self.redis = underlying.get_client(0) if callable(underlying.get_client) else underlying
+                else:
+                    self.redis = underlying
+            elif hasattr(redis_client, 'get_client'):
+                # Already a wrapper with get_client method
+                self.redis = redis_client.get_client(0) if callable(redis_client.get_client) else redis_client
+            else:
+                # Raw redis.Redis client - replace with RedisManager82
+                self.redis = RedisManager82.get_client(
+                    process_name="alert_validator",
+                    db=0,  # DB 0 for system/metadata
+                    max_connections=None
+                )
+        else:
+            # No client provided - create via RedisManager82
+            self.redis = RedisManager82.get_client(
+                process_name="alert_validator",
+                db=0,  # DB 0 for system/metadata
+                max_connections=None
+            )
+        
+        if not self.redis:
+            raise RuntimeError("Failed to initialize Redis client via RedisManager82")
+        
+        # ✅ Use RedisKeyStandards for consistent key naming
+        from redis_files.redis_key_standards import RedisKeyStandards
+        
         self.pending_alerts_stream = "alerts:pending:validation"
         self.validation_results_stream = "alerts:validation:results"
-        self.performance_stats_key = "alert_performance:stats"
-        self.alert_metadata_prefix = "alert:metadata"
+        self.performance_stats_key = RedisKeyStandards.get_alert_performance_stats_key()
+        self.alert_metadata_prefix = "alert:metadata"  # Used with build_key() for full key
         self.rolling_windows_key = "alert:rolling_windows"
         self.chart_cache_key = "alert:charts"
 
@@ -76,8 +128,11 @@ class AlertStream:
             approximate=True,
         )
 
-        # Persist metadata for later stats aggregation
-        metadata_key = self._metadata_key(alert_id)
+        # ✅ Use RedisKeyStandards for consistent key naming
+        from redis_files.redis_key_standards import RedisKeyStandards
+        from redis_files.redis_config import get_ttl_for_data_type
+        
+        metadata_key = RedisKeyStandards.get_alert_metadata_key(alert_id)
         metadata_payload = {
             "alert_id": alert_id,
             "symbol": stream_payload["symbol"],
@@ -88,17 +143,15 @@ class AlertStream:
             "rolling_windows": json.dumps(rolling_data.get("rolling_windows", {})),
         }
 
-        # ✅ CONSISTENCY: Use RedisManager82 for direct client access
-        from redis_files.redis_manager import RedisManager82
-        redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
-            process_name="alert_validator",
-            db=0,
-            max_connections=None
-        )
+        # ✅ Use self.redis (already from RedisManager82) for metadata storage
+        # self.redis is already a RedisManager82 client (DB 0) from __init__
+        # ✅ Use centralized TTL from redis_config.py
+        redis_core = self.redis
         if redis_core:
             pipe = redis_core.pipeline()
             pipe.hset(metadata_key, mapping=metadata_payload)
-            pipe.expire(metadata_key, 86400)  # keep for 24h
+            metadata_ttl = get_ttl_for_data_type("metadata")  # DB 0: 57600 seconds (16 hours)
+            pipe.expire(metadata_key, metadata_ttl)
             pipe.execute()
 
         return alert_id
@@ -157,16 +210,14 @@ class AlertStream:
         return f"alert_{int(time.time() * 1000)}_{symbol}"
 
     def _metadata_key(self, alert_id: str) -> str:
-        return f"{self.alert_metadata_prefix}:{alert_id}"
+        """Get alert metadata key using RedisKeyStandards"""
+        from redis_files.redis_key_standards import RedisKeyStandards
+        return RedisKeyStandards.get_alert_metadata_key(alert_id)
 
     def _load_metadata(self, alert_id: str) -> Optional[Dict]:
-        # ✅ CONSISTENCY: Use RedisManager82 for direct client access
-        from redis_files.redis_manager import RedisManager82
-        redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
-            process_name="alert_validator",
-            db=0,
-            max_connections=None
-        )
+        # ✅ Use self.redis (already from RedisManager82) for metadata retrieval
+        # self.redis is already a RedisManager82 client (DB 0) from __init__
+        redis_core = self.redis
         if not redis_core:
             return None
         metadata = redis_core.hgetall(self._metadata_key(alert_id))
@@ -216,22 +267,21 @@ class AlertStream:
         }
 
     def _update_performance_stats_sync(self, result_payload: Dict, metadata: Dict) -> None:
-        # ✅ CONSISTENCY: Use RedisManager82 for direct client access
-        from redis_files.redis_manager import RedisManager82
-        redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
-            process_name="alert_validator",
-            db=0,
-            max_connections=None
-        )
+        # ✅ Use self.redis (already from RedisManager82) for performance stats
+        # self.redis is already a RedisManager82 client (DB 0) from __init__
+        redis_core = self.redis
         if not redis_core:
             return
 
+        # ✅ Use RedisKeyStandards for consistent key naming
+        from redis_files.redis_key_standards import RedisKeyStandards
+        
         status = str(result_payload.get("status", "INCONCLUSIVE")).upper()
         movement = float(result_payload.get("price_movement_pct", 0.0))
         pattern = str(metadata.get("pattern", "unknown")).lower()
 
-        total_key = self.performance_stats_key
-        pattern_key = f"{self.performance_stats_key}:{pattern}"
+        total_key = RedisKeyStandards.get_alert_performance_stats_key()
+        pattern_key = RedisKeyStandards.get_alert_performance_pattern_key(pattern)
 
         pipe = redis_core.pipeline()
         pipe.hincrby(total_key, "total_alerts", 1)
@@ -253,6 +303,15 @@ class AlertStream:
             pipe.hincrby(pattern_key, "inconclusive_count", 1)
         pipe.hincrbyfloat(pattern_key, "total_movement", movement)
         pipe.hset(pattern_key, mapping={"last_updated": int(time.time() * 1000)})
+        
+        # ✅ Track pattern in Set for O(1) discovery (no pattern scanning)
+        # ✅ Use centralized TTL from redis_config.py
+        from redis_files.redis_config import get_ttl_for_data_type
+        
+        patterns_set_key = RedisKeyStandards.get_alert_performance_patterns_set_key()
+        pipe.sadd(patterns_set_key, pattern)
+        patterns_ttl = get_ttl_for_data_type("metadata")  # DB 0: 57600 seconds (16 hours)
+        pipe.expire(patterns_set_key, patterns_ttl)
 
         pipe.execute()
 
@@ -276,18 +335,17 @@ class AlertStream:
         }
         
         try:
-            # ✅ CONSISTENCY: Use RedisManager82 for direct client access
-            from redis_files.redis_manager import RedisManager82
-            redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
-                process_name="alert_validator",
-                db=0,
-                max_connections=None
-            )
+            # ✅ Use self.redis (already from RedisManager82) for rolling window data
+            # self.redis is already a RedisManager82 client (DB 0) from __init__
+            redis_core = self.redis
             if not redis_core:
                 return rolling_data
             
+            # ✅ Use RedisKeyStandards for consistent key naming
+            from redis_files.redis_key_standards import RedisKeyStandards
+            
             # Get recent price data for rolling windows
-            price_key = f"ohlc_latest:{symbol}"
+            price_key = RedisKeyStandards.get_ohlc_latest_key(symbol)
             price_data = redis_core.hgetall(price_key)
             
             if price_data:
@@ -300,7 +358,7 @@ class AlertStream:
                 }
             
             # Get volume baseline data
-            volume_key = f"volume_averages:{symbol}"
+            volume_key = RedisKeyStandards.get_volume_averages_key(symbol)
             volume_data = redis_core.hgetall(volume_key)
             
             if volume_data:
@@ -458,35 +516,40 @@ Rolling Windows Analysis:"""
     def get_performance_summary(self) -> Dict:
         """Get comprehensive performance summary with rolling windows data."""
         try:
-            # ✅ CONSISTENCY: Use RedisManager82 for direct client access
-            from redis_files.redis_manager import RedisManager82
-            redis_core = getattr(self.redis, "redis_client", None) or RedisManager82.get_client(
-                process_name="alert_validator",
-                db=0,
-                max_connections=None
-            )
+            # ✅ Use self.redis (already from RedisManager82) for performance summary
+            # self.redis is already a RedisManager82 client (DB 0) from __init__
+            redis_core = self.redis
             if not redis_core:
                 return {}
             
             # Get overall stats
             total_stats = redis_core.hgetall(self.performance_stats_key)
             
-            # Get pattern-specific stats
-            pattern_keys = list(redis_core.scan_iter(match=f"{self.performance_stats_key}:*", count=500))
+            # ✅ Use RedisKeyStandards for consistent key naming
+            # ✅ NO PATTERN SCANNING: Use Set-based pattern tracking for O(1) discovery
+            from redis_files.redis_key_standards import RedisKeyStandards
+            
+            # Get pattern names from Set (no keyspace scan)
+            patterns_set_key = RedisKeyStandards.get_alert_performance_patterns_set_key()
+            pattern_names = redis_core.smembers(patterns_set_key)
+            
             pattern_stats = {}
             
-            for key in pattern_keys:
-                pattern_key = key.decode() if isinstance(key, (bytes, bytearray)) else key
-                pattern_name = pattern_key.split(":")[-1]
+            # Direct key lookups for each pattern (O(1) per pattern)
+            for pattern_name_bytes in pattern_names:
+                pattern_name = pattern_name_bytes.decode('utf-8') if isinstance(pattern_name_bytes, bytes) else pattern_name_bytes
+                pattern_key = RedisKeyStandards.get_alert_performance_pattern_key(pattern_name)
                 pattern_data = redis_core.hgetall(pattern_key)
-                pattern_stats[pattern_name] = {
-                    "total_alerts": int(pattern_data.get("total_alerts", 0)),
-                    "success_count": int(pattern_data.get("success_count", 0)),
-                    "failure_count": int(pattern_data.get("failure_count", 0)),
-                    "inconclusive_count": int(pattern_data.get("inconclusive_count", 0)),
-                    "total_movement": float(pattern_data.get("total_movement", 0.0)),
-                    "success_rate": self._calculate_success_rate(pattern_data),
-                }
+                
+                if pattern_data:  # Only include if pattern has data
+                    pattern_stats[pattern_name] = {
+                        "total_alerts": int(pattern_data.get("total_alerts", 0)),
+                        "success_count": int(pattern_data.get("success_count", 0)),
+                        "failure_count": int(pattern_data.get("failure_count", 0)),
+                        "inconclusive_count": int(pattern_data.get("inconclusive_count", 0)),
+                        "total_movement": float(pattern_data.get("total_movement", 0.0)),
+                        "success_rate": self._calculate_success_rate(pattern_data),
+                    }
             
             return {
                 "overall": {

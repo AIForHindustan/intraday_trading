@@ -2,20 +2,41 @@
 """
 Retrieve Alert Validation Report from Redis
 Based on README.md structure and Redis DB 1 (realtime - consolidated from DB 6 alerts)
+
+✅ Uses RedisManager82 for centralized connection management:
+- Connection pooling (process-specific pools)
+- Proper DB routing per redis_config.py
+- No raw redis.Redis() clients
 """
 
 import json
-import redis
 from datetime import datetime
 from typing import Dict, List, Any
 from collections import defaultdict
 
 class AlertValidationReport:
     def __init__(self):
+        # ✅ Use RedisManager82 for centralized connection management
+        from redis_files.redis_manager import RedisManager82
+        
         # Connect to Redis DB 1 (realtime database - consolidated from DB 6) for validation results
-        self.redis_client = redis.Redis(host='localhost', port=6379, db=1, decode_responses=True)
+        self.redis_client = RedisManager82.get_client(
+            process_name="alert_validation_report",
+            db=1,  # DB 1 for realtime data
+            max_connections=1,  # Report script only needs one connection
+            decode_responses=True
+        )
+        
         # Connect to Redis DB 0 for forward validation alerts and schedule
-        self.redis_db0 = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+        self.redis_db0 = RedisManager82.get_client(
+            process_name="alert_validation_report",
+            db=0,  # DB 0 for system/metadata
+            max_connections=1,  # Report script only needs one connection
+            decode_responses=True
+        )
+        
+        if not self.redis_client or not self.redis_db0:
+            raise RuntimeError("Failed to initialize Redis clients via RedisManager82")
         
     def get_validation_results(self) -> List[Dict]:
         """Get recent validation results from Redis"""
@@ -39,7 +60,27 @@ class AlertValidationReport:
     def get_forward_validation_alerts(self) -> List[Dict]:
         """Get forward validation alerts from DB 0"""
         try:
-            keys = self.redis_db0.keys('forward_validation:alert:*')
+            # ✅ Use limited SCAN instead of KEYS to avoid blocking Redis
+            def safe_scan_keys(client, pattern, max_keys=1000):
+                """Safely scan keys with limit"""
+                try:
+                    keys = []
+                    cursor = 0
+                    count = 0
+                    while count < max_keys:
+                        cursor, batch = client.scan(cursor=cursor, match=pattern, count=100)
+                        keys.extend(batch)
+                        count += len(batch)
+                        if cursor == 0:
+                            break
+                        if count >= max_keys:
+                            break
+                    return keys[:max_keys]
+                except Exception as e:
+                    print(f"⚠️ SCAN failed for pattern {pattern}: {e}")
+                    return []
+            
+            keys = safe_scan_keys(self.redis_db0, 'forward_validation:alert:*', max_keys=1000)
             alerts = []
             
             for key in keys:
@@ -111,7 +152,27 @@ class AlertValidationReport:
     def get_validation_by_key(self, pattern: str = 'validation:*') -> List[Dict]:
         """Get validation results by key pattern"""
         try:
-            keys = self.redis_client.keys(pattern)
+            # ✅ Use limited SCAN instead of KEYS to avoid blocking Redis
+            def safe_scan_keys(client, pattern, max_keys=1000):
+                """Safely scan keys with limit"""
+                try:
+                    keys = []
+                    cursor = 0
+                    count = 0
+                    while count < max_keys:
+                        cursor, batch = client.scan(cursor=cursor, match=pattern, count=100)
+                        keys.extend(batch)
+                        count += len(batch)
+                        if cursor == 0:
+                            break
+                        if count >= max_keys:
+                            break
+                    return keys[:max_keys]
+                except Exception as e:
+                    print(f"⚠️ SCAN failed for pattern {pattern}: {e}")
+                    return []
+            
+            keys = safe_scan_keys(self.redis_client, pattern, max_keys=1000)
             results = []
             
             for key in keys:

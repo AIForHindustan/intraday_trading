@@ -1569,12 +1569,13 @@ class EnhancedAlertManager(AlertManager):
         ✅ SMART CACHING: Fetch indicators from Redis with in-memory cache.
         Checks cache first, then Redis (DB 5 → DB 1 → DB 4), then caches result.
         
-        Redis Storage Schema:
-        - DB 5 (primary per user): indicators:{symbol}:{indicator_name} via analysis_cache data type
-        - DB 1 (realtime): indicators:{symbol}:{indicator_name} via analysis_cache data type (fallback)
+        Redis Storage Schema (SINGLE SOURCE OF TRUTH):
+        - DB 5 (PRIMARY): indicators:{symbol}:{indicator_name} via indicators_cache data type (per redis_config.py)
+        - DB 1 (fallback): indicators:{symbol}:{indicator_name} via analysis_cache data type (legacy, backward compatibility)
         - DB 4 (fallback): Additional indicator storage
         - Format: Simple indicators (RSI, EMA, ATR, VWAP) stored as string/number
                   Complex indicators (MACD, BB) stored as JSON with {'value': {...}, 'timestamp': ..., 'symbol': ...}
+        - TTL: 300 seconds (5 minutes) for all indicators
         """
         indicators = {}
         if not self.redis_client:

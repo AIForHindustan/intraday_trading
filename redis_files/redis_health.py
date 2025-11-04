@@ -93,13 +93,32 @@ def main() -> int:
             r4_db = r0
             r5_db = r0
 
+        # ✅ Use limited SCAN instead of KEYS to avoid blocking Redis
+        def safe_scan_count(client, pattern, max_keys=100):
+            """Safely count keys with limit"""
+            try:
+                if not hasattr(client, 'scan'):
+                    return 0
+                count = 0
+                cursor = 0
+                while count < max_keys:
+                    cursor, batch = client.scan(cursor=cursor, match=pattern, count=50)
+                    count += len(batch)
+                    if cursor == 0:
+                        break
+                    if count >= max_keys:
+                        break
+                return count
+            except Exception:
+                return 0
+        
         counts = {
-            "db0:session:*": len(r0_db.keys("session:*")) if hasattr(r0_db, 'keys') else 0,
-            "db2:ohlc_latest:*": len(r2_db.keys("ohlc_latest:*")) if hasattr(r2_db, 'keys') else 0,
-            "db4:ticks:*": len(r4_db.keys("ticks:*")) if hasattr(r4_db, 'keys') else 0,
-            "db5:volume_averages:*": len(r5_db.keys("volume_averages:*")) if hasattr(r5_db, 'keys') else 0,
+            "db0:session:*": safe_scan_count(r0_db, "session:*", max_keys=100),
+            "db2:ohlc_latest:*": safe_scan_count(r2_db, "ohlc_latest:*", max_keys=100),
+            "db4:ticks:*": safe_scan_count(r4_db, "ticks:*", max_keys=100),
+            "db5:volume_averages:*": safe_scan_count(r5_db, "volume_averages:*", max_keys=100),
         }
-        print("Keyspace subset:", json.dumps(counts, indent=2))
+        print("Keyspace subset (limited scan):", json.dumps(counts, indent=2))
 
         # Streams: create + write a tiny test message (auto-trim)
         stream = os.getenv("HEALTH_STREAM", "health:smoke")
@@ -120,17 +139,26 @@ def main() -> int:
     except Exception as e:
         print(f"Modern health check failed: {e}, falling back to legacy")
     
-    # Legacy fallback
+    # Legacy fallback - ✅ Use RedisManager82 for centralized connection management
     try:
-        # Use consolidated Redis client
-        from redis_files.redis_client import get_redis_client
-        r = get_redis_client()
+        # ✅ Use RedisManager82 for process-specific connection pools
+        from redis_files.redis_manager import RedisManager82
+        r = RedisManager82.get_client(
+            process_name="redis_health",
+            db=0,  # Default DB
+            host=args.host,
+            port=args.port,
+            max_connections=1  # Health check doesn't need many connections
+        )
+        if not r:
+            raise RuntimeError("Failed to get Redis client from RedisManager82")
     except Exception as e:
-        print(f"Consolidated Redis client not available: {e}")
-        # Fallback to basic redis client
+        print(f"RedisManager82 not available: {e}")
+        # Last resort fallback - only for emergency situations
         try:
             import redis
-            r = redis.Redis(host=args.host, port=args.port)
+            print("⚠️ WARNING: Using direct redis.Redis() - not recommended for production")
+            r = redis.Redis(host=args.host, port=args.port, max_connections=1)
         except Exception as e2:
             print(f"redis-py not available: {e2}")
             return 1
@@ -156,18 +184,46 @@ def main() -> int:
         print(f"Failed to fetch info: {e}")
 
     try:
-        bucket_keys = r.keys("bucket:*")
-        volume_keys = r.keys("volume:*:buckets:*")
-        volume_ratio_keys = r.keys("volume_ratio:*")
-        pattern_keys = r.keys("patterns:*")
-        alert_keys = r.keys("alerts:*")
+        # ⚠️ ADMIN/DEBUG ONLY: This script uses limited SCAN for health monitoring
+        # Pattern scanning is FORBIDDEN in production code - this is an exception for admin tools
+        # In production, use Set-based tracking or direct key lookups
+        def safe_scan(client, pattern, max_keys=1000):
+            """Safely scan keys with limit to avoid blocking Redis"""
+            try:
+                keys = []
+                cursor = 0
+                count = 0
+                while count < max_keys:
+                    cursor, batch = client.scan(cursor=cursor, match=pattern, count=100)
+                    keys.extend(batch)
+                    count += len(batch)
+                    if cursor == 0:  # Scan complete
+                        break
+                    if count >= max_keys:  # Limit reached
+                        break
+                return keys[:max_keys]  # Return at most max_keys
+            except Exception as e:
+                print(f"⚠️ SCAN failed for pattern {pattern}: {e}")
+                return []
         
-        print("\n=== Trading System Health ===")
-        print(f"📊 OHLC buckets: {len(bucket_keys)}")
-        print(f"📈 Volume buckets: {len(volume_keys)}")
-        print(f"⚡ Volume ratios: {len(volume_ratio_keys)}")
-        print(f"🎯 Pattern data: {len(pattern_keys)}")
-        print(f"🚨 Alert data: {len(alert_keys)}")
+        # ⚠️ ADMIN/DEBUG ONLY: Pattern scanning forbidden in production code
+        # This is an exception for health monitoring scripts
+        print("\n⚠️ ADMIN TOOL: Using limited SCAN for health monitoring (admin/debug only)")
+        print("   Pattern scanning is FORBIDDEN in production code")
+        print("   Production code should use Set-based tracking or direct key lookups")
+        
+        bucket_keys = safe_scan(r, "bucket:*", max_keys=1000)
+        volume_keys = safe_scan(r, "volume:*:buckets:*", max_keys=1000)
+        volume_ratio_keys = safe_scan(r, "volume_ratio:*", max_keys=1000)
+        pattern_keys = safe_scan(r, "patterns:*", max_keys=1000)
+        alert_keys = safe_scan(r, "alerts:*", max_keys=1000)
+        
+        print("\n=== Trading System Health (Limited Scan) ===")
+        print(f"📊 OHLC buckets: {len(bucket_keys)} (max 1000 shown)")
+        print(f"📈 Volume buckets: {len(volume_keys)} (max 1000 shown)")
+        print(f"⚡ Volume ratios: {len(volume_ratio_keys)} (max 1000 shown)")
+        print(f"🎯 Pattern data: {len(pattern_keys)} (max 1000 shown)")
+        print(f"🚨 Alert data: {len(alert_keys)} (max 1000 shown)")
         
         # Health indicators
         print("\n=== Health Indicators ===")
@@ -182,7 +238,8 @@ def main() -> int:
         
         # Check volume bucket updates (recent activity)
         try:
-            recent_buckets = r.keys("bucket:*")
+            # ✅ Use limited SCAN instead of KEYS
+            recent_buckets = safe_scan(r, "bucket:*", max_keys=10)  # Only need a few samples
             if recent_buckets:
                 # Check TTL of a few buckets to see if they're being updated
                 sample_bucket = recent_buckets[0]
@@ -198,7 +255,8 @@ def main() -> int:
         
         # Check pattern detection latency (approximate)
         try:
-            pattern_data = r.keys("patterns:*")
+            # ✅ Use limited SCAN instead of KEYS
+            pattern_data = safe_scan(r, "patterns:*", max_keys=10)  # Only need a few samples
             if pattern_data:
                 print("✅ Pattern detection: Active (patterns found)")
             else:
@@ -208,9 +266,10 @@ def main() -> int:
         
         # Check alert accuracy (recent alerts)
         try:
-            recent_alerts = r.keys("alerts:*")
+            # ✅ Use limited SCAN instead of KEYS
+            recent_alerts = safe_scan(r, "alerts:*", max_keys=10)  # Only need a few samples
             if recent_alerts:
-                print(f"✅ Alert system: Active ({len(recent_alerts)} alerts)")
+                print(f"✅ Alert system: Active ({len(recent_alerts)} alerts shown)")
             else:
                 print("⚠️ Alert system: No recent alerts")
         except:
