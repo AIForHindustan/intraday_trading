@@ -12,9 +12,12 @@ const NewsFeed: React.FC = () => {
     setLoading(true);
     try {
       const response = symbol ? await newsAPI.getBySymbol(symbol, 50, 180) : await newsAPI.getLatestMarket();
-      setNews(response.data.news);
+      // API returns array directly, not wrapped in {news: [...]}
+      const newsData = Array.isArray(response.data) ? response.data : (response.data?.news || []);
+      setNews(newsData);
     } catch (err) {
       console.error('Failed to fetch news', err);
+      setNews([]);
     } finally {
       setLoading(false);
     }

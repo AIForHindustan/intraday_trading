@@ -196,7 +196,12 @@ async def redis_alert_listener(redis: Optional[Redis] = None):
                             await redis.xack(stream, group, message_id)
                             
                             # Broadcast to all WebSocket clients
-                            await manager.broadcast(alert_data)
+                            # Wrap in consistent format for frontend compatibility
+                            broadcast_data = {
+                                "type": "new_alert",
+                                "data": alert_data
+                            }
+                            await manager.broadcast(broadcast_data)
                             
                             logger.debug(f"Broadcasted alert from {message_id} to {len(manager.active_connections)} clients")
                             

@@ -42,12 +42,15 @@ export function subscribeAlerts(filters: { symbol?: string; pattern?: string } |
   
   alertsWs.onmessage = (event) => {
     try {
-      const data = JSON.parse(event.data);
+      const message = JSON.parse(event.data);
       // Skip ping messages
-      if (data.type === 'ping') {
+      if (message.type === 'ping') {
         return;
       }
-      callback(data);
+      // Handle new_alert format: {type: "new_alert", data: {...}}
+      // or legacy format: direct alert object
+      const alertData = message.type === 'new_alert' ? message.data : message;
+      callback(alertData);
     } catch (e) {
       console.error('Error parsing WebSocket message:', e);
     }

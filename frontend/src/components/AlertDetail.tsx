@@ -14,6 +14,7 @@ import {
   ListItem,
   ListItemText
 } from '@mui/material';
+// @ts-ignore - react-plotly.js doesn't have type definitions
 import Plot from 'react-plotly.js';
 import { format } from 'date-fns';
 
@@ -38,19 +39,26 @@ const AlertDetail: React.FC = () => {
         const response = await alertsAPI.getById(alertId);
         if (!mounted) return;
         const alertData = response.data;
+        // Extract symbol - use base_symbol if available, otherwise extract from symbol
+        const symbol = alertData.alert.base_symbol || alertData.alert.symbol?.split(':')?.[1]?.split(/\d/)?.[0] || alertData.alert.symbol;
+        
         // Fetch additional chart and volume data
         const [chartRes, volumeRes, newsRes, validationRes] = await Promise.all([
           chartsAPI.getData(alertData.alert.symbol, { include_indicators: true }),
           volumeProfileAPI.getData(alertData.alert.symbol),
-          newsAPI.getBySymbol(alertData.alert.base_symbol),
+          newsAPI.getBySymbol(symbol),
           validationAPI.getByAlertId(alertId)
         ]);
         if (!mounted) return;
+        
+        // Handle news response - API returns array directly, not wrapped in {news: [...]}
+        const newsData = Array.isArray(newsRes.data) ? newsRes.data : (newsRes.data?.news || []);
+        
         setData({
           alert: alertData.alert,
           chart_data: chartRes.data,
           volume_profile: volumeRes.data,
-          news: newsRes.data.news,
+          news: newsData,
           validation: validationRes.data
         });
         setLoading(false);
@@ -80,9 +88,21 @@ const AlertDetail: React.FC = () => {
   const { alert, chart_data, volume_profile, news, validation } = data;
 
   // Prepare candlestick data for Plotly
-  const ohlc = chart_data?.data || [];
+  // API returns {ohlc: [...], indicators_overlay: {...}, ...}
+  const ohlc = chart_data?.ohlc || chart_data?.data || [];
+  
+  // Convert timestamps to Date objects for Plotly
+  const convertTimestamp = (ts: number): Date => {
+    // If timestamp is in milliseconds (10+ digits), use as-is
+    // If timestamp is in seconds (10 digits), multiply by 1000
+    if (ts > 1e10) {
+      return new Date(ts);
+    }
+    return new Date(ts * 1000);
+  };
+  
   const trace = {
-    x: ohlc.map((d: any) => d.timestamp),
+    x: ohlc.map((d: any) => convertTimestamp(d.timestamp)),
     open: ohlc.map((d: any) => d.open),
     high: ohlc.map((d: any) => d.high),
     low: ohlc.map((d: any) => d.low),
@@ -92,20 +112,37 @@ const AlertDetail: React.FC = () => {
     increasing: { line: { color: '#4caf50' } },
     decreasing: { line: { color: '#f44336' } }
   };
+  
   const indicatorTraces: any[] = [];
-  if (chart_data?.indicators_overlay) {
+  if (chart_data?.indicators_overlay && ohlc.length > 0) {
     Object.keys(chart_data.indicators_overlay).forEach((key) => {
-      const arr = chart_data.indicators_overlay[key];
-      indicatorTraces.push({
-        x: ohlc.map((d: any) => d.timestamp),
-        y: arr,
-        type: 'scatter',
-        mode: 'lines',
-        name: key.toUpperCase(),
-        line: { width: 1 }
-      });
+      const indicatorValue = chart_data.indicators_overlay[key];
+      // Handle both array and single value
+      if (Array.isArray(indicatorValue)) {
+        if (indicatorValue.length === ohlc.length) {
+          indicatorTraces.push({
+            x: ohlc.map((d: any) => convertTimestamp(d.timestamp)),
+            y: indicatorValue,
+            type: 'scatter',
+            mode: 'lines',
+            name: key.toUpperCase(),
+            line: { width: 1 }
+          });
+        }
+      } else if (typeof indicatorValue === 'number') {
+        // Single value - draw horizontal line
+        indicatorTraces.push({
+          x: ohlc.map((d: any) => convertTimestamp(d.timestamp)),
+          y: Array(ohlc.length).fill(indicatorValue),
+          type: 'scatter',
+          mode: 'lines',
+          name: key.toUpperCase(),
+          line: { width: 1, dash: 'dash' }
+        });
+      }
     });
   }
+  
   const layout = {
     title: `${alert.symbol} Price Chart`,
     xaxis: { type: 'date' },
@@ -130,6 +167,7 @@ const AlertDetail: React.FC = () => {
         <Chip label={`Last Price: ${alert.last_price.toFixed(2)}`} sx={{ mr: 1, mt: 1 }} />
       </Box>
       <Grid container spacing={2}>
+        {/* @ts-ignore - MUI Grid API mismatch */}
         <Grid item xs={12} md={8}>
           <Paper sx={{ p: 2 }}>
             <Plot
@@ -140,23 +178,50 @@ const AlertDetail: React.FC = () => {
             />
           </Paper>
         </Grid>
+        {/* @ts-ignore - MUI Grid API mismatch */}
         <Grid item xs={12} md={4}>
           <Paper sx={{ p: 2, mb: 2 }}>
-            <Typography variant="h6">Indicators</Typography>
-            {alert.indicators && Object.keys(alert.indicators).map((key) => (
-              <Typography key={key} variant="body2">
-                {key.toUpperCase()}: {JSON.stringify(alert.indicators[key])}
+            <Typography variant="h6" gutterBottom>Indicators</Typography>
+            {alert.indicators && Object.keys(alert.indicators).length > 0 ? (
+              Object.keys(alert.indicators).map((key) => {
+                const value = alert.indicators[key];
+                let displayValue: string;
+                if (typeof value === 'object' && value !== null) {
+                  // Handle complex indicators like MACD, Bollinger Bands
+                  displayValue = JSON.stringify(value, null, 2);
+                } else if (typeof value === 'number') {
+                  displayValue = value.toFixed(2);
+                } else {
+                  displayValue = String(value);
+                }
+                return (
+                  <Typography key={key} variant="body2" sx={{ mb: 0.5 }}>
+                    <strong>{key.toUpperCase()}:</strong> {displayValue}
+                  </Typography>
+                );
+              })
+            ) : (
+              <Typography variant="body2" color="text.secondary">
+                No indicators available
               </Typography>
-            ))}
+            )}
           </Paper>
-          {alert.instrument_type === 'OPTIONS' && alert.greeks && (
+          {alert.instrument_type === 'OPTIONS' && alert.greeks && Object.keys(alert.greeks).length > 0 && (
             <Paper sx={{ p: 2, mb: 2 }}>
-              <Typography variant="h6">Greeks</Typography>
-              {Object.keys(alert.greeks).map((key) => (
-                <Typography key={key} variant="body2">
-                  {key.toUpperCase()}: {alert.greeks[key]}
-                </Typography>
-              ))}
+              <Typography variant="h6" gutterBottom>Greeks</Typography>
+              {Object.keys(alert.greeks).map((key) => {
+                const value = alert.greeks[key];
+                const displayValue = typeof value === 'number' ? value.toFixed(4) : String(value);
+                const color = typeof value === 'number' && value < 0 ? 'error.main' : 'success.main';
+                return (
+                  <Typography key={key} variant="body2" sx={{ mb: 0.5 }}>
+                    <strong>{key.toUpperCase()}:</strong>{' '}
+                    <span style={{ color: color === 'error.main' ? '#f44336' : '#4caf50' }}>
+                      {displayValue}
+                    </span>
+                  </Typography>
+                );
+              })}
             </Paper>
           )}
           <Paper sx={{ p: 2 }}>
