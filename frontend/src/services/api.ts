@@ -1,16 +1,21 @@
 import axios from 'axios';
 
-// Configure base URL for the API
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+// Unified API base URL configuration
+const RAW = import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
+
+// Remove any trailing slashes once
+const API_BASE = RAW.replace(/\/+$/, '');
 
 const api = axios.create({
-  baseURL: API_BASE_URL,
+  baseURL: API_BASE,          // e.g. http://localhost:5001/api
+  timeout: 20000,             // bump from 10s → 20s
   headers: {
     'Content-Type': 'application/json'
-  }
+  },
+  withCredentials: false      // set true ONLY if using cookie auth
 });
 
-// ---- JWT auth bearer token interceptor ----
+// Attach JWT to every call
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('access_token');
   if (token) {
@@ -18,6 +23,9 @@ api.interceptors.request.use((config) => {
   }
   return config;
 });
+
+// OPTIONAL: dev log so you can see exactly where calls go
+console.info('[API] Base URL:', API_BASE);
 
 // Alert endpoints
 export interface AlertQueryParams {

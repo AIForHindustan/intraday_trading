@@ -4,7 +4,7 @@ from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredenti
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from backend.websockets import router as websocket_router
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -23,7 +23,7 @@ import time
 import os
 from typing import Dict, List, Optional
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 # Use uvloop for better async performance if available
@@ -38,6 +38,19 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
+
+# Add exception handler for better error messages (only for non-HTTPException errors)
+@app.exception_handler(500)
+async def internal_server_error_handler(request: Request, exc: Exception):
+    """Handle 500 errors with detailed messages"""
+    import traceback
+    error_detail = str(exc)
+    print(f"Internal server error: {exc}")
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {error_detail}"}
+    )
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
@@ -73,16 +86,23 @@ LOCALTUNNEL_DOMAIN = os.getenv("LOCALTUNNEL_DOMAIN", "loca.lt")  # Restrict to L
 # User management - stored in Redis DB 0 (system database)
 # Key format: user:{username} -> JSON with hashed password and metadata
 def get_user_from_redis(username: str) -> Optional[Dict]:
-    """Get user from Redis"""
+    """Get user from Redis - fast non-blocking lookup"""
     try:
         from redis_files.redis_manager import RedisManager82
         db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+        # Redis.get() with decode_responses=True returns string, not bytes
         user_data = db0_client.get(f"user:{username}")
         if user_data:
+            # decode_responses=True means we get a string, parse JSON
             return json.loads(user_data)
+        return None
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error for user {username}: {e}")
         return None
     except Exception as e:
         print(f"Error fetching user from Redis: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def save_user_to_redis(username: str, password_hash: str, metadata: Optional[Dict] = None, update_existing: bool = False):
@@ -118,6 +138,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     if not hashed_password:
         return False
     
+    if not plain_password:
+        return False
+    
     # Try passlib first
     if HAS_PASSLIB and pwd_context:
         try:
@@ -132,11 +155,23 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         password_bytes = plain_password.encode('utf-8')
         if len(password_bytes) > 72:
             password_bytes = password_bytes[:72]
-        return bcrypt.checkpw(password_bytes, hashed_password.encode('utf-8'))
+        
+        # Ensure hashed_password is a string
+        if isinstance(hashed_password, bytes):
+            hash_bytes = hashed_password
+        else:
+            hash_bytes = hashed_password.encode('utf-8')
+        
+        return bcrypt.checkpw(password_bytes, hash_bytes)
     except Exception as e:
         print(f"bcrypt verification failed: {e}")
+        import traceback
+        traceback.print_exc()
         # Last resort: plain text (NOT SECURE - only for development)
-        return plain_password == hashed_password
+        # Only use this if we're in development mode
+        if os.getenv("ENVIRONMENT") != "production":
+            return plain_password == hashed_password
+        return False
 
 def hash_password(password: str) -> str:
     """Hash password (bcrypt has 72-byte limit)"""
@@ -190,13 +225,21 @@ def verify_api_key(x_api_key: str = Depends(API_KEY_HEADER)):
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Create JWT access token"""
     to_encode = data.copy()
+    now = datetime.now(timezone.utc)
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = now + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+        expire = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    # JWT expects exp as integer timestamp
+    to_encode.update({"exp": int(expire.timestamp())})
+    try:
+        encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+        return encoded_jwt
+    except Exception as e:
+        print(f"Error encoding JWT: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     """Verify JWT token and return user"""
@@ -538,35 +581,146 @@ manager = ConnectionManager()
 
 @app.websocket("/ws/professional/{symbol}")
 async def websocket_professional_chart(websocket: WebSocket, symbol: str):
-    """WebSocket for real-time professional chart data"""
+    """WebSocket for real-time professional chart data - reads from Redis ohlc_latest"""
     await manager.connect(websocket, symbol)
     try:
+        from redis_files.redis_manager import RedisManager82
+        db2_client = RedisManager82.get_client(process_name="api", db=2, decode_responses=False)
+        db5_client = RedisManager82.get_client(process_name="api", db=5, decode_responses=False)
+        
+        # Normalize symbol
+        base_symbol = symbol.split(':')[-1] if ':' in symbol else symbol
+        
+        last_sent_hash = None  # Track last sent data to avoid duplicate sends
+        
         while True:
-            # Keep connection alive and send periodic updates
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Poll every 500ms for real-time updates
             
-            # Simulate real-time data
-            chart_data = {
-                "timestamp": int(time.time() * 1000),
-                "ohlc_data": [{
-                    "timestamp": int(time.time() * 1000),
-                    "open": 2400 + (time.time() % 100),
-                    "high": 2405 + (time.time() % 100),
-                    "low": 2395 + (time.time() % 100),
-                    "close": 2402 + (time.time() % 100),
-                    "volume": 1000000 + int(time.time() % 500000)
-                }],
-                "technical_indicators": {
-                    "rsi": {"value": 65.4, "signal": "NEUTRAL"},
-                    "ema20": {"value": 2400.2, "signal": "BULLISH"},
-                    "vwap": {"value": 2401.5, "signal": "BULLISH"}
-                },
-                "active_patterns": []
-            }
-            
-            await manager.send_personal_message(json.dumps(chart_data), websocket)
+            try:
+                # Read latest OHLC from Redis DB 2
+                ohlc_key = f"ohlc_latest:{base_symbol}"
+                ohlc_data = db2_client.hgetall(ohlc_key)
+                
+                if not ohlc_data:
+                    # Try with full symbol
+                    ohlc_key = f"ohlc_latest:{symbol}"
+                    ohlc_data = db2_client.hgetall(ohlc_key)
+                
+                # For base indices, also try index data if no ohlc_latest found
+                if not ohlc_data:
+                    is_base_index = base_symbol in ['NIFTY', 'BANKNIFTY', 'NIFTY 50', 'NIFTY BANK', 'INDIA VIX']
+                    if is_base_index:
+                        db1_client = RedisManager82.get_client(process_name="api", db=1, decode_responses=False)
+                        index_key_map = {
+                            'NIFTY': 'index:NSE:NIFTY 50',
+                            'NIFTY 50': 'index:NSE:NIFTY 50',
+                            'BANKNIFTY': 'index:NSE:NIFTY BANK',
+                            'NIFTY BANK': 'index:NSE:NIFTY BANK',
+                            'INDIA VIX': 'index:NSE:INDIA VIX'
+                        }
+                        index_key = index_key_map.get(base_symbol, f"index:NSE:{base_symbol}")
+                        index_data = db1_client.get(index_key)
+                        
+                        if index_data:
+                            if isinstance(index_data, bytes):
+                                index_data = index_data.decode('utf-8')
+                            try:
+                                index_json = json.loads(index_data)
+                                # Convert index data to ohlc_data hash format for processing
+                                ohlc_data = {
+                                    b'last_price': str(index_json.get('last_price', 0)).encode(),
+                                    b'open': str(index_json.get('ohlc', {}).get('open', 0)).encode(),
+                                    b'high': str(index_json.get('ohlc', {}).get('high', 0)).encode(),
+                                    b'low': str(index_json.get('ohlc', {}).get('low', 0)).encode(),
+                                    b'close': str(index_json.get('ohlc', {}).get('close', 0)).encode(),
+                                    b'timestamp': str(int(time.time() * 1000)).encode()
+                                }
+                            except Exception as e:
+                                print(f"Error reading index data for WebSocket: {e}")
+                
+                if ohlc_data:
+                    # Decode hash fields
+                    def decode_val(key, default=0):
+                        val = ohlc_data.get(key.encode() if isinstance(key, str) else key) or ohlc_data.get(key, default)
+                        if isinstance(val, bytes):
+                            val = val.decode('utf-8')
+                        try:
+                            return float(val) if val else default
+                        except (ValueError, TypeError):
+                            return default
+                    
+                    timestamp = decode_val('timestamp', int(time.time() * 1000))
+                    if timestamp < 1e10:
+                        timestamp = int(timestamp * 1000)  # Convert seconds to ms
+                    
+                    current_ohlc = {
+                        "timestamp": int(timestamp),
+                        "open": decode_val('open', 0),
+                        "high": decode_val('high', 0),
+                        "low": decode_val('low', 0),
+                        "close": decode_val('close', decode_val('last_price', 0)),
+                        "volume": int(decode_val('volume', 0))
+                    }
+                    
+                    # Create hash to detect changes
+                    current_hash = hash((current_ohlc['timestamp'], current_ohlc['close'], current_ohlc['volume']))
+                    
+                    # Only send if data changed
+                    if current_hash != last_sent_hash:
+                        # Get indicators from DB 5
+                        indicators = {}
+                        try:
+                            ema_20 = db5_client.get(f"indicators:{base_symbol}:ema_20")
+                            ema_50 = db5_client.get(f"indicators:{base_symbol}:ema_50")
+                            ema_100 = db5_client.get(f"indicators:{base_symbol}:ema_100")
+                            ema_200 = db5_client.get(f"indicators:{base_symbol}:ema_200")
+                            vwap_val = db5_client.get(f"indicators:{base_symbol}:vwap")
+                            
+                            def parse_indicator(val):
+                                if not val:
+                                    return None
+                                if isinstance(val, bytes):
+                                    val = val.decode('utf-8')
+                                try:
+                                    return float(val)
+                                except:
+                                    return None
+                            
+                            if ema_20:
+                                indicators['ema_20'] = parse_indicator(ema_20)
+                            if ema_50:
+                                indicators['ema_50'] = parse_indicator(ema_50)
+                            if ema_100:
+                                indicators['ema_100'] = parse_indicator(ema_100)
+                            if ema_200:
+                                indicators['ema_200'] = parse_indicator(ema_200)
+                            if vwap_val:
+                                indicators['vwap'] = parse_indicator(vwap_val)
+                        except Exception as e:
+                            print(f"Error loading indicators: {e}")
+                        
+                        chart_data = {
+                            "type": "chart_update",
+                            "symbol": symbol,
+                            "timestamp": int(time.time() * 1000),
+                            "ohlc": current_ohlc,
+                            "indicators": indicators
+                        }
+                        
+                        await manager.send_personal_message(json.dumps(chart_data), websocket)
+                        last_sent_hash = current_hash
+                else:
+                    # No data available - send empty update occasionally
+                    await asyncio.sleep(2)  # Slow down if no data
+                    
+            except Exception as e:
+                print(f"Error in websocket_professional_chart: {e}")
+                await asyncio.sleep(1)  # Wait before retrying
             
     except WebSocketDisconnect:
+        manager.disconnect(websocket, symbol)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
         manager.disconnect(websocket, symbol)
 
 
@@ -581,32 +735,60 @@ async def login(
     two_fa_code: Optional[str] = Form(None)
 ):
     """Login endpoint - returns JWT access token (supports 2FA)"""
-    user_data = get_user_from_redis(username)
-    if not user_data:
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-    
-    if not verify_password(password, user_data.get("password_hash", "")):
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-    
-    # Check if 2FA is enabled
-    if user_data.get("two_fa_enabled", False):
-        if not two_fa_code:
-            raise HTTPException(status_code=403, detail="2FA code required")
+    try:
+        # Run Redis call in thread pool to prevent blocking
+        loop = asyncio.get_event_loop()
+        user_data = await loop.run_in_executor(None, get_user_from_redis, username)
+        if not user_data:
+            raise HTTPException(status_code=401, detail="Incorrect username or password")
         
-        two_fa_secret = user_data.get("two_fa_secret")
-        if not two_fa_secret or not HAS_2FA:
-            raise HTTPException(status_code=500, detail="2FA not properly configured")
+        # Verify password with error handling (also run in executor to avoid blocking)
+        password_hash = user_data.get("password_hash", "")
+        try:
+            password_valid = await loop.run_in_executor(None, verify_password, password, password_hash)
+        except Exception as e:
+            print(f"Error verifying password: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Password verification error: {str(e)}")
         
-        # Verify 2FA code
-        totp = pyotp.TOTP(two_fa_secret)
-        if not totp.verify(two_fa_code, valid_window=1):  # Allow 1 step tolerance
-            raise HTTPException(status_code=401, detail="Invalid 2FA code")
-    
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": username}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer", "two_fa_required": user_data.get("two_fa_enabled", False)}
+        if not password_valid:
+            raise HTTPException(status_code=401, detail="Incorrect username or password")
+        
+        # Check if 2FA is enabled
+        if user_data.get("two_fa_enabled", False):
+            if not two_fa_code:
+                raise HTTPException(status_code=403, detail="2FA code required")
+            
+            two_fa_secret = user_data.get("two_fa_secret")
+            if not two_fa_secret or not HAS_2FA:
+                raise HTTPException(status_code=500, detail="2FA not properly configured")
+            
+            # Verify 2FA code
+            totp = pyotp.TOTP(two_fa_secret)
+            if not totp.verify(two_fa_code, valid_window=1):  # Allow 1 step tolerance
+                raise HTTPException(status_code=401, detail="Invalid 2FA code")
+        
+        # Create access token with error handling
+        try:
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            access_token = create_access_token(
+                data={"sub": username}, expires_delta=access_token_expires
+            )
+        except Exception as e:
+            print(f"Error creating access token: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Token creation error: {str(e)}")
+        
+        return {"access_token": access_token, "token_type": "bearer", "two_fa_required": user_data.get("two_fa_enabled", False)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Unexpected error in login: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
 
 @app.post("/api/auth/register")
 async def register(
@@ -809,88 +991,201 @@ async def disable_2fa(
 # BROKERAGE INTEGRATION ENDPOINTS
 # ============================================================================
 
-@app.post("/api/brokerage/connect")
+@app.get("/api/brokerage/auth-url")
 @limiter.limit("10/minute")
-async def connect_brokerage(
+async def get_brokerage_auth_url(
     request: Request,
-    broker: str = Form(...),  # "zerodha", "angel_one", etc.
-    api_key: str = Form(...),
-    access_token: Optional[str] = Form(None),
-    request_token: Optional[str] = Form(None),
+    broker: str = Query(...),  # "zerodha", "angel_one", etc.
+    redirect_url: str = Query(...),  # Where to redirect after auth
     current_user: dict = Depends(get_current_user)
 ):
-    """Connect user's brokerage account"""
+    """Get authentication URL for brokerage OAuth flow
+    
+    This endpoint generates the OAuth URL for users to authenticate directly with their broker.
+    We do NOT store credentials - authentication happens client-side.
+    
+    Returns:
+        - auth_url: URL to redirect user for broker authentication
+        - state: State token for CSRF protection
+    """
+    import secrets
+    import urllib.parse
+    
+    username = current_user.get("username")
+    state = secrets.token_urlsafe(32)
+    
+    # Store state temporarily in Redis (expires in 10 minutes) for CSRF protection
+    from redis_files.redis_manager import RedisManager82
+    db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+    db0_client.setex(f"brokerage_auth_state:{username}:{broker}:{state}", 600, "pending")
+    
+    if broker.lower() == "zerodha":
+        # Zerodha Kite Connect OAuth flow
+        api_key = request.headers.get("X-API-Key") or os.getenv("ZERODHA_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="Zerodha API key not configured. Provide X-API-Key header or set ZERODHA_API_KEY env var.")
+        
+        # Build Kite Connect login URL
+        kite_login_url = f"https://kite.trade/connect/login?v=3&api_key={api_key}"
+        # Note: redirect_url should be whitelisted in Kite Connect app settings
+        
+        return {
+            "auth_url": kite_login_url,
+            "state": state,
+            "broker": "zerodha",
+            "message": "Redirect user to this URL. After authentication, user will be redirected back with request_token."
+        }
+    
+    elif broker.lower() in ["angel_one", "angel_broking", "angel"]:
+        # Angel Broking uses Publisher API - authentication happens client-side
+        # We just provide the API key (which is public for Publisher API)
+        api_key = request.headers.get("X-API-Key") or os.getenv("ANGEL_ONE_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="Angel One API key not configured. Provide X-API-Key header or set ANGEL_ONE_API_KEY env var.")
+        
+        # For Publisher API, authentication is handled client-side via embedded buttons
+        # No server-side OAuth flow needed
+        return {
+            "auth_url": None,
+            "api_key": api_key,  # Public API key for Publisher API
+            "state": state,
+            "broker": "angel_one",
+            "message": "Use Publisher API client-side. No server-side auth needed. Embed Publisher buttons in frontend.",
+            "publisher_api_url": "https://smartapi.angelbroking.com/publisher.js",
+            "docs": "https://smartapi.angelbroking.com/docs/Publisher"
+        }
+    
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported broker: {broker}. Supported: zerodha, angel_one")
+
+@app.post("/api/brokerage/verify-connection")
+@limiter.limit("10/minute")
+async def verify_brokerage_connection(
+    request: Request,
+    broker: str = Form(...),
+    state: str = Form(...),
+    # Zerodha specific
+    request_token: Optional[str] = Form(None),
+    # Angel One - no token needed (client-side auth)
+    current_user: dict = Depends(get_current_user)
+):
+    """Verify and confirm brokerage connection (after OAuth redirect)
+    
+    This endpoint verifies the connection WITHOUT storing credentials.
+    We only store that the user has connected (not their tokens).
+    
+    For Zerodha: Verifies request_token and confirms connection
+    For Angel One: Just confirms connection (auth happens client-side)
+    """
     username = current_user.get("username")
     user_data = get_user_from_redis(username)
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Store brokerage credentials securely
+    # Verify state token (CSRF protection)
+    from redis_files.redis_manager import RedisManager82
+    db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+    state_key = f"brokerage_auth_state:{username}:{broker}:{state}"
+    state_valid = db0_client.exists(state_key)
+    
+    if not state_valid:
+        raise HTTPException(status_code=400, detail="Invalid or expired state token")
+    
+    # Delete state token (one-time use)
+    db0_client.delete(state_key)
+    
     brokerage_connections = user_data.get("brokerage_connections", {})
     
     if broker.lower() == "zerodha":
+        if not request_token:
+            raise HTTPException(status_code=400, detail="request_token required for Zerodha verification")
+        
         try:
+            # Get API key from env or header (not from user - this is OUR app's API key)
+            api_key = os.getenv("ZERODHA_API_KEY") or request.headers.get("X-API-Key")
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Zerodha API key not configured")
+            
+            # Verify token (one-time check) - we DON'T store it
             from kiteconnect import KiteConnect
             kite = KiteConnect(api_key=api_key)
+            session = kite.generate_session(request_token, api_secret=os.getenv("ZERODHA_API_SECRET"))
             
-            # If request_token provided, generate access_token
-            if request_token:
-                session = kite.generate_session(request_token)
-                access_token = session["access_token"]
-            elif not access_token:
-                raise HTTPException(status_code=400, detail="Either access_token or request_token required")
-            
-            kite.set_access_token(access_token)
-            # Verify connection by fetching profile
+            # Verify connection by fetching profile (one-time verification)
+            kite.set_access_token(session["access_token"])
             profile = kite.profile()
             
-            # Store credentials (encrypted in production)
+            # Store ONLY metadata (NOT credentials)
             brokerage_connections["zerodha"] = {
-                "api_key": api_key,
-                "access_token": access_token,
+                "connected": True,
                 "user_id": profile.get("user_id"),
                 "user_name": profile.get("user_name"),
                 "connected_at": datetime.utcnow().isoformat(),
-                "last_verified": datetime.utcnow().isoformat()
+                "last_verified": datetime.utcnow().isoformat(),
+                "note": "Credentials NOT stored. User manages tokens client-side."
             }
             
-            # Update user data
+            # Update user data (only metadata)
             user_data["brokerage_connections"] = brokerage_connections
-            from redis_files.redis_manager import RedisManager82
-            db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
             db0_client.set(f"user:{username}", json.dumps(user_data))
             
             return {
-                "message": "Brokerage account connected successfully",
+                "message": "Zerodha connection verified successfully",
                 "broker": "zerodha",
                 "user_id": profile.get("user_id"),
-                "user_name": profile.get("user_name")
+                "user_name": profile.get("user_name"),
+                "note": "Credentials are NOT stored. You must manage your access_token client-side for trade execution."
             }
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to connect brokerage: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Failed to verify Zerodha connection: {str(e)}")
+    
+    elif broker.lower() in ["angel_one", "angel_broking", "angel"]:
+        # Angel One Publisher API - authentication is 100% client-side
+        # We just confirm the connection status
+        brokerage_connections["angel_one"] = {
+            "connected": True,
+            "connected_at": datetime.utcnow().isoformat(),
+            "note": "Publisher API - authentication happens client-side. No credentials stored."
+        }
+        
+        # Update user data (only connection status)
+        user_data["brokerage_connections"] = brokerage_connections
+        db0_client.set(f"user:{username}", json.dumps(user_data))
+        
+        return {
+            "message": "Angel One connection confirmed",
+            "broker": "angel_one",
+            "note": "Publisher API handles authentication client-side. Embed Publisher buttons in frontend for trade execution."
+        }
+    
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported broker: {broker}")
+        raise HTTPException(status_code=400, detail=f"Unsupported broker: {broker}. Supported: zerodha, angel_one")
 
 @app.get("/api/brokerage/connections")
 async def get_brokerage_connections(current_user: dict = Depends(get_current_user)):
-    """Get user's connected brokerage accounts"""
+    """Get user's connected brokerage accounts (metadata only - no credentials)"""
     username = current_user.get("username")
     user_data = get_user_from_redis(username)
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
     
     connections = user_data.get("brokerage_connections", {})
-    # Return connection info without sensitive tokens
+    # Return only connection status (NO credentials stored)
     safe_connections = {}
     for broker, data in connections.items():
         safe_connections[broker] = {
+            "connected": data.get("connected", False),
             "user_id": data.get("user_id"),
             "user_name": data.get("user_name"),
             "connected_at": data.get("connected_at"),
-            "last_verified": data.get("last_verified")
+            "last_verified": data.get("last_verified"),
+            "note": data.get("note", "Credentials managed client-side")
         }
     
-    return {"connections": safe_connections}
+    return {
+        "connections": safe_connections,
+        "security_note": "Credentials are NEVER stored. Users manage authentication tokens client-side."
+    }
 
 @app.post("/api/brokerage/disconnect")
 @limiter.limit("5/minute")
@@ -1232,7 +1527,10 @@ async def get_alert_stats(
         confidence_counts = {"high": 0, "medium": 0, "low": 0}
         instrument_type_counts = {}
         today_count = 0
-        today = datetime.now().date()
+        # Use IST timezone for "today" calculation
+        from datetime import timezone, timedelta
+        ist = timezone(timedelta(hours=5, minutes=30))
+        today = datetime.now(ist).date()
         
         for msg_id, msg_data in messages:
             try:
@@ -1271,20 +1569,28 @@ async def get_alert_stats(
                 inst_type = alert.get('instrument_type', 'UNKNOWN')
                 instrument_type_counts[inst_type] = instrument_type_counts.get(inst_type, 0) + 1
                 
-                # Count today's alerts
+                # Count today's alerts (IST timezone) - INSIDE the loop
                 alert_ts = alert.get('timestamp')
                 if alert_ts:
                     try:
                         if isinstance(alert_ts, str):
                             alert_dt = datetime.fromisoformat(alert_ts.replace('Z', '+00:00'))
                         else:
+                            # If timestamp is in milliseconds, convert to seconds
+                            if alert_ts > 1e10:
+                                alert_ts = alert_ts / 1000
                             alert_dt = datetime.fromtimestamp(alert_ts)
-                        if alert_dt.date() == today:
+                        
+                        # Convert to IST (UTC+5:30)
+                        alert_ist = alert_dt.replace(tzinfo=timezone.utc).astimezone(ist)
+                        today_ist = datetime.now(ist).date()
+                        
+                        if alert_ist.date() == today_ist:
                             today_count += 1
                     except Exception:
                         pass
             except Exception:
-                continue
+                pass
         
         # Sort symbol ranking
         symbol_ranking = sorted(symbol_counts.items(), key=lambda x: x[1], reverse=True)[:10]
@@ -1470,6 +1776,10 @@ async def get_chart_data_internal(
         zset_key = f"ohlc_daily:{symbol}"
         
         ohlc_data = []
+        
+        # For base indices (NIFTY, BANKNIFTY), try to get from index data if no historical data
+        is_base_index = base_symbol in ['NIFTY', 'BANKNIFTY', 'NIFTY 50', 'NIFTY BANK', 'INDIA VIX']
+        
         try:
             zset_entries = db2_client.zrange(zset_key, 0, -1, withscores=True)
             
@@ -1477,6 +1787,36 @@ async def get_chart_data_internal(
                 # Try base symbol
                 zset_key = f"ohlc_daily:{base_symbol}"
                 zset_entries = db2_client.zrange(zset_key, 0, -1, withscores=True)
+            
+            # If still no data and it's a base index, try to get from index data
+            if not zset_entries and is_base_index:
+                # Try to get latest index data and create a minimal chart
+                db1_client = RedisManager82.get_client(process_name="api", db=1, decode_responses=False)
+                index_key = f"index:NSE:{base_symbol}" if base_symbol in ['NIFTY 50', 'NIFTY BANK'] else f"index:NSE:{base_symbol}"
+                index_data = db1_client.get(index_key)
+                
+                if index_data:
+                    if isinstance(index_data, bytes):
+                        index_data = index_data.decode('utf-8')
+                    try:
+                        index_json = json.loads(index_data)
+                        last_price = float(index_json.get('last_price', 0))
+                        ohlc_obj = index_json.get('ohlc', {})
+                        
+                        if isinstance(ohlc_obj, dict) and ohlc_obj:
+                            # Create a single OHLC bar from index data
+                            timestamp_ms = int(time.time() * 1000)
+                            ohlc_entry = {
+                                "timestamp": timestamp_ms,
+                                "open": float(ohlc_obj.get('open', last_price)),
+                                "high": float(ohlc_obj.get('high', last_price)),
+                                "low": float(ohlc_obj.get('low', last_price)),
+                                "close": float(ohlc_obj.get('close', last_price)),
+                                "volume": 0
+                            }
+                            ohlc_data.append(ohlc_entry)
+                    except Exception as e:
+                        print(f"Error creating chart from index data: {e}")
             
             for entry_data, timestamp_score in zset_entries:
                 try:
@@ -1507,6 +1847,73 @@ async def get_chart_data_internal(
                     continue
         except Exception as e:
             print(f"Error reading OHLC data: {e}")
+        
+        # If still no data, try ohlc_latest hash in DB 2 (bucket format)
+        if len(ohlc_data) == 0:
+            for symbol_variant in [symbol, base_symbol]:
+                ohlc_key = f"ohlc_latest:{symbol_variant}"
+                ohlc_hash = db2_client.hgetall(ohlc_key)
+                
+                if ohlc_hash:
+                    def decode_val(key, default=0):
+                        val = ohlc_hash.get(key.encode() if isinstance(key, str) else key) or ohlc_hash.get(key, default)
+                        if isinstance(val, bytes):
+                            val = val.decode('utf-8')
+                        try:
+                            return float(val) if val else default
+                        except (ValueError, TypeError):
+                            return default
+                    
+                    # Bucket format: open, high, low, close, volume, timestamp
+                    timestamp_ms = int(decode_val('timestamp', time.time() * 1000))
+                    ohlc_entry = {
+                        "timestamp": timestamp_ms,
+                        "open": decode_val('open', 0),
+                        "high": decode_val('high', 0),
+                        "low": decode_val('low', 0),
+                        "close": decode_val('close', 0),
+                        "volume": int(decode_val('volume', 0))
+                    }
+                    ohlc_data.append(ohlc_entry)
+                    break
+        
+        # If still no data and it's a base index, try to get from index data
+        if len(ohlc_data) == 0 and is_base_index:
+            # Try to get latest index data and create a minimal chart
+            db1_client = RedisManager82.get_client(process_name="api", db=1, decode_responses=False)
+            # Map symbol names to Redis index keys
+            index_key_map = {
+                'NIFTY': 'index:NSE:NIFTY 50',
+                'NIFTY 50': 'index:NSE:NIFTY 50',
+                'BANKNIFTY': 'index:NSE:NIFTY BANK',
+                'NIFTY BANK': 'index:NSE:NIFTY BANK',
+                'INDIA VIX': 'index:NSE:INDIA VIX'
+            }
+            index_key = index_key_map.get(base_symbol, f"index:NSE:{base_symbol}")
+            index_data = db1_client.get(index_key)
+            
+            if index_data:
+                if isinstance(index_data, bytes):
+                    index_data = index_data.decode('utf-8')
+                try:
+                    index_json = json.loads(index_data)
+                    last_price = float(index_json.get('last_price', 0))
+                    ohlc_obj = index_json.get('ohlc', {})
+                    
+                    if isinstance(ohlc_obj, dict) and ohlc_obj:
+                        # Create a single OHLC bar from index data
+                        timestamp_ms = int(time.time() * 1000)
+                        ohlc_entry = {
+                            "timestamp": timestamp_ms,
+                            "open": float(ohlc_obj.get('open', last_price)),
+                            "high": float(ohlc_obj.get('high', last_price)),
+                            "low": float(ohlc_obj.get('low', last_price)),
+                            "close": float(ohlc_obj.get('close', last_price)),
+                            "volume": 0
+                        }
+                        ohlc_data.append(ohlc_entry)
+                except Exception as e:
+                    print(f"Error creating chart from index data: {e}")
         
         # Sort by timestamp
         ohlc_data.sort(key=lambda x: x['timestamp'])
@@ -1786,48 +2193,136 @@ async def get_validation_stats():
 
 @app.get("/api/market/indices")
 async def get_market_indices():
-    """Get market indices (NIFTY, BANKNIFTY, VIX) from Redis"""
+    """Get market indices (NIFTY, BANKNIFTY, VIX) from Redis
+    
+    Per REDIS_STORAGE_SIGNATURE.md:
+    - ohlc_latest:{symbol} is in DB 2 (analytics_data) - bucket format
+    - index:NSE:{name} is in DB 1 (realtime) - gift_nifty_gap.py format
+    
+    Priority:
+    1. ohlc_latest:{symbol} hash in DB 2 (bucket format when market is on)
+    2. index:NSE:{name} JSON in DB 1 (gift_nifty_gap.py format when market is off)
+    """
     try:
         from redis_files.redis_manager import RedisManager82
         
-        # Get DB 1 client (realtime)
-        client = RedisManager82.get_client(process_name="api", db=1, decode_responses=False)
+        # Get clients for both DB 1 (realtime) and DB 2 (analytics)
+        # Per REDIS_STORAGE_SIGNATURE.md: ohlc_latest is in DB 2, index:NSE: is in DB 1
+        db1_client = RedisManager82.get_client(process_name="api", db=1, decode_responses=False)
+        db2_client = RedisManager82.get_client(process_name="api", db=2, decode_responses=False)
         
         indices = {}
-        index_symbols = ['NIFTY 50', 'NIFTY BANK', 'INDIA VIX']
+        # Map index names to symbol variations for bucket lookup
+        index_symbol_map = {
+            'NIFTY 50': ['NIFTY 50', 'NIFTY', 'NSE:NIFTY 50'],
+            'NIFTY BANK': ['NIFTY BANK', 'BANKNIFTY', 'NSE:NIFTY BANK'],
+            'INDIA VIX': ['INDIA VIX', 'VIX', 'NSE:INDIA VIX']
+        }
         
-        for index_name in index_symbols:
+        # Map index names to gift_nifty_gap.py Redis keys
+        gift_nifty_key_map = {
+            'NIFTY 50': 'index:NSE:NIFTY 50',
+            'NIFTY BANK': 'index:NSE:NIFTY BANK',
+            'INDIA VIX': 'index:NSE:INDIA VIX'
+        }
+        
+        for index_name, symbol_variations in index_symbol_map.items():
             try:
-                # Try ohlc_latest:{symbol} hash
-                ohlc_key = f"ohlc_latest:{index_name}"
-                ohlc_data = client.hgetall(ohlc_key)
+                found = False
                 
-                if ohlc_data:
-                    def decode_val(key, default=0):
-                        val = ohlc_data.get(key.encode() if isinstance(key, str) else key) or ohlc_data.get(key, default)
-                        if isinstance(val, bytes):
-                            val = val.decode('utf-8')
-                        return float(val) if val else default
+                # PRIORITY 1: Try ohlc_latest hash in DB 2 (bucket format - when market is on)
+                for symbol_variant in symbol_variations:
+                    ohlc_key = f"ohlc_latest:{symbol_variant}"
+                    ohlc_data = db2_client.hgetall(ohlc_key)
                     
-                    last_price = decode_val('last_price', 0)
-                    prev_close = decode_val('prev_close', last_price)
-                    
-                    change_pct = ((last_price - prev_close) / prev_close * 100) if prev_close > 0 else 0
-                    
-                    indices[index_name] = {
-                        "last_price": last_price,
-                        "prev_close": prev_close,
-                        "change": last_price - prev_close,
-                        "change_pct": change_pct
-                    }
-                else:
+                    if ohlc_data:
+                        def decode_val(key, default=0):
+                            val = ohlc_data.get(key.encode() if isinstance(key, str) else key) or ohlc_data.get(key, default)
+                            if isinstance(val, bytes):
+                                val = val.decode('utf-8')
+                            try:
+                                return float(val) if val else default
+                            except (ValueError, TypeError):
+                                return default
+                        
+                        # Bucket format: open, high, low, close, volume, timestamp
+                        # Note: bucket format uses 'close' as the current price, no 'last_price' field
+                        close_price = decode_val('close', 0)
+                        last_price = close_price  # In bucket format, close IS the last_price
+                        
+                        # prev_close: try to get from yesterday's data or use current close as fallback
+                        prev_close = decode_val('prev_close', close_price)
+                        
+                        # Calculate change: last_price - prev_close
+                        change = last_price - prev_close
+                        change_pct = ((change / prev_close) * 100) if prev_close > 0 else 0.0
+                        
+                        indices[index_name] = {
+                            "last_price": last_price,
+                            "prev_close": prev_close,
+                            "change": change,
+                            "change_pct": change_pct
+                        }
+                        found = True
+                        break
+                
+                # PRIORITY 2: Fallback to gift_nifty_gap.py format in DB 1 (when market is off)
+                if not found:
+                    redis_key = gift_nifty_key_map.get(index_name)
+                    if redis_key:
+                        index_data = db1_client.get(redis_key)
+                        
+                        if index_data:
+                            if isinstance(index_data, bytes):
+                                index_data = index_data.decode('utf-8')
+                            
+                            try:
+                                index_json = json.loads(index_data)
+                                last_price = float(index_json.get('last_price', 0))
+                                
+                                # Handle different data structures
+                                ohlc = index_json.get('ohlc', {})
+                                if isinstance(ohlc, dict):
+                                    prev_close = float(ohlc.get('close', last_price))
+                                else:
+                                    prev_close = float(index_json.get('prev_close', last_price))
+                                
+                                # Calculate change from net_change or last_price - prev_close
+                                net_change = index_json.get('net_change')
+                                if net_change is not None:
+                                    change = float(net_change)
+                                else:
+                                    change = float(index_json.get('change', last_price - prev_close))
+                                
+                                # Calculate change percentage
+                                if prev_close > 0:
+                                    change_pct = (change / prev_close) * 100
+                                else:
+                                    change_pct = 0.0
+                                
+                                indices[index_name] = {
+                                    "last_price": last_price,
+                                    "prev_close": prev_close,
+                                    "change": change,
+                                    "change_pct": change_pct
+                                }
+                                found = True
+                            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                                print(f"Error parsing index data for {index_name}: {e}")
+                
+                # Default fallback if nothing found
+                if not found:
                     indices[index_name] = {
                         "last_price": 0,
                         "prev_close": 0,
                         "change": 0,
                         "change_pct": 0
                     }
+                    
             except Exception as e:
+                print(f"Error fetching index {index_name}: {e}")
+                import traceback
+                traceback.print_exc()
                 indices[index_name] = {
                     "last_price": 0,
                     "prev_close": 0,
@@ -1835,9 +2330,28 @@ async def get_market_indices():
                     "change_pct": 0
                 }
         
+        # Add Gift Nifty gap data
+        try:
+            gap_data = db1_client.get('latest_gift_nifty_gap')
+            if gap_data:
+                if isinstance(gap_data, bytes):
+                    gap_data = gap_data.decode('utf-8')
+                gap_json = json.loads(gap_data)
+                indices['GIFT_NIFTY_GAP'] = {
+                    "gap_points": float(gap_json.get('gap_points', 0)),
+                    "gap_percent": float(gap_json.get('gap_percent', 0)),
+                    "gift_price": float(gap_json.get('gift_price', 0)),
+                    "nifty_price": float(gap_json.get('nifty_price', 0)),
+                    "signal": gap_json.get('signal', '')
+                }
+        except Exception as e:
+            print(f"Error fetching Gift Nifty gap: {e}")
+        
         return indices
     except Exception as e:
         print(f"Error in get_market_indices: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "NIFTY 50": {"last_price": 0, "prev_close": 0, "change": 0, "change_pct": 0},
             "NIFTY BANK": {"last_price": 0, "prev_close": 0, "change": 0, "change_pct": 0},

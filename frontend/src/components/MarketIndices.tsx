@@ -1,93 +1,96 @@
 import React, { useEffect, useState } from 'react';
 import { marketAPI } from '../services/api';
 import { subscribeMarket } from '../services/socket';
-import { Box, Typography } from '@mui/material';
+import { Box, Chip, Stack, Typography } from '@mui/material';
 
 interface IndicesData {
-  "NIFTY 50": {
+  "NIFTY 50"?: {
     last_price: number;
     prev_close: number;
     change: number;
     change_pct: number;
   };
-  "NIFTY BANK": {
+  "NIFTY BANK"?: {
     last_price: number;
     prev_close: number;
     change: number;
     change_pct: number;
   };
-  "INDIA VIX": {
+  "INDIA VIX"?: {
     last_price: number;
     prev_close: number;
     change: number;
     change_pct: number;
   };
+  "GIFT_NIFTY_GAP"?: {
+    gap_points: number;
+    gap_percent: number;
+    gift_price: number;
+    nifty_price: number;
+    signal: string;
+  };
+  // Alternative format
+  vix?: { value: number };
+  nifty_50?: { value: number };
+  banknifty?: { value: number };
 }
 
 const MarketIndices: React.FC = () => {
-  const [indices, setIndices] = useState<IndicesData | null>(null);
+  const [indices, setIndices] = useState<IndicesData>({});
 
-  // Fetch initial data
+  // REST bootstrap + polling fallback
   useEffect(() => {
-    let mounted = true;
-    (async () => {
+    let timer: any;
+    const fetchOnce = async () => {
       try {
-        const response = await marketAPI.getIndices();
-        if (mounted) setIndices(response.data);
+        const { data } = await marketAPI.getIndices();
+        if (data) {
+          setIndices(data);
+        }
       } catch (err) {
         console.error('Failed to fetch market indices', err);
       }
-    })();
-    // Subscribe to real-time updates via WebSocket
-    const unsubscribe = subscribeMarket((data) => {
-      setIndices(data);
-    });
-    return () => {
-      mounted = false;
-      unsubscribe();
     };
+    fetchOnce();
+    timer = setInterval(fetchOnce, 5000); // Poll every 5 seconds
+    return () => clearInterval(timer);
   }, []);
 
-  if (!indices) {
-    // Return empty placeholder instead of null to avoid layout issues
-    return (
-      <Box sx={{ display: 'flex', alignItems: 'center', mr: 2 }}>
-        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-          Loading indices...
-        </Typography>
-      </Box>
-    );
-  }
+  // WS live updates (if available) - use subscribeMarket helper
+  useEffect(() => {
+    const unsubscribe = subscribeMarket((msg: any) => {
+      const data = msg?.data || msg || {};
+      setIndices(data);
+    });
+    return unsubscribe;
+  }, []);
 
-  const Item = ({ name, data }: { name: string; data: any }) => {
-    if (!data) return null;
-    // Always show, even if price is 0 (market closed)
-    const hasData = data.last_price > 0;
-    const color = hasData ? (data.change >= 0 ? 'success.main' : 'error.main') : 'text.secondary';
-    const arrow = hasData && data.change >= 0 ? '▲' : hasData ? '▼' : '';
-    return (
-      <Box sx={{ mx: 1 }}>
-        <Typography variant="subtitle2" component="span" sx={{ fontWeight: 600 }}>
-          {name}:
-        </Typography>
-        <Typography component="span" sx={{ ml: 0.5 }}>
-          {hasData ? data.last_price.toFixed(2) : '--'}
-        </Typography>
-        {hasData && (
-          <Typography component="span" sx={{ ml: 0.5, color }}>
-            {arrow} {Math.abs(data.change).toFixed(2)} ({data.change_pct.toFixed(2)}%)
-          </Typography>
-        )}
-      </Box>
-    );
-  };
+  // Extract values with fallbacks
+  const vixValue = indices?.vix?.value ?? indices?.["INDIA VIX"]?.last_price ?? null;
+  const niftyValue = indices?.nifty_50?.value ?? indices?.["NIFTY 50"]?.last_price ?? null;
+  const bankniftyValue = indices?.banknifty?.value ?? indices?.["NIFTY BANK"]?.last_price ?? null;
+  const giftGap = indices?.["GIFT_NIFTY_GAP"];
+
+  const v = vixValue != null && vixValue > 0 ? vixValue.toFixed(2) : '--';
+  const n = niftyValue != null && niftyValue > 0 ? niftyValue.toFixed(2) : '--';
+  const b = bankniftyValue != null && bankniftyValue > 0 ? bankniftyValue.toFixed(2) : '--';
+  
+  // Format Gift Nifty gap
+  const gapDisplay = giftGap 
+    ? `${giftGap.gap_points >= 0 ? '+' : ''}${giftGap.gap_points.toFixed(0)} (${giftGap.gap_percent >= 0 ? '+' : ''}${giftGap.gap_percent.toFixed(2)}%)`
+    : '--';
 
   return (
-    <Box sx={{ display: 'flex', alignItems: 'center', mr: 2 }}>
-      <Item name="VIX" data={indices["INDIA VIX"]} />
-      <Item name="NIFTY" data={indices["NIFTY 50"]} />
-      <Item name="BANKNIFTY" data={indices["NIFTY BANK"]} />
-    </Box>
+    <Stack direction="row" spacing={2} sx={{ alignItems: 'center' }}>
+      <Chip label={`VIX: ${v}`} size="small" />
+      <Chip label={`NIFTY: ${n}`} size="small" />
+      <Chip label={`BANKNIFTY: ${b}`} size="small" />
+      <Chip 
+        label={`GIFT NIFTY GAP: ${gapDisplay}`} 
+        size="small"
+        color={giftGap && Math.abs(giftGap.gap_percent) > 0.5 ? (giftGap.gap_percent > 0 ? 'success' : 'error') : 'default'}
+      />
+    </Stack>
   );
 };
 
