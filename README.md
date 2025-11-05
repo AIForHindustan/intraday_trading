@@ -148,11 +148,14 @@
 - **Usage**: Price level volume analysis and gravitational effect zones
 - **Historical Analysis**: Trend analysis with 24-hour lookback for pattern detection
 
-### **📊 Alert Validation Dashboard**
+### **📊 Alert Validation Dashboard (Dash-based)**
 - **Primary Source**: `aion_alert_dashboard/alert_dashboard.py` (AlertValidationDashboard)
 - **Framework**: Dash (Plotly) with Bootstrap components
-- **Port**: 53056 (fixed for external consumer access)
-- **External Access**: ngrok tunnel (https://jere-unporous-magan.ngrok-free.dev)
+- **Port**: 53056 (fixed for external consumer access - DO NOT CHANGE)
+- **External Access**: 
+  - ngrok tunnel (https://jere-unporous-magan.ngrok-free.dev)
+  - Cloudflare Tunnel (https://remember-prefers-thinkpad-distributors.trycloudflare.com)
+- **Note**: This is a separate Dash-based dashboard, distinct from the React frontend (which runs on port 3000/5173)
 - **Features**:
   - Real-time alert visualization with interactive charts
   - Technical indicators overlay (VWAP, EMAs, Bollinger Bands, RSI, MACD)
@@ -276,11 +279,11 @@ Tick Data → Standardized Fields → Volume State → Pattern Analysis → Trad
 
 ### **7. Redis Multi-Database Architecture**
 ```
-DB 0: System → system_config, metadata, session_data, health_checks, volume baselines
-DB 1: Realtime → alerts:stream, ticks:*, patterns:*, news:* (NO indicators - indicators moved to DB 5)
-DB 2: Analytics → volume_profile:poc:*, volume_profile:distribution:*, ohlc_daily:*, metrics
-DB 3: Independent Validator → signal_quality, pattern_performance (isolated from main system)
-DB 5: Indicators Cache → indicators:*, Greeks (PRIMARY location per redis_config.py)
+DB 0: System → system_config, metadata, session_data, health_checks, user management, validation metadata
+DB 1: Realtime → alerts:stream, ticks:*, patterns:*, news:*, ohlc_latest:*, index:* (NO indicators - indicators moved to DB 5)
+DB 2: Analytics → volume_profile:poc:*, volume_profile:distribution:*, ohlc_daily:*, metrics, volume_state, straddle_volume
+DB 3: Independent Validator → signal_quality, pattern_performance, pattern_metrics, validator_metadata (isolated from main system)
+DB 5: Indicators Cache → indicators:{symbol}:{indicator_name}, indicators:{symbol}:greeks (PRIMARY location per redis_config.py)
 ```
 
 **⚠️ CRITICAL: Redis Storage Schema for Indicators, Greeks, and Volume Profile**
@@ -1660,9 +1663,9 @@ python core/data/redis_health.py
 redis-cli --stat
 ```
 
-### **3. Start Alert Dashboard**
+### **3. Start Alert Dashboard (Dash-based)**
 ```bash
-# Start the dashboard (local access)
+# Start the Dash dashboard (local access)
 python aion_alert_dashboard/alert_dashboard.py
 
 # Dashboard will be available at:
@@ -1672,6 +1675,8 @@ python aion_alert_dashboard/alert_dashboard.py
 
 # For external access, start ngrok tunnel:
 ngrok http 53056
+
+# Note: This is the Dash-based dashboard. For React frontend, see section below.
 
 # Dashboard features:
 # - Real-time alert visualization
@@ -1781,10 +1786,15 @@ The `community_bots/community_manager.py` orchestrates multi-platform distributi
 ```json
 {
     "bot_token": "YOUR_BOT_TOKEN",
-    "chat_ids": ["@kow_signal_bot"],
+    "chat_ids": ["@NSEAlgoTrading"],
+    "single_source": true,
+    "channel_name": "NSE Algo Trading",
     "signal_bot": {
         "bot_token": "SIGNAL_BOT_TOKEN",
-        "chat_ids": ["@kow_signal_bot"]
+        "bot_username": "kow_signal_bot",
+        "chat_ids": ["-1003231444405", "1847390842"],
+        "minimum_confidence": 0.85,
+        "symbols": ["NIFTY", "BANKNIFTY", "KOW_SIGNAL_STRADDLE"]
     }
 }
 ```
@@ -1805,7 +1815,7 @@ The `community_bots/community_manager.py` orchestrates multi-platform distributi
     "client_secret": "YOUR_CLIENT_SECRET",
     "username": "YOUR_USERNAME",
     "password": "YOUR_PASSWORD",
-    "subreddit": "AIONAlgoTrading"
+    "subreddit": "NSEAlgoTrading"
 }
 ```
 
@@ -1828,11 +1838,13 @@ python community_bots/reddit_bot.py
 ```
 
 ### **Redis Channels**
-The community manager subscribes to these Redis channels:
-- `telegram:validation_results`
-- `telegram:high_confidence_alerts`
-- `telegram:community_updates`
-- `reddit:validation_results`
+The community manager subscribes to these Redis pub/sub channels (DB 0):
+- `telegram:validation_results` - Validation results for Telegram distribution
+- `telegram:high_confidence_alerts` - High-confidence alerts (>90%) for Telegram
+- `telegram:community_updates` - General community updates
+- `reddit:validation_results` - Validation results for Reddit posting
+
+**Note**: The alert validator (`alert_validation/alert_validator.py`) publishes validation results to these channels when confidence >= 90%.
 
 ### **Alert Flow**
 ```
@@ -1930,11 +1942,12 @@ The system includes a modern React + TypeScript dashboard with real-time updates
 - **Login Flow**: Username/Password → 2FA Code (if enabled) → JWT Token
 
 #### **Brokerage Integration**
-- **Zerodha Kite Connect**: Connect user brokerage accounts
-- **Connect**: POST `/api/brokerage/connect` - Link Zerodha account
-- **List**: GET `/api/brokerage/connections` - View connected accounts
+- **Zerodha Kite Connect / Angel One**: OAuth-based brokerage authentication
+- **Auth URL**: GET `/api/brokerage/auth-url` - Get OAuth URL for broker authentication
+- **Verify Connection**: POST `/api/brokerage/verify-connection` - Verify and store connection metadata (NO credentials stored)
+- **List**: GET `/api/brokerage/connections` - View connected accounts (metadata only)
 - **Disconnect**: POST `/api/brokerage/disconnect` - Remove connection
-- Credentials stored securely in Redis per-user
+- **Security**: Credentials are NEVER stored server-side. Users manage authentication tokens client-side.
 
 #### **API Endpoints**
 
@@ -1950,8 +1963,9 @@ The system includes a modern React + TypeScript dashboard with real-time updates
 - `POST /api/auth/2fa/disable` - Disable 2FA
 
 **Brokerage:**
-- `POST /api/brokerage/connect` - Connect Zerodha
-- `GET /api/brokerage/connections` - List connections
+- `GET /api/brokerage/auth-url` - Get OAuth URL for broker authentication
+- `POST /api/brokerage/verify-connection` - Verify and store brokerage connection (metadata only)
+- `GET /api/brokerage/connections` - List connected accounts (metadata only, no credentials)
 - `POST /api/brokerage/disconnect` - Disconnect account
 
 **Alerts:**
@@ -1960,39 +1974,57 @@ The system includes a modern React + TypeScript dashboard with real-time updates
 - `GET /api/alerts/stats/summary` - Alert statistics
 
 **Market Data:**
-- `GET /api/market/indices` - Market indices
-- `GET /api/charts/{symbol}` - OHLC chart data
+- `GET /api/market/indices` - Market indices (NIFTY 50, BANKNIFTY, VIX, GIFT NIFTY GAP)
+- `GET /api/charts/{symbol}` - OHLC chart data (also available as `/api/chart/{symbol}`)
 - `GET /api/indicators/{symbol}` - Technical indicators
 - `GET /api/greeks/{symbol}` - Options Greeks
 - `GET /api/volume-profile/{symbol}` - Volume profile
-- `GET /api/news/{symbol}` - Symbol news
-- `GET /api/news/market/latest` - Latest market news
+- `GET /api/news` - General news endpoint (requires auth, query parameters for filtering)
+- `GET /api/news/{symbol}` - Symbol news (DB 1: `news:latest:{symbol}`)
+- `GET /api/news/market/latest` - Latest market news (file system: `config/data/indices/news/*.jsonl`)
+- `GET /api/market-data` - General market data endpoint
+- `GET /api/dashboard-stats` - Dashboard statistics (aggregated stats)
+- `GET /api/historical/{symbol}` - Historical data for symbol
 
 **Validation:**
 - `GET /api/validation/{alert_id}` - Validation results
 - `GET /api/validation/stats` - Validation statistics
 
+**Instruments:**
+- `GET /api/instruments` - Get all instruments
+- `GET /api/instruments/{asset_class}` - Get instruments by asset class (eq, eq_fut, index_fut, index_opt)
+- `GET /api/instruments/search/{query}` - Search instruments
+- `GET /api/instruments/metadata` - Get instrument metadata
+- `GET /api/options-chain/{underlying}` - Get options chain for underlying
+
 ### **External Access**
+
+**Backend Port Configuration:**
+- **Default Port**: 5000 (as per `START_DASHBOARD.sh` and `deploy_production.sh`)
+- **Frontend Default**: 5001 (fallback in `frontend/src/services/api.ts`, but can be overridden via `.env.local`)
+- **Configuration**: Set via `VITE_API_URL` environment variable in `frontend/.env.local`
 
 **LocalTunnel (Recommended):**
 ```bash
 # Install LocalTunnel
 npm install -g localtunnel
 
-# Expose backend
-lt --port 5001
+# Expose backend (port 5000)
+lt --port 5000
 
-# Expose frontend
+# Expose frontend (port 3000 or 5173)
 lt --port 3000
 ```
 
 **Security:**
-- Rate limiting (100 req/min)
-- CORS protection
-- Origin validation
-- Security headers
-- JWT token authentication
+- Rate limiting (100 req/min per endpoint, with specific limits for sensitive endpoints)
+- CORS protection with origin validation
+- Security headers (X-Content-Type-Options, X-Frame-Options)
+- JWT token authentication (24-hour expiry)
+- API key authentication (optional, via `API_KEY` environment variable)
+- Password verification timeout protection (5 seconds max)
+- Timing attack prevention (2-second delay on failed login)
 
 ---
 
-*Last updated: November 4, 2025 - React Dashboard with 2FA & Brokerage Integration*
+*Last updated: November 5, 2025 - Verified and updated with accurate port configuration, API endpoints, and Redis architecture*
