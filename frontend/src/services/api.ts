@@ -10,6 +10,15 @@ const api = axios.create({
   }
 });
 
+// ---- JWT auth bearer token interceptor ----
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('access_token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
 // Alert endpoints
 export interface AlertQueryParams {
   symbol?: string;
@@ -77,4 +86,36 @@ export const marketAPI = {
 // Instruments endpoints
 export const instrumentsAPI = {
   getInstruments: (type?: string) => api.get('/instruments', { params: { type } })
+};
+
+// Auth endpoints
+export interface LoginCredentials {
+  username: string;
+  password: string;
+}
+
+export interface AuthResponse {
+  access_token: string;
+  token_type: string;
+  expires_in?: number;
+}
+
+export const authAPI = {
+  login: (credentials: LoginCredentials) => {
+    // Use FormData for FastAPI Form(...) endpoint
+    const formData = new URLSearchParams();
+    formData.append('username', credentials.username);
+    formData.append('password', credentials.password);
+    return api.post<AuthResponse>('/auth/login', formData, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+  },
+  refresh: (refreshToken?: string) => 
+    api.post<AuthResponse>('/auth/refresh', { refresh_token: refreshToken }),
+  logout: () => {
+    localStorage.removeItem('access_token');
+    localStorage.removeItem('refresh_token');
+  }
 };

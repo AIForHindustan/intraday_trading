@@ -60,20 +60,24 @@ const MarketIndices: React.FC = () => {
   }
 
   const Item = ({ name, data }: { name: string; data: any }) => {
-    if (!data || data.last_price === 0) return null;
-    const color = data.change >= 0 ? 'success.main' : 'error.main';
-    const arrow = data.change >= 0 ? '▲' : '▼';
+    if (!data) return null;
+    // Always show, even if price is 0 (market closed)
+    const hasData = data.last_price > 0;
+    const color = hasData ? (data.change >= 0 ? 'success.main' : 'error.main') : 'text.secondary';
+    const arrow = hasData && data.change >= 0 ? '▲' : hasData ? '▼' : '';
     return (
       <Box sx={{ mx: 1 }}>
         <Typography variant="subtitle2" component="span" sx={{ fontWeight: 600 }}>
           {name}:
         </Typography>
         <Typography component="span" sx={{ ml: 0.5 }}>
-          {data.last_price.toFixed(2)}
+          {hasData ? data.last_price.toFixed(2) : '--'}
         </Typography>
-        <Typography component="span" sx={{ ml: 0.5, color }}>
-          {arrow} {Math.abs(data.change).toFixed(2)} ({data.change_pct.toFixed(2)}%)
-        </Typography>
+        {hasData && (
+          <Typography component="span" sx={{ ml: 0.5, color }}>
+            {arrow} {Math.abs(data.change).toFixed(2)} ({data.change_pct.toFixed(2)}%)
+          </Typography>
+        )}
       </Box>
     );
   };

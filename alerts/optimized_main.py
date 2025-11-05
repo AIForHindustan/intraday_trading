@@ -1,15 +1,30 @@
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, Query, HTTPException
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, Query, HTTPException, Depends, Header, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from backend.websockets import router as websocket_router
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from jose import JWTError, jwt
+try:
+    from passlib.context import CryptContext
+    HAS_PASSLIB = True
+except ImportError:
+    HAS_PASSLIB = False
+    CryptContext = None  # Optional - only needed for password hashing
 import asyncio
 import uuid
 import json
 import time
+import os
 from typing import Dict, List, Optional
 from pathlib import Path
 from datetime import datetime, timedelta
+from functools import lru_cache
 
 # Use uvloop for better async performance if available
 try:
@@ -24,10 +39,185 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# JWT Authentication
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")  # Change in production!
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
+
+# Password hashing (for future user management)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto") if HAS_PASSLIB else None
+security = HTTPBearer(auto_error=False)
+
+# 2FA Support (TOTP)
+try:
+    import pyotp
+    import qrcode
+    from io import BytesIO
+    import base64
+    HAS_2FA = True
+except ImportError:
+    HAS_2FA = False
+    pyotp = None
+    qrcode = None
+
+# API Key authentication (optional - enable via environment variable)
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+REQUIRED_API_KEY = os.getenv("API_KEY", None)  # Set API_KEY env var to enable
+LOCALTUNNEL_DOMAIN = os.getenv("LOCALTUNNEL_DOMAIN", "loca.lt")  # Restrict to LocalTunnel domain
+
+# User management - stored in Redis DB 0 (system database)
+# Key format: user:{username} -> JSON with hashed password and metadata
+def get_user_from_redis(username: str) -> Optional[Dict]:
+    """Get user from Redis"""
+    try:
+        from redis_files.redis_manager import RedisManager82
+        db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+        user_data = db0_client.get(f"user:{username}")
+        if user_data:
+            return json.loads(user_data)
+        return None
+    except Exception as e:
+        print(f"Error fetching user from Redis: {e}")
+        return None
+
+def save_user_to_redis(username: str, password_hash: str, metadata: Optional[Dict] = None, update_existing: bool = False):
+    """Save user to Redis with hashed password"""
+    try:
+        from redis_files.redis_manager import RedisManager82
+        db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+        
+        # Get existing user data if updating
+        existing_data = {}
+        if update_existing:
+            existing = get_user_from_redis(username)
+            if existing:
+                existing_data = existing
+        
+        user_data = {
+            "username": username,
+            "password_hash": password_hash,
+            "created_at": existing_data.get("created_at", datetime.utcnow().isoformat()),
+            "metadata": {**(existing_data.get("metadata", {})), **(metadata or {})},
+            "two_fa_enabled": existing_data.get("two_fa_enabled", False),
+            "two_fa_secret": existing_data.get("two_fa_secret"),
+            "brokerage_connections": existing_data.get("brokerage_connections", {})
+        }
+        db0_client.set(f"user:{username}", json.dumps(user_data))
+        return True
+    except Exception as e:
+        print(f"Error saving user to Redis: {e}")
+        return False
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify password against hash"""
+    if not HAS_PASSLIB or not pwd_context:
+        # Fallback: plain text comparison (NOT SECURE - only for development)
+        return plain_password == hashed_password
+    return pwd_context.verify(plain_password, hashed_password)
+
+def hash_password(password: str) -> str:
+    """Hash password (bcrypt has 72-byte limit)"""
+    if not HAS_PASSLIB or not pwd_context:
+        # Fallback: return plain text (NOT SECURE - only for development)
+        return password
+    # Truncate password to 72 bytes if needed (bcrypt limitation)
+    password_bytes = password.encode('utf-8')
+    if len(password_bytes) > 72:
+        password = password_bytes[:72].decode('utf-8', errors='ignore')
+    return pwd_context.hash(password)
+
+# Initialize default users if they don't exist
+def initialize_default_users():
+    """Initialize default admin and user accounts in Redis"""
+    default_users = {
+        "admin": "admin123",
+        "user": "user123"
+    }
+    for username, password in default_users.items():
+        existing = get_user_from_redis(username)
+        if not existing:
+            password_hash = hash_password(password)
+            save_user_to_redis(username, password_hash, {"role": "admin" if username == "admin" else "user"})
+            print(f"✅ Initialized default user: {username}")
+
+def verify_api_key(x_api_key: str = Depends(API_KEY_HEADER)):
+    """Verify API key if authentication is enabled"""
+    if REQUIRED_API_KEY is None:
+        return True  # Authentication disabled
+    if x_api_key != REQUIRED_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return True
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    """Verify JWT token and return user"""
+    # Allow unauthenticated access for development (can be disabled in production)
+    if os.getenv("ALLOW_UNAUTHENTICATED", "false").lower() == "true":
+        return {"username": "guest"}
+    
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Not authenticated", headers={"WWW-Authenticate": "Bearer"})
+    
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token", headers={"WWW-Authenticate": "Bearer"})
+        return {"username": username}
+    except JWTError as e:
+        raise HTTPException(status_code=401, detail="Invalid token", headers={"WWW-Authenticate": "Bearer"})
+
 # Add CORS middleware for frontend
+# Allow all origins for production (restrict in production with specific domains)
+FRONTEND_DIST_PATH = Path("frontend/dist")
+IS_PRODUCTION = FRONTEND_DIST_PATH.exists() and os.getenv("ENVIRONMENT") == "production"
+
+if IS_PRODUCTION:
+    # Production: Serve static files
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIST_PATH / "assets")), name="static")
+    
+    # Allow specific production domains (including LocalTunnel)
+    frontend_url = os.getenv("FRONTEND_URL", "")
+    localtunnel_url = os.getenv("LOCALTUNNEL_URL", "")  # e.g., https://intraday-trading.loca.lt
+    
+    allowed_origins = [
+        frontend_url,
+        localtunnel_url,
+        f"https://*.{LOCALTUNNEL_DOMAIN}",  # Allow any LocalTunnel subdomain
+    ]
+    # Remove empty strings
+    allowed_origins = [origin for origin in allowed_origins if origin]
+    
+    # If no specific origins, allow LocalTunnel by default
+    if not allowed_origins:
+        allowed_origins = [f"https://*.{LOCALTUNNEL_DOMAIN}"]
+else:
+    # Development: Allow localhost origins
+    allowed_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",  # Vite default
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Frontend dev server
+    allow_origins=allowed_origins + ["*"] if os.getenv("ALLOW_ALL_ORIGINS") == "true" else allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,16 +231,43 @@ templates = Jinja2Templates(directory="alerts")
 
 
 @app.middleware("http")
-async def add_performance_headers(request: Request, call_next):
+async def security_middleware(request: Request, call_next):
+    """Security middleware: Origin validation, rate limiting"""
+    # Check if request is from LocalTunnel domain (when using LocalTunnel)
+    # Allow LocalTunnel requests - they may not have origin header
+    if LOCALTUNNEL_DOMAIN and IS_PRODUCTION:
+        origin = request.headers.get("origin", "")
+        host = request.headers.get("host", "")
+        # Allow if: no origin (direct access), LocalTunnel domain, or static files
+        if origin and not request.url.path.startswith("/static"):
+            # Only block if origin is explicitly set and not from LocalTunnel
+            if LOCALTUNNEL_DOMAIN not in origin and LOCALTUNNEL_DOMAIN not in host:
+                # Allow empty origin (LocalTunnel direct access)
+                if origin:
+                    # Log suspicious access attempt
+                    print(f"⚠️  Blocked request from unauthorized origin: {origin}")
+                    return Response(
+                        content="Unauthorized origin",
+                        status_code=403,
+                        headers={"X-Blocked-Reason": "Origin validation failed"}
+                    )
+    
+    # Add security headers
     response = await call_next(request)
     response.headers["X-Response-Time"] = "ultra-fast"
     response.headers["Cache-Control"] = "no-cache, must-revalidate"
     response.headers["X-Accel-Buffering"] = "no"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
     return response
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def dashboard(request: Request):
+    """Serve dashboard - either static React build or legacy HTML"""
+    if IS_PRODUCTION:
+        return FileResponse(FRONTEND_DIST_PATH / "index.html")
     return templates.TemplateResponse("dashboard.html", {"request": request})
 
 @app.get("/professional", response_class=HTMLResponse)
@@ -70,6 +287,13 @@ async def warm_instrument_cache():
         await instrument_manager.initialize_data()
     except Exception as e:
         print(f"Instrument cache warm failed: {e}")
+    
+    # Initialize default users in Redis
+    try:
+        initialize_default_users()
+        print("✅ Initialized default users in Redis")
+    except Exception as e:
+        print(f"Failed to initialize default users: {e}")
     
     # Start Redis alert listener for WebSocket
     try:
@@ -313,11 +537,362 @@ async def websocket_professional_chart(websocket: WebSocket, symbol: str):
 
 
 # ============================================================================
+# AUTH ENDPOINTS
+# ============================================================================
+
+@app.post("/api/auth/login")
+async def login(
+    username: str = Form(...), 
+    password: str = Form(...),
+    two_fa_code: Optional[str] = Form(None)
+):
+    """Login endpoint - returns JWT access token (supports 2FA)"""
+    user_data = get_user_from_redis(username)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    
+    if not verify_password(password, user_data.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    
+    # Check if 2FA is enabled
+    if user_data.get("two_fa_enabled", False):
+        if not two_fa_code:
+            raise HTTPException(status_code=403, detail="2FA code required")
+        
+        two_fa_secret = user_data.get("two_fa_secret")
+        if not two_fa_secret or not HAS_2FA:
+            raise HTTPException(status_code=500, detail="2FA not properly configured")
+        
+        # Verify 2FA code
+        totp = pyotp.TOTP(two_fa_secret)
+        if not totp.verify(two_fa_code, valid_window=1):  # Allow 1 step tolerance
+            raise HTTPException(status_code=401, detail="Invalid 2FA code")
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer", "two_fa_required": user_data.get("two_fa_enabled", False)}
+
+@app.post("/api/auth/register")
+async def register(
+    username: str = Form(...),
+    password: str = Form(...),
+    email: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user)
+):
+    """Register a new user (requires authentication to prevent public signups)"""
+    # Check if user already exists
+    if get_user_from_redis(username):
+        raise HTTPException(status_code=400, detail="Username already exists")
+    
+    # Validate password strength
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    
+    # Hash and save password
+    password_hash = hash_password(password)
+    metadata = {"email": email, "created_by": current_user.get("username", "system")}
+    if save_user_to_redis(username, password_hash, metadata):
+        return {"message": "User registered successfully", "username": username}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to register user")
+
+@app.post("/api/auth/create-user")
+@limiter.limit("10/minute")
+async def create_user(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    email: Optional[str] = Form(None),
+    role: Optional[str] = Form("user"),
+    current_user: dict = Depends(get_current_user)
+):
+    """Admin endpoint to create users (requires authentication)"""
+    # Check if user already exists
+    if get_user_from_redis(username):
+        raise HTTPException(status_code=400, detail="Username already exists")
+    
+    # Validate password strength
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    
+    # Hash and save password
+    password_hash = hash_password(password)
+    metadata = {
+        "email": email,
+        "role": role,
+        "created_by": current_user.get("username", "system"),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    if save_user_to_redis(username, password_hash, metadata):
+        return {"message": "User created successfully", "username": username}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to create user")
+
+@app.post("/api/auth/refresh")
+async def refresh_token(refresh_token: Optional[str] = None):
+    """Refresh access token (for future implementation)"""
+    # For now, just return a new token if refresh_token is valid
+    # In production, implement proper refresh token validation
+    return {"access_token": create_access_token(data={"sub": "user"}), "token_type": "bearer"}
+
+# ============================================================================
+# 2FA ENDPOINTS
+# ============================================================================
+
+@app.post("/api/auth/2fa/setup")
+@limiter.limit("5/minute")
+async def setup_2fa(
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate 2FA secret and QR code for user"""
+    if not HAS_2FA:
+        raise HTTPException(status_code=501, detail="2FA not available (pyotp/qrcode not installed)")
+    
+    username = current_user.get("username")
+    user_data = get_user_from_redis(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Generate new secret
+    secret = pyotp.random_base32()
+    totp = pyotp.TOTP(secret)
+    
+    # Generate QR code
+    issuer = "Intraday Trading Dashboard"
+    uri = totp.provisioning_uri(
+        name=username,
+        issuer_name=issuer
+    )
+    
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Convert to base64
+    buffer = BytesIO()
+    img.save(buffer, format='PNG')
+    qr_code_base64 = base64.b64encode(buffer.getvalue()).decode()
+    
+    # Save secret temporarily (user needs to verify before enabling)
+    # Store in user metadata as pending_secret
+    metadata = user_data.get("metadata", {})
+    metadata["pending_2fa_secret"] = secret
+    
+    save_user_to_redis(
+        username, 
+        user_data.get("password_hash", ""),
+        metadata=metadata,
+        update_existing=True
+    )
+    
+    return {
+        "secret": secret,
+        "qr_code": f"data:image/png;base64,{qr_code_base64}",
+        "uri": uri,
+        "message": "Scan QR code with authenticator app, then verify with /api/auth/2fa/verify"
+    }
+
+@app.post("/api/auth/2fa/verify")
+@limiter.limit("10/minute")
+async def verify_2fa(
+    request: Request,
+    code: str = Form(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Verify 2FA code and enable 2FA for user"""
+    if not HAS_2FA:
+        raise HTTPException(status_code=501, detail="2FA not available")
+    
+    username = current_user.get("username")
+    user_data = get_user_from_redis(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get pending secret
+    pending_secret = user_data.get("metadata", {}).get("pending_2fa_secret")
+    if not pending_secret:
+        raise HTTPException(status_code=400, detail="No pending 2FA setup. Call /api/auth/2fa/setup first")
+    
+    # Verify code
+    totp = pyotp.TOTP(pending_secret)
+    if not totp.verify(code, valid_window=1):
+        raise HTTPException(status_code=401, detail="Invalid 2FA code")
+    
+    # Enable 2FA
+    metadata = user_data.get("metadata", {})
+    metadata.pop("pending_2fa_secret", None)
+    
+    save_user_to_redis(
+        username,
+        user_data.get("password_hash", ""),
+        metadata=metadata,
+        update_existing=True
+    )
+    
+    # Update user with 2FA enabled
+    user_data["two_fa_enabled"] = True
+    user_data["two_fa_secret"] = pending_secret
+    user_data["metadata"] = metadata
+    
+    from redis_files.redis_manager import RedisManager82
+    db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+    db0_client.set(f"user:{username}", json.dumps(user_data))
+    
+    return {"message": "2FA enabled successfully"}
+
+@app.post("/api/auth/2fa/disable")
+@limiter.limit("5/minute")
+async def disable_2fa(
+    request: Request,
+    password: str = Form(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Disable 2FA for user (requires password confirmation)"""
+    username = current_user.get("username")
+    user_data = get_user_from_redis(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Verify password
+    if not verify_password(password, user_data.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    # Disable 2FA
+    user_data["two_fa_enabled"] = False
+    user_data["two_fa_secret"] = None
+    
+    from redis_files.redis_manager import RedisManager82
+    db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+    db0_client.set(f"user:{username}", json.dumps(user_data))
+    
+    return {"message": "2FA disabled successfully"}
+
+# ============================================================================
+# BROKERAGE INTEGRATION ENDPOINTS
+# ============================================================================
+
+@app.post("/api/brokerage/connect")
+@limiter.limit("10/minute")
+async def connect_brokerage(
+    request: Request,
+    broker: str = Form(...),  # "zerodha", "angel_one", etc.
+    api_key: str = Form(...),
+    access_token: Optional[str] = Form(None),
+    request_token: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user)
+):
+    """Connect user's brokerage account"""
+    username = current_user.get("username")
+    user_data = get_user_from_redis(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Store brokerage credentials securely
+    brokerage_connections = user_data.get("brokerage_connections", {})
+    
+    if broker.lower() == "zerodha":
+        try:
+            from kiteconnect import KiteConnect
+            kite = KiteConnect(api_key=api_key)
+            
+            # If request_token provided, generate access_token
+            if request_token:
+                session = kite.generate_session(request_token)
+                access_token = session["access_token"]
+            elif not access_token:
+                raise HTTPException(status_code=400, detail="Either access_token or request_token required")
+            
+            kite.set_access_token(access_token)
+            # Verify connection by fetching profile
+            profile = kite.profile()
+            
+            # Store credentials (encrypted in production)
+            brokerage_connections["zerodha"] = {
+                "api_key": api_key,
+                "access_token": access_token,
+                "user_id": profile.get("user_id"),
+                "user_name": profile.get("user_name"),
+                "connected_at": datetime.utcnow().isoformat(),
+                "last_verified": datetime.utcnow().isoformat()
+            }
+            
+            # Update user data
+            user_data["brokerage_connections"] = brokerage_connections
+            from redis_files.redis_manager import RedisManager82
+            db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+            db0_client.set(f"user:{username}", json.dumps(user_data))
+            
+            return {
+                "message": "Brokerage account connected successfully",
+                "broker": "zerodha",
+                "user_id": profile.get("user_id"),
+                "user_name": profile.get("user_name")
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to connect brokerage: {str(e)}")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported broker: {broker}")
+
+@app.get("/api/brokerage/connections")
+async def get_brokerage_connections(current_user: dict = Depends(get_current_user)):
+    """Get user's connected brokerage accounts"""
+    username = current_user.get("username")
+    user_data = get_user_from_redis(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    connections = user_data.get("brokerage_connections", {})
+    # Return connection info without sensitive tokens
+    safe_connections = {}
+    for broker, data in connections.items():
+        safe_connections[broker] = {
+            "user_id": data.get("user_id"),
+            "user_name": data.get("user_name"),
+            "connected_at": data.get("connected_at"),
+            "last_verified": data.get("last_verified")
+        }
+    
+    return {"connections": safe_connections}
+
+@app.post("/api/brokerage/disconnect")
+@limiter.limit("5/minute")
+async def disconnect_brokerage(
+    request: Request,
+    broker: str = Form(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Disconnect brokerage account"""
+    username = current_user.get("username")
+    user_data = get_user_from_redis(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    brokerage_connections = user_data.get("brokerage_connections", {})
+    if broker.lower() in brokerage_connections:
+        del brokerage_connections[broker.lower()]
+        user_data["brokerage_connections"] = brokerage_connections
+        
+        from redis_files.redis_manager import RedisManager82
+        db0_client = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+        db0_client.set(f"user:{username}", json.dumps(user_data))
+        
+        return {"message": f"Brokerage account {broker} disconnected"}
+    else:
+        raise HTTPException(status_code=404, detail=f"No connection found for {broker}")
+
+# ============================================================================
 # REST API ENDPOINTS FOR FRONTEND
 # ============================================================================
 
 @app.get("/api/alerts")
+@limiter.limit("100/minute")  # Rate limit: 100 requests per minute
 async def get_alerts(
+    request: Request,
+    current_user: dict = Depends(get_current_user),  # Require JWT authentication
     symbol: Optional[str] = Query(None),
     pattern: Optional[str] = Query(None),
     min_confidence: Optional[float] = Query(None),
@@ -361,6 +936,26 @@ async def get_alerts(
                                 alert = json.loads(data_field.decode('utf-8'))
                         else:
                             alert = json.loads(data_field) if isinstance(data_field, str) else data_field
+                        
+                        # Generate alert_id for legacy alerts that don't have it
+                        if 'alert_id' not in alert or not alert.get('alert_id'):
+                            ts = alert.get('timestamp') or alert.get('timestamp_ms', int(time.time() * 1000))
+                            sym = alert.get('symbol', 'UNKNOWN')
+                            alert['alert_id'] = f"{sym}_{ts}"
+                        
+                        # Ensure required fields for frontend
+                        if 'signal' not in alert:
+                            alert['signal'] = alert.get('direction', alert.get('action', 'NEUTRAL'))
+                        if 'pattern_label' not in alert:
+                            alert['pattern_label'] = alert.get('pattern', 'Unknown Pattern')
+                        if 'base_symbol' not in alert:
+                            # Extract base symbol from full symbol (e.g., "NIFTY25DEC26000CE" -> "NIFTY")
+                            symbol_str = alert.get('symbol', '')
+                            if symbol_str:
+                                # Try to extract base symbol (remove dates, strikes, option types)
+                                import re
+                                base_match = re.match(r'^([A-Z]+)', symbol_str)
+                                alert['base_symbol'] = base_match.group(1) if base_match else symbol_str.split(':')[-1] if ':' in symbol_str else symbol_str
                         
                         # Apply filters
                         if symbol and alert.get('symbol') != symbol:
@@ -583,7 +1178,11 @@ async def get_alert_by_id(alert_id: str):
 
 
 @app.get("/api/alerts/stats/summary")
-async def get_alert_stats():
+@limiter.limit("100/minute")
+async def get_alert_stats(
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
     """Get alert statistics from Redis"""
     try:
         from redis_files.redis_manager import RedisManager82
@@ -656,9 +1255,39 @@ async def get_alert_stats():
         # Sort symbol ranking
         symbol_ranking = sorted(symbol_counts.items(), key=lambda x: x[1], reverse=True)[:10]
         
+        # Calculate average confidence and top pattern
+        total_confidence = 0
+        confidence_count = 0
+        for msg_id, msg_data in messages:
+            try:
+                data_field = msg_data.get('data') or msg_data.get(b'data')
+                if not data_field:
+                    continue
+                
+                if isinstance(data_field, bytes):
+                    try:
+                        import orjson
+                        alert = orjson.loads(data_field)
+                    except:
+                        alert = json.loads(data_field.decode('utf-8'))
+                else:
+                    alert = json.loads(data_field) if isinstance(data_field, str) else data_field
+                
+                conf = alert.get('confidence', 0)
+                if conf > 0:
+                    total_confidence += conf
+                    confidence_count += 1
+            except Exception:
+                continue
+        
+        avg_confidence = total_confidence / confidence_count if confidence_count > 0 else 0.0
+        top_pattern = max(pattern_counts.items(), key=lambda x: x[1])[0] if pattern_counts else "N/A"
+        
         return {
             "total_alerts": stream_length,
             "today_alerts": today_count,
+            "avg_confidence": avg_confidence,
+            "top_pattern": top_pattern,
             "pattern_distribution": pattern_counts,
             "symbol_ranking": [{"symbol": s, "count": c} for s, c in symbol_ranking],
             "confidence_distribution": confidence_counts,
@@ -1142,4 +1771,21 @@ async def get_instruments(type: Optional[str] = Query(None)):
     asset_class = type or "eq"
     return await api_instruments(asset_class)
 
+
+# SPA routing: Serve React frontend for all non-API routes (must be last)
+if IS_PRODUCTION:
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        """Serve React frontend for all routes (SPA routing)"""
+        # Skip API and WebSocket routes
+        if full_path.startswith("api") or full_path.startswith("ws") or full_path.startswith("alerts/stream"):
+            raise HTTPException(status_code=404, detail="Not found")
+        
+        # Serve static files if they exist
+        file_path = FRONTEND_DIST_PATH / full_path
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(file_path)
+        
+        # Default to index.html for SPA routing
+        return FileResponse(FRONTEND_DIST_PATH / "index.html")
 

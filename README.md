@@ -1,5 +1,5 @@
 # High-Performance Intraday Trading System
-*Last Updated: November 1, 2025 - Statistical Model Integration & Alert Validator Dashboard Wiring*
+*Last Updated: November 4, 2025 - React Dashboard with 2FA & Brokerage Integration*
 
 ## 🧭 End-to-End Audit Playbook (Nightly Reference)
 1. **Environment Baseline** — Activate the project venv and refresh dependencies: `python -m pip install -r requirements_apple_silicon.txt`; confirm `.env`/config secrets align with `config/optimized_field_mapping.yaml`.
@@ -171,7 +171,7 @@
   - Redis DB 0: Alert storage (`alert:*`, `forward_validation:alert:*`)
   - Redis DB 1: Real-time data (`alerts:stream`, `ohlc_updates:*`, `ohlc_daily:*`, indicators, Greeks)
   - Redis DB 2: Analytics (`volume_profile:poc:*`, `volume_profile:distribution:*`)
-  - Redis DB 4/5: Additional indicator storage (fallback)
+  - Redis DB 5: Primary indicator storage (indicators_cache)
 - **Integration Points**:
   - Scanner: Loads alerts from `alerts:stream` (primary source)
   - Redis Storage: Reads indicators/Greeks from multiple DBs
@@ -349,7 +349,7 @@ All assistants must know where indicators, Greeks, and volume profile are stored
 - **Documentation**: See `patterns/VOLUME_PROFILE_AUDIT.md`, `patterns/VOLUME_PROFILE_FIXES_APPLIED.md`, `patterns/VOLUME_PROFILE_OVERRIDE_ANALYSIS.md`
 
 #### **🔑 Key Access Patterns**
-- **Dashboard**: `alert_dashboard.py` loads from DB 1 (primary), DB 4/5 (fallbacks), DB 2 (volume profile)
+- **Dashboard**: `alert_dashboard.py` loads from DB 1 (realtime), DB 5 (indicators), DB 2 (volume profile)
 - **Alert Templates**: `alerts/notifiers.py` extracts from alert payload (`signal['indicators']`, `signal['delta']`, etc.)
 - **Alert Validator**: `alert_validation/alert_validator.py` can load from Redis if needed
 - **Alert Manager**: `alerts/alert_manager.py` merges indicators from Redis into alert payload via `_fetch_indicators_from_redis()`
@@ -517,7 +517,7 @@ def get_session_profile_summary(symbol: str, date: str = None) -> Dict:
 - **Performance**: O(1) single tick updates, vectorized batch processing
 - **EMA Windows**: All periods (5, 10, 20, 50, 100, 200) calculated ultra-fast
 - **Integration**: Seamlessly integrated with existing TA-Lib/Polars fallbacks
-- **Redis Caching**: All EMA windows cached in Redis DB 10 for pattern access
+- **Redis Caching**: All EMA windows cached in Redis DB 1 (realtime) for pattern access
 - **Pattern Access**: Patterns now have access to complete EMA suite with Greeks
 
 ### **📚 Available Libraries & Dependencies**
@@ -1480,7 +1480,7 @@ VolumeStateManager → Multiple Redis Publishing Paths → Storage & Calculation
 
 #### **A. Binary Stream Publishing**
 ```python
-# Stream: "ticks:raw:binary" (DB 4)
+# Stream: "ticks:raw:binary" (DB 1 - realtime)
 # Contains: 4,411,873+ entries (massive real-time data)
 fields = {
     "binary_data": base64_encoded_data,
@@ -1494,7 +1494,7 @@ redis_client.xadd("ticks:raw:binary", fields)
 
 #### **B. Processed Stream Publishing**
 ```python
-# Stream: "ticks:intraday:processed" (DB 4)
+# Stream: "ticks:intraday:processed" (DB 1 - realtime)
 # Normalized Zerodha field names with timestamp conversion
 intraday_tick = {
     "symbol": symbol,
@@ -1523,13 +1523,10 @@ redis_client.xadd("ticks:intraday:processed", {"data": json.dumps(intraday_tick)
 | **DB 0** | System | system_config, metadata, session_data, health_checks | System operations |
 | **DB 2** | Prices | equity_prices, futures_prices, options_prices | OHLC data storage |
 | **DB 3** | Premarket | premarket_trades, incremental_volume, opening_data | Pre-market analysis |
-| **DB 4** | Continuous Market | 5s_ticks, real_time_data, streaming_data | Live tick processing |
-| **DB 5** | Cumulative Volume | daily_cumulative, symbol_volume, volume profiles | Volume analysis |
-| **DB 6** | Alerts | pattern_alerts, trading_alerts, system_alerts | Alert management |
-| **DB 8** | Microstructure | depth_analysis, flow_data, microstructure_metrics | Market microstructure |
-| **DB 10** | Patterns | pattern_candidates, detection_data, analysis_cache | Pattern detection |
-| **DB 11** | News | news_data, sentiment_scores, market_news | News analysis |
-| **DB 13** | Metrics | performance_data, metrics_cache, analytics_data | Performance tracking |
+| **DB 1** | Realtime | Ticks, alerts, patterns, prices, news (consolidated from DBs 2,3,4,6,8,10,11) | Live tick processing, streaming data |
+| **DB 2** | Analytics | Volume profiles, OHLC, historical data, metrics (consolidated from DBs 5,13) | Volume analysis, analytics |
+| **DB 3** | Independent Validator | Signal quality, pattern performance (isolated) | Pattern validation (isolated from main system) |
+| **DB 5** | Indicators Cache | Technical indicators, Greeks | Indicator storage (300s TTL) |
 
 ### **Data Structures**
 
@@ -1628,7 +1625,7 @@ redis-cli keys "volume:*" | head -5
 ### **Current System Status**
 - **Memory Usage**: 1.88GB (2GB limit) - 94% utilization
 - **Total Keys**: 57,813 across all databases
-- **Database Distribution**: DB 0 (56,215 keys), DB 4 (172 keys), DB 5 (1,426 keys)
+- **Database Distribution**: DB 0 (system), DB 1 (realtime), DB 2 (analytics), DB 5 (indicators_cache)
 - **Volume Buckets**: 48,877 accessible buckets
 - **Redis Connections**: 10 stable connections
 - **Alert System**: 1 active alert
@@ -1890,4 +1887,112 @@ All Communities (Telegram + Reddit)
 
 ---
 
-*Last updated: November 1, 2025 - Statistical Model Integration & Alert Validator Dashboard Wiring*
+---
+
+## 🖥️ **REACT DASHBOARD & AUTHENTICATION**
+
+### **Modern React Dashboard**
+
+The system includes a modern React + TypeScript dashboard with real-time updates, comprehensive alert management, and advanced security features.
+
+**Tech Stack:**
+- **Frontend**: React 18 + TypeScript + Vite
+- **UI**: Material-UI (MUI)
+- **State Management**: Zustand
+- **Charts**: Lightweight Charts (price), ECharts (volume profile)
+- **Real-time**: Socket.IO Client
+- **Routing**: React Router
+
+**Features:**
+- ✅ Real-time alerts table with filtering
+- ✅ Summary statistics cards
+- ✅ Market indices display (NIFTY, BANKNIFTY, VIX)
+- ✅ Recent news sidebar
+- ✅ Alert detail pages with charts
+- ✅ Technical indicators overlay
+- ✅ Volume profile visualization
+- ✅ JWT authentication with 2FA
+- ✅ Brokerage integration
+
+### **Authentication System**
+
+#### **User Management**
+- Users stored in Redis DB 0: `user:{username}` → JSON
+- Password hashing with bcrypt (passlib)
+- JWT tokens for API access (24-hour expiry)
+- Default users: `admin/admin123`, `user/user123`
+
+#### **2FA (Two-Factor Authentication)**
+- **TOTP Support**: Google Authenticator / Microsoft Authenticator compatible
+- **Setup**: POST `/api/auth/2fa/setup` - Generates QR code
+- **Verify**: POST `/api/auth/2fa/verify` - Enables 2FA after code verification
+- **Disable**: POST `/api/auth/2fa/disable` - Requires password confirmation
+- **Login Flow**: Username/Password → 2FA Code (if enabled) → JWT Token
+
+#### **Brokerage Integration**
+- **Zerodha Kite Connect**: Connect user brokerage accounts
+- **Connect**: POST `/api/brokerage/connect` - Link Zerodha account
+- **List**: GET `/api/brokerage/connections` - View connected accounts
+- **Disconnect**: POST `/api/brokerage/disconnect` - Remove connection
+- Credentials stored securely in Redis per-user
+
+#### **API Endpoints**
+
+**Authentication:**
+- `POST /api/auth/login` - Login (supports 2FA)
+- `POST /api/auth/register` - Register new user (requires auth)
+- `POST /api/auth/create-user` - Admin create user
+- `POST /api/auth/refresh` - Refresh JWT token
+
+**2FA:**
+- `POST /api/auth/2fa/setup` - Generate QR code
+- `POST /api/auth/2fa/verify` - Enable 2FA
+- `POST /api/auth/2fa/disable` - Disable 2FA
+
+**Brokerage:**
+- `POST /api/brokerage/connect` - Connect Zerodha
+- `GET /api/brokerage/connections` - List connections
+- `POST /api/brokerage/disconnect` - Disconnect account
+
+**Alerts:**
+- `GET /api/alerts` - Get paginated alerts
+- `GET /api/alerts/{alert_id}` - Get alert details
+- `GET /api/alerts/stats/summary` - Alert statistics
+
+**Market Data:**
+- `GET /api/market/indices` - Market indices
+- `GET /api/charts/{symbol}` - OHLC chart data
+- `GET /api/indicators/{symbol}` - Technical indicators
+- `GET /api/greeks/{symbol}` - Options Greeks
+- `GET /api/volume-profile/{symbol}` - Volume profile
+- `GET /api/news/{symbol}` - Symbol news
+- `GET /api/news/market/latest` - Latest market news
+
+**Validation:**
+- `GET /api/validation/{alert_id}` - Validation results
+- `GET /api/validation/stats` - Validation statistics
+
+### **External Access**
+
+**LocalTunnel (Recommended):**
+```bash
+# Install LocalTunnel
+npm install -g localtunnel
+
+# Expose backend
+lt --port 5001
+
+# Expose frontend
+lt --port 3000
+```
+
+**Security:**
+- Rate limiting (100 req/min)
+- CORS protection
+- Origin validation
+- Security headers
+- JWT token authentication
+
+---
+
+*Last updated: November 4, 2025 - React Dashboard with 2FA & Brokerage Integration*
