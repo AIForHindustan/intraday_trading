@@ -952,11 +952,12 @@ class AlertValidator:
         """
         Load technical indicators from Redis for enhanced validation.
         
-        Redis Storage Schema (from redis_storage.py):
-        - DB 1 (realtime): indicators:{symbol}:{indicator_name}
+        Redis Storage Schema (SINGLE SOURCE OF TRUTH):
+        - DB 5 (PRIMARY): indicators:{symbol}:{indicator_name} via indicators_cache data type (per redis_config.py)
+        - DB 1 (fallback): indicators:{symbol}:{indicator_name} via analysis_cache data type (legacy, backward compatibility only)
         - Format: Simple indicators (RSI, EMA, ATR, VWAP) as string/number
                   Complex indicators (MACD, BB) as JSON with {'value': {...}, ...}
-        - Fallback DBs: DB 4 and DB 5
+        - DB 4 removed from architecture per redis_config.py
         """
         indicators = {}
         try:
@@ -982,11 +983,35 @@ class AlertValidator:
             # ✅ Use RedisKeyStandards for consistent key naming
             from redis_files.redis_key_standards import RedisKeyStandards
             
+            # ✅ STANDARDIZED: Use retrieve_by_data_type() for all indicator retrieval
+            # Wrap client if needed to provide retrieve_by_data_type() method
+            from redis_files.redis_client import RobustRedisClient
+            
+            # Check if client has retrieve_by_data_type, if not wrap it
+            if not hasattr(self.redis_client, 'retrieve_by_data_type'):
+                # Wrap raw client with RobustRedisClient for standardized retrieval
+                wrapped_client = RobustRedisClient(
+                    redis_client=self.redis_client,
+                    process_name="alert_validator"
+                )
+            else:
+                wrapped_client = self.redis_client
+            
             for variant in symbol_variants:
                 for indicator_name in indicator_names:
                     redis_key = RedisKeyStandards.get_indicator_key(variant, indicator_name, use_cache=False)
                     try:
-                        value = redis_db1.get(redis_key)
+                        # ✅ STANDARDIZED: Use retrieve_by_data_type() - PRIMARY DB 5, fallback DB 1
+                        value = None
+                        
+                        # Try indicators_cache (DB 5) first - PRIMARY source of truth
+                        if hasattr(wrapped_client, 'retrieve_by_data_type'):
+                            value = wrapped_client.retrieve_by_data_type(redis_key, "indicators_cache")
+                        
+                        # Fallback to analysis_cache (DB 1) for backward compatibility
+                        if not value and hasattr(wrapped_client, 'retrieve_by_data_type'):
+                            value = wrapped_client.retrieve_by_data_type(redis_key, "analysis_cache")
+                        
                         if value:
                             # Handle bytes
                             if isinstance(value, bytes):
@@ -1007,7 +1032,9 @@ class AlertValidator:
                                     indicators[indicator_name] = value
                         if indicator_name in indicators:
                             break  # Found indicator for this variant
-                    except Exception:
+                    except Exception as e:
+                        from aion_alert_dashboard.alert_dashboard import logger
+                        logger.info(f"Error retrieving indicator {indicator_name} for {variant}: {e}")
                         continue
                 if indicators:
                     break  # Found indicators for this variant
@@ -1024,7 +1051,9 @@ class AlertValidator:
         - DB 1 (realtime): indicators:{symbol}:greeks (combined) or indicators:{symbol}:{greek} (individual)
         - Format: Combined as JSON with {'value': {'delta': ..., ...}, ...}
                   Individual as float string
-        - Fallback DBs: DB 4 and DB 5
+        - DB 5 (PRIMARY): indicators:{symbol}:greeks via indicators_cache data type (per redis_config.py)
+        - DB 1 (fallback): indicators:{symbol}:greeks via analysis_cache data type (legacy, backward compatibility only)
+        - DB 4 removed from architecture per redis_config.py
         """
         greeks = {}
         try:

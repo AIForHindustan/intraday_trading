@@ -12,6 +12,8 @@ import json
 import duckdb
 from typing import List, Optional
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -102,13 +104,124 @@ def ingest_parquet_file_duckdb_native(
             
             # Check if this is already in the correct schema (has instrument_token)
             if 'instrument_token' in columns:
-                # Already in correct format - but need to explicitly map columns
-                count = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{file_path}') WHERE instrument_token > 0").fetchone()[0]
-                if count == 0:
-                    return {"success": False, "error": "No valid rows", "row_count": 0}
+                # Check if we need to enrich with token metadata (if symbol is missing/UNKNOWN)
+                needs_enrichment = False
+                if token_metadata_view:
+                    # Check if there are any rows with missing/UNKNOWN symbols
+                    unknown_check = conn.execute(f"""
+                        SELECT COUNT(*) 
+                        FROM read_parquet('{file_path}') 
+                        WHERE instrument_token > 0 
+                        AND (symbol IS NULL OR symbol = '' OR symbol LIKE 'UNKNOWN%')
+                    """).fetchone()[0]
+                    if unknown_check > 0:
+                        needs_enrichment = True
+                        logger.info(f"Found {unknown_check} rows with missing/UNKNOWN symbols, enriching with token metadata")
                 
-                # Build explicit column list matching database schema order
-                # Parquet has 65 columns, DB has 67 (missing processed_at, parser_version)
+                # Get row count and filter UNKNOWN symbols
+                count_query = f"""
+                    SELECT COUNT(*) 
+                    FROM read_parquet('{file_path}') 
+                    WHERE instrument_token > 0
+                    AND (symbol IS NULL OR symbol = '' OR symbol NOT LIKE 'UNKNOWN%')
+                """
+                count = conn.execute(count_query).fetchone()[0]
+                if count == 0:
+                    return {"success": False, "error": "No valid rows (all filtered out)", "row_count": 0}
+                
+                # Build column mapping - handle nested structures and map to DB schema
+                # Handle different parquet schemas (with ohlc struct, depth struct, etc.)
+                column_mapping = {}
+                
+                # Map standard columns - only use metadata join if enrichment is needed
+                if 'symbol' in columns:
+                    if needs_enrichment and token_metadata_view:
+                        column_mapping['symbol'] = "COALESCE(p.symbol, m.symbol, '')"
+                    else:
+                        column_mapping['symbol'] = "COALESCE(p.symbol, '')"
+                elif needs_enrichment and token_metadata_view:
+                    column_mapping['symbol'] = f"COALESCE(m.symbol, '')"
+                else:
+                    column_mapping['symbol'] = "''"
+                
+                if 'exchange' in columns:
+                    if needs_enrichment and token_metadata_view:
+                        column_mapping['exchange'] = "COALESCE(p.exchange, m.exchange, '')"
+                    else:
+                        column_mapping['exchange'] = "COALESCE(p.exchange, '')"
+                elif needs_enrichment and token_metadata_view:
+                    column_mapping['exchange'] = f"COALESCE(m.exchange, '')"
+                else:
+                    column_mapping['exchange'] = "''"
+                
+                if 'segment' in columns:
+                    if needs_enrichment and token_metadata_view:
+                        column_mapping['segment'] = "COALESCE(p.segment, m.segment, '')"
+                    else:
+                        column_mapping['segment'] = "COALESCE(p.segment, '')"
+                elif needs_enrichment and token_metadata_view:
+                    column_mapping['segment'] = f"COALESCE(m.segment, '')"
+                else:
+                    column_mapping['segment'] = "''"
+                
+                if 'instrument_type' in columns:
+                    if needs_enrichment and token_metadata_view:
+                        column_mapping['instrument_type'] = "COALESCE(p.instrument_type, m.instrument_type, '')"
+                    else:
+                        column_mapping['instrument_type'] = "COALESCE(p.instrument_type, '')"
+                elif needs_enrichment and token_metadata_view:
+                    column_mapping['instrument_type'] = f"COALESCE(m.instrument_type, '')"
+                else:
+                    column_mapping['instrument_type'] = "''"
+                
+                # Price columns
+                column_mapping['last_price'] = "COALESCE(p.last_price, 0.0)"
+                
+                # OHLC handling - check if ohlc struct exists
+                if 'ohlc' in columns:
+                    column_mapping['open_price'] = "COALESCE(p.ohlc.open, p.last_price, 0.0)"
+                    column_mapping['high_price'] = "COALESCE(p.ohlc.high, p.last_price, 0.0)"
+                    column_mapping['low_price'] = "COALESCE(p.ohlc.low, p.last_price, 0.0)"
+                    column_mapping['close_price'] = "COALESCE(p.ohlc.close, p.last_price, 0.0)"
+                elif 'open_price' in columns:
+                    column_mapping['open_price'] = "COALESCE(p.open_price, p.last_price, 0.0)"
+                    column_mapping['high_price'] = "COALESCE(p.high_price, p.last_price, 0.0)"
+                    column_mapping['low_price'] = "COALESCE(p.low_price, p.last_price, 0.0)"
+                    column_mapping['close_price'] = "COALESCE(p.close_price, p.last_price, 0.0)"
+                else:
+                    column_mapping['open_price'] = "COALESCE(p.last_price, 0.0)"
+                    column_mapping['high_price'] = "COALESCE(p.last_price, 0.0)"
+                    column_mapping['low_price'] = "COALESCE(p.last_price, 0.0)"
+                    column_mapping['close_price'] = "COALESCE(p.last_price, 0.0)"
+                
+                # Volume
+                if 'volume' in columns:
+                    column_mapping['volume'] = "COALESCE(p.volume, 0)"
+                elif 'volume_traded' in columns:
+                    column_mapping['volume'] = "COALESCE(p.volume_traded, 0)"
+                else:
+                    column_mapping['volume'] = "0"
+                
+                # Timestamps - handle TIMESTAMP_NS type
+                if 'exchange_timestamp_epoch' in columns:
+                    # Use epoch (seconds) - convert to timestamp and nanoseconds
+                    column_mapping['exchange_timestamp'] = "TO_TIMESTAMP(p.exchange_timestamp_epoch)"
+                    column_mapping['exchange_timestamp_ns'] = "p.exchange_timestamp_epoch * 1000000000"
+                elif 'exchange_timestamp' in columns:
+                    # exchange_timestamp is TIMESTAMP_NS - extract properly
+                    column_mapping['exchange_timestamp'] = "CAST(p.exchange_timestamp AS TIMESTAMP)"
+                    # For TIMESTAMP_NS, extract epoch and convert to nanoseconds
+                    column_mapping['exchange_timestamp_ns'] = "CAST(EXTRACT(EPOCH FROM p.exchange_timestamp) * 1000000000 AS BIGINT)"
+                elif 'timestamp' in columns:
+                    # Try to parse timestamp string or use epoch
+                    column_mapping['exchange_timestamp'] = "CAST(p.timestamp AS TIMESTAMP)"
+                    # If timestamp is already numeric (epoch), use it directly
+                    column_mapping['exchange_timestamp_ns'] = "CAST(p.timestamp AS BIGINT)"
+                else:
+                    column_mapping['exchange_timestamp'] = "CURRENT_TIMESTAMP"
+                    column_mapping['exchange_timestamp_ns'] = "CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000 AS BIGINT)"
+                
+                # Build complete column list for DB schema (82 columns total)
                 db_columns = [
                     'instrument_token', 'symbol', 'exchange', 'segment', 'instrument_type',
                     'expiry', 'strike_price', 'option_type', 'lot_size', 'tick_size', 'is_expired',
@@ -129,47 +242,183 @@ def ingest_parquet_file_duckdb_native(
                     'ask_5_price', 'ask_5_quantity', 'ask_5_orders',
                     'packet_type', 'data_quality', 'session_type', 
                     'source_file', 'processing_batch', 'session_id',
-                    'processed_at', 'parser_version'  # DB has these, parquet doesn't
+                    'processed_at', 'parser_version',
+                    # Technical indicators
+                    'rsi_14', 'sma_20', 'ema_12', 'bollinger_upper', 'bollinger_middle', 'bollinger_lower',
+                    'macd', 'macd_signal', 'macd_histogram',
+                    # Option Greeks
+                    'delta', 'gamma', 'theta', 'vega', 'rho', 'implied_volatility'
                 ]
                 
-                # Select columns that exist in parquet, use defaults for missing ones
                 select_cols = []
                 for col in db_columns:
-                    if col in columns:
+                    if col in column_mapping:
+                        select_cols.append(column_mapping[col] + f" AS {col}")
+                    elif col == 'instrument_token':
+                        select_cols.append("p.instrument_token")
+                    elif col in columns:
                         select_cols.append(f"p.{col}")
                     elif col == 'source_file':
-                        # Override with actual file path
-                        select_cols.append(f"'{file_path}'")
+                        select_cols.append(f"'{file_path}' AS source_file")
                     elif col == 'processing_batch':
-                        # Override with batch name
-                        select_cols.append("'parquet_ingestion_duckdb_native'")
+                        select_cols.append("'parquet_ingestion_duckdb_native' AS processing_batch")
+                    elif col == 'timestamp':
+                        select_cols.append("CURRENT_TIMESTAMP AS timestamp")
                     elif col == 'processed_at':
-                        # Use current timestamp
-                        select_cols.append("CURRENT_TIMESTAMP")
+                        select_cols.append("CURRENT_TIMESTAMP AS processed_at")
                     elif col == 'parser_version':
-                        # Use default version
-                        select_cols.append("'v2.0'")
-                    else:
-                        # Use appropriate default based on column type
-                        if 'timestamp' in col or col == 'expiry':
-                            select_cols.append("NULL")
-                        elif col in ['symbol', 'exchange', 'segment', 'instrument_type', 'option_type', 'packet_type', 'data_quality', 'session_type', 'session_id']:
-                            select_cols.append("''")
-                        elif 'price' in col or 'strike' in col or col in ['tick_size', 'average_traded_price']:
-                            select_cols.append("0.0")
-                        elif col in ['volume', 'quantity', 'interest', 'high', 'low', 'orders', 'lot_size'] or 'bid_' in col or 'ask_' in col:
-                            select_cols.append("0")
-                        elif col == 'is_expired':
-                            select_cols.append("FALSE")
+                        select_cols.append("'v2.0' AS parser_version")
+                    elif col in ['last_traded_timestamp', 'last_traded_timestamp_ns']:
+                        # Use last_trade_time if available (TIMESTAMP_NS), otherwise use exchange_timestamp
+                        if 'last_trade_time' in columns:
+                            if col == 'last_traded_timestamp':
+                                select_cols.append("CAST(p.last_trade_time AS TIMESTAMP) AS last_traded_timestamp")
+                            else:
+                                # Extract epoch from TIMESTAMP_NS and convert to nanoseconds
+                                select_cols.append("CAST(EXTRACT(EPOCH FROM p.last_trade_time) * 1000000000 AS BIGINT) AS last_traded_timestamp_ns")
+                        elif 'exchange_timestamp' in column_mapping:
+                            if col == 'last_traded_timestamp':
+                                select_cols.append(column_mapping['exchange_timestamp'].replace(' AS exchange_timestamp', '') + " AS last_traded_timestamp")
+                            else:
+                                # Use exchange_timestamp_ns (already converted to nanoseconds)
+                                select_cols.append(column_mapping['exchange_timestamp_ns'].replace(' AS exchange_timestamp_ns', '') + " AS last_traded_timestamp_ns")
                         else:
-                            select_cols.append("NULL")
+                            select_cols.append("NULL AS " + col)
+                    elif col == 'average_traded_price':
+                        if 'average_traded_price' in columns:
+                            select_cols.append("COALESCE(p.average_traded_price, p.last_price, 0.0) AS average_traded_price")
+                        else:
+                            select_cols.append("COALESCE(p.last_price, 0.0) AS average_traded_price")
+                    elif col in ['total_buy_quantity', 'total_sell_quantity']:
+                        if col in columns:
+                            select_cols.append(f"COALESCE(p.{col}, 0) AS {col}")
+                        else:
+                            select_cols.append(f"0 AS {col}")
+                    elif col == 'open_interest':
+                        if 'oi' in columns:
+                            select_cols.append("COALESCE(p.oi, 0) AS open_interest")
+                        elif 'open_interest' in columns:
+                            select_cols.append("COALESCE(p.open_interest, 0) AS open_interest")
+                        else:
+                            select_cols.append("0 AS open_interest")
+                    elif col in ['oi_day_high', 'oi_day_low']:
+                        if col in columns:
+                            select_cols.append(f"COALESCE(p.{col}, 0) AS {col}")
+                        else:
+                            select_cols.append("0 AS " + col)
+                    elif 'bid_' in col or 'ask_' in col:
+                        # Handle depth structure or direct columns
+                        if 'depth' in columns:
+                            # Extract from depth struct
+                            if 'bid_1' in col:
+                                if 'price' in col:
+                                    select_cols.append("COALESCE(p.depth.buy[1].price, p.best_bid_price, 0.0) AS " + col)
+                                elif 'quantity' in col:
+                                    select_cols.append("COALESCE(p.depth.buy[1].quantity, p.best_bid_quantity, 0) AS " + col)
+                                elif 'orders' in col:
+                                    select_cols.append("COALESCE(p.depth.buy[1].orders, p.best_bid_orders, 0) AS " + col)
+                                else:
+                                    select_cols.append("0 AS " + col)
+                            elif 'ask_1' in col:
+                                if 'price' in col:
+                                    select_cols.append("COALESCE(p.depth.sell[1].price, p.best_ask_price, 0.0) AS " + col)
+                                elif 'quantity' in col:
+                                    select_cols.append("COALESCE(p.depth.sell[1].quantity, p.best_ask_quantity, 0) AS " + col)
+                                elif 'orders' in col:
+                                    select_cols.append("COALESCE(p.depth.sell[1].orders, p.best_ask_orders, 0) AS " + col)
+                                else:
+                                    select_cols.append("0 AS " + col)
+                            else:
+                                select_cols.append("0 AS " + col)
+                        elif col in columns:
+                            select_cols.append(f"COALESCE(p.{col}, 0) AS {col}")
+                        else:
+                            select_cols.append("0 AS " + col)
+                    else:
+                        # Default values
+                        if 'timestamp' in col or col == 'expiry':
+                            select_cols.append(f"NULL AS {col}")
+                        elif col in ['option_type', 'packet_type', 'data_quality', 'session_type', 'session_id']:
+                            select_cols.append(f"'' AS {col}")
+                        elif col in ['strike_price', 'lot_size', 'tick_size']:
+                            select_cols.append(f"NULL AS {col}")
+                        elif col == 'is_expired':
+                            select_cols.append("FALSE AS is_expired")
+                        elif col in ['rsi_14', 'sma_20', 'ema_12', 'bollinger_upper', 'bollinger_middle', 'bollinger_lower',
+                                      'macd', 'macd_signal', 'macd_histogram', 'delta', 'gamma', 'theta', 'vega', 'rho', 'implied_volatility']:
+                            # Technical indicators and Greeks - NULL by default (calculated later)
+                            select_cols.append(f"NULL AS {col}")
+                        else:
+                            select_cols.append(f"NULL AS {col}")
                 
-                # Direct insert - already in correct format
+                # Build join clause if enrichment needed
+                join_clause = ""
+                if needs_enrichment and token_metadata_view:
+                    join_clause = f"LEFT JOIN {token_metadata_view} m ON p.instrument_token = m.token"
+                
+                # Build WHERE clause - filter UNKNOWN symbols
+                where_clause = """
+                    WHERE p.instrument_token > 0
+                    AND (p.symbol IS NULL OR p.symbol = '' OR p.symbol NOT LIKE 'UNKNOWN%')
+                """
+                
+                # Build insert query with aggregation for duplicates
+                # Group by primary key (instrument_token + exchange_timestamp_ns) and aggregate values
+                # This ensures we don't lose data when multiple rows have same PK but different values
+                # Use MAX for volumes/quantities/prices to capture the maximum values
+                
+                # Build aggregated SELECT with GROUP BY on primary key
+                agg_select_cols = []
+                for col in db_columns:
+                    if col == 'instrument_token':
+                        agg_select_cols.append("p.instrument_token")
+                    elif col == 'exchange_timestamp_ns':
+                        # Group by this - use the calculated value
+                        agg_select_cols.append("CAST(p.exchange_timestamp_epoch * 1000000000 AS BIGINT) AS exchange_timestamp_ns")
+                    elif col in ['total_buy_quantity', 'total_sell_quantity']:
+                        # Handle these explicitly - they exist in parquet
+                        if col in columns:
+                            agg_select_cols.append(f"MAX(COALESCE(p.{col}, 0)) AS {col}")
+                        else:
+                            agg_select_cols.append(f"0 AS {col}")
+                    elif col in column_mapping:
+                        # For numeric columns (prices, volumes, quantities), use MAX to aggregate
+                        expr = column_mapping[col]
+                        if 'price' in col.lower() or 'volume' in col.lower() or 'quantity' in col.lower() or 'interest' in col.lower():
+                            # Wrap in MAX() for aggregation
+                            if 'COALESCE' in expr:
+                                # Extract the inner expression
+                                inner = expr.split('(')[1].rsplit(')')[0] if ')' in expr else expr
+                                agg_select_cols.append(f"MAX({expr}) AS {col}")
+                            else:
+                                agg_select_cols.append(f"MAX({expr}) AS {col}")
+                        else:
+                            # For other columns, use MAX or FIRST
+                            agg_select_cols.append(f"MAX({expr}) AS {col}")
+                    elif col in ['source_file', 'processing_batch', 'timestamp', 'processed_at', 'parser_version']:
+                        if col == 'source_file':
+                            agg_select_cols.append(f"'{file_path}' AS {col}")
+                        elif col == 'processing_batch':
+                            agg_select_cols.append(f"'parquet_ingestion_duckdb_native' AS {col}")
+                        elif col == 'timestamp':
+                            agg_select_cols.append(f"CURRENT_TIMESTAMP AS {col}")
+                        elif col == 'processed_at':
+                            agg_select_cols.append(f"CURRENT_TIMESTAMP AS {col}")
+                        elif col == 'parser_version':
+                            agg_select_cols.append(f"'v2.0' AS {col}")
+                    else:
+                        # Default NULL
+                        agg_select_cols.append(f"NULL AS {col}")
+                
                 insert_query = f"""
                     INSERT OR REPLACE INTO tick_data_corrected
-                    SELECT {', '.join(select_cols)}
+                    SELECT {', '.join(agg_select_cols)}
                     FROM read_parquet('{file_path}') p
-                    WHERE instrument_token > 0
+                    {join_clause}
+                    {where_clause}
+                    GROUP BY 
+                        p.instrument_token,
+                        CAST(p.exchange_timestamp_epoch * 1000000000 AS BIGINT)
                 """
                 
                 conn.execute(insert_query)
@@ -347,25 +596,51 @@ def ingest_parquet_file_duckdb_native(
         }
 
 
-def get_pending_parquet_files(db_path: str, search_dirs: List[str] = None) -> List[Path]:
-    """Get list of parquet files that haven't been ingested"""
+def get_pending_parquet_files(db_path: str, search_dirs: List[str] = None, date_filter: str = None) -> List[Path]:
+    """Get list of parquet files that haven't been ingested
+    
+    Args:
+        db_path: Path to DuckDB database
+        search_dirs: Directories to search for parquet files
+        date_filter: Optional date filter (e.g., '20251103' for Nov 3, 2025)
+    """
     if search_dirs is None:
-        search_dirs = ["real_parquet_data", "parquet_output", "binary_to_parquet"]
+        search_dirs = [
+            "real_parquet_data",
+            "parquet_output",
+            "binary_to_parquet",
+            "crawlers/raw_data",
+            "crawlers",
+            "research",
+            "research_data",
+        ]
     
-    conn = duckdb.connect(db_path)
-    
-    # Get ingested parquet files
-    ingested_parquet = conn.execute("""
-        SELECT DISTINCT source_file
-        FROM tick_data_corrected
-        WHERE source_file LIKE '%.parquet'
-    """).fetchall()
-    
-    ingested_paths = {Path(row[0]) for row in ingested_parquet if row[0]}
-    conn.close()
+    try:
+        conn = duckdb.connect(db_path, read_only=True)
+        
+        # Get ingested parquet files
+        if date_filter:
+            ingested_parquet = conn.execute("""
+                SELECT DISTINCT source_file
+                FROM tick_data_corrected
+                WHERE source_file LIKE '%.parquet'
+                AND source_file LIKE ?
+            """, [f"%{date_filter}%"]).fetchall()
+        else:
+            ingested_parquet = conn.execute("""
+                SELECT DISTINCT source_file
+                FROM tick_data_corrected
+                WHERE source_file LIKE '%.parquet'
+            """).fetchall()
+        
+        ingested_paths = {Path(row[0]) for row in ingested_parquet if row[0]}
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Error reading database (assuming empty): {e}")
+        ingested_paths = set()
     
     # Find parquet files on disk
-    excluded_patterns = ['.venv', '__pycache__', 'site-packages', 'tests', 'test_', 'backtesting', 'binary_to_parquet']
+    excluded_patterns = ['.venv', '__pycache__', 'site-packages', 'tests', 'test_', 'backtesting']
     
     all_parquet = set()
     for directory in search_dirs:
@@ -375,6 +650,9 @@ def get_pending_parquet_files(db_path: str, search_dirs: List[str] = None) -> Li
                 if any(excluded in str(f) for excluded in excluded_patterns):
                     continue
                 if f.exists():
+                    # Apply date filter if specified
+                    if date_filter and date_filter not in str(f):
+                        continue
                     all_parquet.add(f)
     
     # Find missing ones
@@ -382,16 +660,445 @@ def get_pending_parquet_files(db_path: str, search_dirs: List[str] = None) -> Li
     return sorted(list(missing_parquet))
 
 
+def enrich_parquet_file_worker(file_path_str: str, token_cache_path: str) -> dict:
+    """Worker function to enrich a single parquet file with token metadata"""
+    import sys
+    from pathlib import Path
+    import pandas as pd
+    import pyarrow.parquet as pq
+    import logging
+    
+    # Add project root to path for imports in worker
+    project_root = Path(__file__).parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    
+    from token_cache import TokenCacheManager
+    
+    # Setup logger for worker
+    worker_logger = logging.getLogger(__name__)
+    
+    file_path = Path(file_path_str)
+    try:
+        # Load token cache in worker
+        token_cache = TokenCacheManager(cache_path=token_cache_path, verbose=False)
+        
+        # Read parquet - try multiple methods including recovery
+        df = None
+        read_error = None
+        
+        # Method 1: Standard pandas read
+        try:
+            df = pd.read_parquet(file_path)
+        except Exception as e1:
+            read_error = str(e1)
+            # Method 2: Try with different engines
+            try:
+                df = pd.read_parquet(file_path, engine='pyarrow')
+            except Exception as e2:
+                try:
+                    df = pd.read_parquet(file_path, engine='fastparquet')
+                except Exception as e3:
+                    # Method 3: Try row group recovery (for incomplete files)
+                    try:
+                        parquet_file = pq.ParquetFile(file_path)
+                        row_group_dfs = []
+                        for rg_idx in range(parquet_file.num_row_groups):
+                            try:
+                                rg_table = parquet_file.read_row_group(rg_idx)
+                                rg_df = rg_table.to_pandas()
+                                row_group_dfs.append(rg_df)
+                            except Exception:
+                                continue  # Skip corrupted row groups
+                        
+                        if row_group_dfs:
+                            df = pd.concat(row_group_dfs, ignore_index=True)
+                        else:
+                            raise Exception("All row groups failed")
+                    except Exception as e4:
+                        # Method 4: Try column-by-column recovery (if metadata is readable)
+                        try:
+                            parquet_file = pq.ParquetFile(file_path)
+                            schema = parquet_file.schema
+                            column_names = [schema[i].name for i in range(len(schema))]
+                            
+                            recovered_data = {}
+                            # Try reading each row group separately, then each column
+                            for rg_idx in range(parquet_file.num_row_groups):
+                                for col_name in column_names:
+                                    if col_name not in recovered_data:
+                                        try:
+                                            # Try reading column from this row group
+                                            col_table = parquet_file.read_row_groups([rg_idx], columns=[col_name])
+                                            if col_table.num_rows > 0:
+                                                col_data = col_table.column(0).to_pandas()
+                                                if col_name not in recovered_data:
+                                                    recovered_data[col_name] = []
+                                                recovered_data[col_name].extend(col_data.tolist())
+                                        except Exception:
+                                            # Skip this column for this row group
+                                            continue
+                            
+                            if recovered_data and len(recovered_data) > 0:
+                                # Convert lists to series, find minimum length
+                                for col_name in recovered_data:
+                                    recovered_data[col_name] = pd.Series(recovered_data[col_name])
+                                min_len = min(len(v) for v in recovered_data.values() if len(v) > 0)
+                                # Truncate all columns to minimum length
+                                recovered_data_truncated = {
+                                    k: v.iloc[:min_len] for k, v in recovered_data.items()
+                                }
+                                df = pd.DataFrame(recovered_data_truncated)
+                                worker_logger.info(f"  Recovered {len(df)} rows with {len(df.columns)} columns via column-by-column method")
+                            else:
+                                raise Exception("No readable columns")
+                        except Exception as e5:
+                            # Method 5: Try DuckDB native read (sometimes more tolerant)
+                            try:
+                                import duckdb
+                                temp_conn = duckdb.connect(":memory:")
+                                # Try to read with DuckDB - it may be more tolerant of corruption
+                                try:
+                                    temp_df = temp_conn.execute(f"SELECT * FROM read_parquet('{file_path}') LIMIT 10000").fetchdf()
+                                    if len(temp_df) > 0:
+                                        df = temp_df
+                                except:
+                                    # Try reading with ignore_errors option if available
+                                    temp_df = temp_conn.execute(f"SELECT * FROM read_parquet('{file_path}', ignore_errors=true) LIMIT 10000").fetchdf()
+                                    if len(temp_df) > 0:
+                                        df = temp_df
+                                temp_conn.close()
+                            except Exception as e6:
+                                # All methods failed
+                                return {
+                                    "success": False,
+                                    "error": f"Cannot read: {str(read_error)[:100]}",
+                                    "file": str(file_path),
+                                    "recovery_attempted": True
+                                }
+        
+        if df is None or len(df) == 0:
+            return {"success": False, "error": "Empty file after recovery", "file": str(file_path)}
+        
+        # Enrich with token metadata
+        if 'instrument_token' in df.columns:
+            # Use vectorized operations for better performance
+            def enrich_token(token_val):
+                if pd.isna(token_val) or token_val is None:
+                    return None
+                try:
+                    token = int(token_val)
+                    if token in token_cache.token_map:
+                        return token_cache.token_map[token]
+                except (ValueError, TypeError):
+                    pass
+                return None
+            
+            # Create metadata columns
+            metadata_list = df['instrument_token'].apply(enrich_token)
+            
+            # Extract symbol, exchange, segment, instrument_type from metadata
+            # TokenCacheManager returns normalized metadata with 'symbol', 'exchange', 'segment', 'instrument_type'
+            def extract_symbol(metadata):
+                if not metadata:
+                    return None
+                return metadata.get("symbol", "")
+            
+            def extract_exchange(metadata):
+                if not metadata:
+                    return None
+                return metadata.get("exchange", "")
+            
+            # Only update if missing or UNKNOWN - handle missing columns gracefully
+            if 'symbol' in df.columns:
+                mask_symbol = (df['symbol'].isna()) | (df['symbol'] == '') | (df['symbol'].astype(str).str.startswith('UNKNOWN', na=False))
+                df.loc[mask_symbol, 'symbol'] = metadata_list.apply(extract_symbol)
+            else:
+                df['symbol'] = metadata_list.apply(extract_symbol)
+            
+            if 'exchange' in df.columns:
+                mask_exchange = (df['exchange'].isna()) | (df['exchange'] == '')
+                df.loc[mask_exchange, 'exchange'] = metadata_list.apply(extract_exchange)
+            else:
+                df['exchange'] = metadata_list.apply(extract_exchange)
+            
+            if 'segment' in df.columns:
+                mask_segment = (df['segment'].isna()) | (df['segment'] == '')
+                df.loc[mask_segment, 'segment'] = metadata_list.apply(lambda m: m.get("segment", "") if m else "")
+            else:
+                df['segment'] = metadata_list.apply(lambda m: m.get("segment", "") if m else "")
+            
+            if 'instrument_type' in df.columns:
+                mask_instrument_type = (df['instrument_type'].isna()) | (df['instrument_type'] == '')
+                df.loc[mask_instrument_type, 'instrument_type'] = metadata_list.apply(lambda m: m.get("instrument_type", "") if m else "")
+            else:
+                df['instrument_type'] = metadata_list.apply(lambda m: m.get("instrument_type", "") if m else "")
+            
+            # Add exchange_timestamp_ns if missing (try ALL fallbacks in order of preference)
+            if 'exchange_timestamp_ns' not in df.columns or df['exchange_timestamp_ns'].isna().all() or (df['exchange_timestamp_ns'] == 0).all():
+                timestamp_set = False
+                
+                # Fallback 1: Try exchange_timestamp_epoch (most accurate)
+                if 'exchange_timestamp_epoch' in df.columns and df['exchange_timestamp_epoch'].notna().any():
+                    try:
+                        df['exchange_timestamp_ns'] = (df['exchange_timestamp_epoch'] * 1000000000).astype('int64')
+                        if (df['exchange_timestamp_ns'] > 0).any():
+                            timestamp_set = True
+                    except:
+                        pass
+                
+                # Fallback 2: Try exchange_timestamp (datetime or numeric)
+                if not timestamp_set and 'exchange_timestamp' in df.columns and df['exchange_timestamp'].notna().any():
+                    try:
+                        # Try converting datetime to nanoseconds
+                        if pd.api.types.is_datetime64_any_dtype(df['exchange_timestamp']):
+                            df['exchange_timestamp_ns'] = (df['exchange_timestamp'].astype('int64') // 1).astype('int64')
+                        else:
+                            # Try as numeric (already in nanoseconds or seconds)
+                            numeric_ts = pd.to_numeric(df['exchange_timestamp'], errors='coerce')
+                            # If values are small (< 1e12), assume seconds, else assume nanoseconds
+                            if numeric_ts.max() < 1e12:
+                                df['exchange_timestamp_ns'] = (numeric_ts * 1000000000).astype('int64')
+                            else:
+                                df['exchange_timestamp_ns'] = numeric_ts.astype('int64')
+                        
+                        if (df['exchange_timestamp_ns'] > 0).any():
+                            timestamp_set = True
+                    except:
+                        pass
+                
+                # Fallback 3: Try timestamp column (datetime or numeric)
+                if not timestamp_set and 'timestamp' in df.columns and df['timestamp'].notna().any():
+                    try:
+                        # Try converting datetime to nanoseconds
+                        if pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+                            df['exchange_timestamp_ns'] = (df['timestamp'].astype('int64') // 1).astype('int64')
+                        else:
+                            # Try as numeric
+                            numeric_ts = pd.to_numeric(df['timestamp'], errors='coerce')
+                            if numeric_ts.max() < 1e12:
+                                df['exchange_timestamp_ns'] = (numeric_ts * 1000000000).astype('int64')
+                            else:
+                                df['exchange_timestamp_ns'] = numeric_ts.astype('int64')
+                        
+                        if (df['exchange_timestamp_ns'] > 0).any():
+                            timestamp_set = True
+                    except:
+                        pass
+                
+                # Fallback 4: Try last_traded_timestamp
+                if not timestamp_set and 'last_traded_timestamp' in df.columns and df['last_traded_timestamp'].notna().any():
+                    try:
+                        if pd.api.types.is_datetime64_any_dtype(df['last_traded_timestamp']):
+                            df['exchange_timestamp_ns'] = (df['last_traded_timestamp'].astype('int64') // 1).astype('int64')
+                        else:
+                            numeric_ts = pd.to_numeric(df['last_traded_timestamp'], errors='coerce')
+                            if numeric_ts.max() < 1e12:
+                                df['exchange_timestamp_ns'] = (numeric_ts * 1000000000).astype('int64')
+                            else:
+                                df['exchange_timestamp_ns'] = numeric_ts.astype('int64')
+                        
+                        if (df['exchange_timestamp_ns'] > 0).any():
+                            timestamp_set = True
+                    except:
+                        pass
+                
+                # Fallback 5: Try last_traded_timestamp_ns (already in nanoseconds)
+                if not timestamp_set and 'last_traded_timestamp_ns' in df.columns and df['last_traded_timestamp_ns'].notna().any():
+                    try:
+                        df['exchange_timestamp_ns'] = pd.to_numeric(df['last_traded_timestamp_ns'], errors='coerce').astype('int64')
+                        if (df['exchange_timestamp_ns'] > 0).any():
+                            timestamp_set = True
+                    except:
+                        pass
+                
+                # Fallback 6: Extract from filename pattern YYYYMMDD_HHMMSS
+                if not timestamp_set:
+                    import re
+                    from pathlib import Path
+                    from datetime import datetime
+                    file_path_obj = Path(file_path)
+                    match = re.search(r'(\d{8})_(\d{6})', file_path_obj.stem)
+                    if match:
+                        date_str = match.group(1)
+                        time_str = match.group(2)
+                        try:
+                            dt = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+                            base_ns = int(dt.timestamp() * 1e9)
+                            # Create incremental timestamps for each row (1 second intervals)
+                            df['exchange_timestamp_ns'] = (base_ns + pd.Series(range(len(df))) * 1_000_000_000).astype('int64')
+                            timestamp_set = True
+                        except:
+                            pass
+                
+                # Fallback 7: Use current time as last resort
+                if not timestamp_set:
+                    import time
+                    base_ns = int(time.time() * 1e9)
+                    df['exchange_timestamp_ns'] = (base_ns + pd.Series(range(len(df))) * 1_000_000_000).astype('int64')
+            
+            # Ensure exchange_timestamp_ns is not null and is int64
+            if 'exchange_timestamp_ns' not in df.columns:
+                import time
+                base_ns = int(time.time() * 1e9)
+                df['exchange_timestamp_ns'] = (base_ns + pd.Series(range(len(df))) * 1_000_000_000).astype('int64')
+            
+            # Fill any remaining nulls with 0, then convert to int64
+            df['exchange_timestamp_ns'] = df['exchange_timestamp_ns'].fillna(0).astype('int64')
+            
+            # Ensure no zeros remain (shouldn't happen with fallbacks, but safety check)
+            if (df['exchange_timestamp_ns'] == 0).any():
+                # For rows with zero, use filename fallback
+                import re
+                from pathlib import Path
+                from datetime import datetime
+                file_path_obj = Path(file_path)
+                match = re.search(r'(\d{8})_(\d{6})', file_path_obj.stem)
+                if match:
+                    date_str = match.group(1)
+                    time_str = match.group(2)
+                    try:
+                        dt = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+                        base_ns = int(dt.timestamp() * 1e9)
+                        zero_mask = df['exchange_timestamp_ns'] == 0
+                        df.loc[zero_mask, 'exchange_timestamp_ns'] = (base_ns + pd.Series(range(zero_mask.sum())) * 1_000_000_000).astype('int64').values
+                    except:
+                        pass
+            
+            # Filter out UNKNOWN symbols
+            before = len(df)
+            df = df[
+                (df['instrument_token'] > 0) &
+                (df['symbol'].notna()) &
+                (df['symbol'] != '') &
+                (~df['symbol'].astype(str).str.startswith('UNKNOWN', na=False))
+            ].copy()
+            filtered = before - len(df)
+            
+            if len(df) == 0:
+                return {"success": False, "error": "All rows filtered", "file": str(file_path)}
+            
+            # Write enriched parquet back (temporary location)
+            enriched_path = file_path.parent / f".enriched_{file_path.name}"
+            df.to_parquet(enriched_path, index=False, engine='pyarrow')
+            
+            return {
+                "success": True,
+                "file": str(file_path),
+                "enriched_file": str(enriched_path),
+                "rows": len(df),
+                "filtered": filtered
+            }
+        else:
+            return {"success": False, "error": "No instrument_token column", "file": str(file_path)}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)[:200], "file": str(file_path)}
+
+
+def bulk_ingest_enriched_parquets(conn: duckdb.DuckDBPyConnection, enriched_files: List[str], db_columns: List[str]) -> dict:
+    """Bulk ingest multiple enriched parquet files using DuckDB native read_parquet()"""
+    try:
+        # Process files individually to get correct source_file for each
+        total_rows = 0
+        files_ingested = 0
+        errors = 0
+        for enriched_file in enriched_files:
+            try:
+                # Extract original file path from enriched file name
+                enriched_path = Path(enriched_file)
+                original_file = str(enriched_path.parent / enriched_path.name.replace('.enriched_', ''))
+                
+                # Get columns from this file
+                sample_cols = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{enriched_file}') LIMIT 1").fetchdf()['column_name'].tolist()
+                
+                # Build SELECT query mapping columns
+                select_parts = []
+                for col in db_columns:
+                    if col in sample_cols:
+                        if col == 'source_file':
+                            select_parts.append(f"'{original_file}' AS source_file")
+                        else:
+                            select_parts.append(f"p.{col}")
+                    elif col == 'source_file':
+                        select_parts.append(f"'{original_file}' AS source_file")
+                    elif col == 'processing_batch':
+                        select_parts.append("'parquet_ingestion_bulk' AS processing_batch")
+                    elif col == 'timestamp' or col == 'processed_at':
+                        select_parts.append(f"CURRENT_TIMESTAMP AS {col}")
+                    elif col == 'parser_version':
+                        select_parts.append("'v2.0' AS parser_version")
+                    else:
+                        select_parts.append(f"NULL AS {col}")
+                
+                # Insert with aggregation for duplicates
+                # For columns that should be aggregated (volumes, quantities, prices), use MAX
+                # For other columns, use ANY_VALUE or MAX
+                agg_select_parts = []
+                group_by_cols = ['instrument_token', 'exchange_timestamp_ns']
+                
+                for col in db_columns:
+                    if col in sample_cols:
+                        if col in group_by_cols:
+                            agg_select_parts.append(f"p.{col}")
+                        elif col in ['volume', 'total_buy_quantity', 'total_sell_quantity', 'open_interest', 
+                                     'last_price', 'open_price', 'high_price', 'low_price', 'close_price',
+                                     'average_traded_price', 'oi_day_high', 'oi_day_low']:
+                            # Aggregate numeric columns with MAX
+                            agg_select_parts.append(f"MAX(p.{col}) AS {col}")
+                        else:
+                            # Use ANY_VALUE for other columns (they should be same for same PK)
+                            agg_select_parts.append(f"ANY_VALUE(p.{col}) AS {col}")
+                    elif col == 'source_file':
+                        agg_select_parts.append(f"'{original_file}' AS source_file")
+                    elif col == 'processing_batch':
+                        agg_select_parts.append("'parquet_ingestion_bulk' AS processing_batch")
+                    elif col == 'timestamp' or col == 'processed_at':
+                        agg_select_parts.append(f"CURRENT_TIMESTAMP AS {col}")
+                    elif col == 'parser_version':
+                        agg_select_parts.append("'v2.0' AS parser_version")
+                    else:
+                        agg_select_parts.append(f"NULL AS {col}")
+                
+                insert_query = f"""
+                    INSERT OR REPLACE INTO tick_data_corrected
+                    SELECT {', '.join(agg_select_parts)}
+                    FROM read_parquet('{enriched_file}') p
+                    WHERE p.instrument_token > 0
+                    GROUP BY p.instrument_token, p.exchange_timestamp_ns
+                """
+                
+                conn.execute(insert_query)
+                
+                # Get row count for this file
+                count = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{enriched_file}') WHERE instrument_token > 0").fetchone()[0]
+                total_rows += count
+                files_ingested += 1
+                
+            except Exception as e:
+                logger.warning(f"Failed to ingest {enriched_file}: {e}")
+                errors += 1
+                continue
+        
+        return {"files_ingested": files_ingested, "rows_ingested": total_rows, "errors": errors}
+    except Exception as e:
+        logger.error(f"Bulk ingest error: {e}")
+        return {"success": False, "error": str(e)}
+
+
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description="Ingest parquet files using DuckDB native SQL")
+    parser = argparse.ArgumentParser(description="Enrich and bulk ingest parquet files using DuckDB native SQL")
     parser.add_argument("--db", default="tick_data_production.db", help="Database path")
-    parser.add_argument("--token-cache", default="zerodha_token_list/all_extracted_tokens_merged.json", 
+    parser.add_argument("--token-cache", default="core/data/token_lookup_enriched.json", 
                        help="Token lookup path")
     parser.add_argument("--search-dirs", nargs="+", help="Directories to search")
     parser.add_argument("--auto", action="store_true", help="Auto-find and ingest pending files")
+    parser.add_argument("--date-filter", type=str, help="Filter files by date (e.g., '20251103')")
     parser.add_argument("--limit", type=int, help="Limit number of files")
+    parser.add_argument("--workers", type=int, default=3, help="Number of parallel workers for enrichment")
+    parser.add_argument("--batch-size", type=int, default=100, help="Batch size for bulk ingestion")
     parser.add_argument("--dry-run", action="store_true", help="Dry run")
     
     args = parser.parse_args()
@@ -400,13 +1107,17 @@ def main():
         parser.print_help()
         return
     
-    # Load token cache
-    token_cache = TokenCacheManager(cache_path=args.token_cache, verbose=False)
-    logger.info(f"Loaded token cache: {len(token_cache.token_map):,} tokens")
-    
     # Get pending files
-    search_dirs = args.search_dirs or ["real_parquet_data", "parquet_output", "binary_to_parquet"]
-    file_paths = get_pending_parquet_files(args.db, search_dirs)
+    search_dirs = args.search_dirs or [
+        "real_parquet_data",
+        "parquet_output",
+        "binary_to_parquet",
+        "crawlers/raw_data",
+        "crawlers",
+        "research",
+        "research_data",
+    ]
+    file_paths = get_pending_parquet_files(args.db, search_dirs, date_filter=args.date_filter)
     
     if args.limit:
         file_paths = file_paths[:args.limit]
@@ -418,46 +1129,96 @@ def main():
         return
     
     if args.dry_run:
-        logger.info("DRY RUN - Would ingest these files")
+        logger.info("DRY RUN - Would process these files")
         for f in file_paths[:10]:
             logger.info(f"  {f}")
         return
     
-    # Single DuckDB connection for all files
+    # STEP 1: Enrich parquet files in parallel using multiprocessing
+    logger.info(f"📦 Step 1: Enriching {len(file_paths):,} parquet files with token metadata (workers={args.workers})...")
+    
+    enriched_files = []
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(enrich_parquet_file_worker, str(f), args.token_cache): f 
+            for f in file_paths
+        }
+        
+        for future in as_completed(futures):
+            result = future.result()
+            if result.get("success"):
+                enriched_files.append(result["enriched_file"])
+                if len(enriched_files) % 100 == 0:
+                    logger.info(f"  Enriched: {len(enriched_files):,}/{len(file_paths):,} files")
+            else:
+                # Log first 10 errors
+                if len([f for f in enriched_files if not f]) < 10:
+                    logger.warning(f"  Failed to enrich {result.get('file', 'unknown')}: {result.get('error', 'unknown error')}")
+    
+    logger.info(f"✅ Enriched {len(enriched_files):,} files")
+    
+    # STEP 2: Bulk ingest enriched parquet files using DuckDB native read_parquet()
+    logger.info(f"📥 Step 2: Bulk ingesting {len(enriched_files):,} enriched parquet files...")
+    
     conn = duckdb.connect(args.db)
     ensure_production_schema(conn)
     
-    # Load token metadata into DuckDB
-    token_metadata_view = load_token_metadata_into_duckdb(conn, token_cache)
+    db_columns = [
+        'instrument_token', 'symbol', 'exchange', 'segment', 'instrument_type',
+        'expiry', 'strike_price', 'option_type', 'lot_size', 'tick_size', 'is_expired',
+        'timestamp', 'exchange_timestamp', 'exchange_timestamp_ns',
+        'last_traded_timestamp', 'last_traded_timestamp_ns', 'last_price',
+        'open_price', 'high_price', 'low_price', 'close_price', 'average_traded_price',
+        'volume', 'last_traded_quantity', 'total_buy_quantity', 'total_sell_quantity',
+        'open_interest', 'oi_day_high', 'oi_day_low',
+        'bid_1_price', 'bid_1_quantity', 'bid_1_orders',
+        'bid_2_price', 'bid_2_quantity', 'bid_2_orders',
+        'bid_3_price', 'bid_3_quantity', 'bid_3_orders',
+        'bid_4_price', 'bid_4_quantity', 'bid_4_orders',
+        'bid_5_price', 'bid_5_quantity', 'bid_5_orders',
+        'ask_1_price', 'ask_1_quantity', 'ask_1_orders',
+        'ask_2_price', 'ask_2_quantity', 'ask_2_orders',
+        'ask_3_price', 'ask_3_quantity', 'ask_3_orders',
+        'ask_4_price', 'ask_4_quantity', 'ask_4_orders',
+        'ask_5_price', 'ask_5_quantity', 'ask_5_orders',
+        'packet_type', 'data_quality', 'session_type', 
+        'source_file', 'processing_batch', 'session_id',
+        'processed_at', 'parser_version',
+        'rsi_14', 'sma_20', 'ema_12', 'bollinger_upper', 'bollinger_middle', 'bollinger_lower',
+        'macd', 'macd_signal', 'macd_histogram',
+        'delta', 'gamma', 'theta', 'vega', 'rho', 'implied_volatility'
+    ]
     
-    # Ingest files sequentially using the same connection
     total_rows = 0
-    files_completed = 0
+    files_ingested = 0
     errors = 0
     
-    for file_path in file_paths:
+    # Process in batches
+    for i in range(0, len(enriched_files), args.batch_size):
+        batch = enriched_files[i:i + args.batch_size]
         try:
-            result = ingest_parquet_file_duckdb_native(conn, file_path, token_metadata_view)
+            result = bulk_ingest_enriched_parquets(conn, batch, db_columns)
             if result.get("success"):
                 total_rows += result.get("row_count", 0)
-                files_completed += 1
-                # Log progress more frequently
-                if files_completed <= 50 or files_completed % 50 == 0:
-                    logger.info(f"Progress: {files_completed}/{len(file_paths)} files, {total_rows:,} rows")
+                files_ingested += len(batch)
+                logger.info(f"Progress: {files_ingested}/{len(enriched_files)} files, {total_rows:,} rows")
             else:
-                errors += 1
-                if errors <= 10:
-                    logger.error(f"Failed {file_path.name}: {result.get('error')}")
+                errors += len(batch)
+                logger.error(f"Batch failed: {result.get('error')}")
         except Exception as e:
-            errors += 1
-            logger.error(f"Exception processing {file_path.name}: {e}", exc_info=True)
-            if errors > 100:
-                logger.error("Too many errors, stopping")
-                break
+            errors += len(batch)
+            logger.error(f"Exception in batch: {e}")
     
     conn.close()
     
-    logger.info(f"✅ Complete: {files_completed} files, {total_rows:,} rows, {errors} errors")
+    # Clean up enriched temp files
+    for enriched_file in enriched_files:
+        try:
+            Path(enriched_file).unlink()
+        except:
+            pass
+    
+    logger.info(f"✅ Complete: {files_ingested} files, {total_rows:,} rows, {errors} errors")
 
 
 if __name__ == "__main__":

@@ -8,9 +8,11 @@ import sys
 from pathlib import Path
 import duckdb
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import time
 import logging
+import multiprocessing
+import resource
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -22,26 +24,48 @@ from token_cache import TokenCacheManager
 # Set up logging
 logging.basicConfig(level=logging.WARNING)  # Suppress verbose logs
 
-def get_pending_parquet_files(db_path: str, search_dirs: list = None) -> list:
-    """Get list of parquet files that haven't been ingested"""
+def get_pending_parquet_files(db_path: str, search_dirs: list = None, date_filter: str = None) -> list:
+    """Get list of parquet files that haven't been ingested
+    
+    Args:
+        db_path: Path to DuckDB database
+        search_dirs: Directories to search for parquet files
+        date_filter: Optional date filter (e.g., '20251103' for Nov 3, 2025)
+    """
     if search_dirs is None:
         search_dirs = [
             "real_parquet_data",
             "parquet_output",
             "binary_to_parquet",
+            "crawlers/raw_data",  # Include crawlers directory
+            "crawlers",  # Include all crawlers subdirectories (rglob will search nested)
+            "research",  # Include research directory
+            "research_data",  # Include research_data directory
         ]
     
-    conn = duckdb.connect(db_path)
-    
-    # Get ingested parquet files
-    ingested_parquet = conn.execute("""
-        SELECT DISTINCT source_file
-        FROM tick_data_corrected
-        WHERE source_file LIKE '%.parquet'
-    """).fetchall()
-    
-    ingested_paths = {Path(row[0]) for row in ingested_parquet if row[0]}
-    conn.close()
+    try:
+        conn = duckdb.connect(db_path, read_only=True)
+        
+        # Get ingested parquet files
+        if date_filter:
+            ingested_parquet = conn.execute("""
+                SELECT DISTINCT source_file
+                FROM tick_data_corrected
+                WHERE source_file LIKE '%.parquet'
+                  AND source_file LIKE ?
+            """, [f'%{date_filter}%']).fetchall()
+        else:
+            ingested_parquet = conn.execute("""
+                SELECT DISTINCT source_file
+                FROM tick_data_corrected
+                WHERE source_file LIKE '%.parquet'
+            """).fetchall()
+        
+        ingested_paths = {Path(row[0]) for row in ingested_parquet if row[0]}
+        conn.close()
+    except Exception as e:
+        logging.warning(f"Could not check database for ingested files: {e}")
+        ingested_paths = set()
     
     # Find parquet files on disk
     excluded_patterns = ['.venv', '__pycache__', 'site-packages', 'tests', 'test_', 'backtesting']
@@ -50,7 +74,8 @@ def get_pending_parquet_files(db_path: str, search_dirs: list = None) -> list:
     for directory in search_dirs:
         dir_path = Path(directory)
         if dir_path.exists():
-            for f in dir_path.rglob('*.parquet'):
+            pattern = f'*{date_filter}*.parquet' if date_filter else '*.parquet'
+            for f in dir_path.rglob(pattern):
                 # Exclude test files and backup data
                 if any(excluded in str(f) for excluded in excluded_patterns):
                     continue
@@ -62,7 +87,7 @@ def get_pending_parquet_files(db_path: str, search_dirs: list = None) -> list:
     
     return sorted(list(missing_parquet))
 
-def ingest_parquet_files_batch(db_path: str, file_paths: list, token_cache_path: str = None, max_workers: int = 4):
+def ingest_parquet_files_batch(db_path: str, file_paths: list, token_cache_path: str = None, max_workers: int = 4, max_memory_gb: float = None, use_multiprocessing: bool = False):
     """Ingest parquet files in parallel"""
     
     if not file_paths:
@@ -105,35 +130,89 @@ def ingest_parquet_files_batch(db_path: str, file_paths: list, token_cache_path:
     total_rows = 0
     errors = 0
     
-    print(f"\nProcessing with {max_workers} workers...")
+    if use_multiprocessing:
+        print(f"\n⚠️  WARNING: DuckDB doesn't support concurrent writes from multiple processes")
+        print(f"   Switching to threading mode (workers can share database connection)")
+        print(f"\nProcessing with {max_workers} workers (threading with shared connection)...")
+        use_multiprocessing = False  # Force threading for database access
     
-    # Use ThreadPoolExecutor for parallel processing (better for I/O-bound tasks)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_file = {}
-        for file_path in file_paths:
-            future = executor.submit(ingest_parquet_file, file_path, db_path, token_cache, enrich=True)
-            future_to_file[future] = file_path
+    if use_multiprocessing:
+        print(f"\nProcessing with {max_workers} workers (multiprocessing)...")
+        if max_memory_gb:
+            print(f"Max memory per worker: {max_memory_gb}GB")
         
-        # Process results as they complete
-        for future in as_completed(future_to_file):
-            file_path = future_to_file[future]
-            try:
-                result = future.result()
-                if result.get("success"):
-                    rows = result.get("row_count", 0)
-                    total_rows += rows
-                    files_completed += 1
-                    if files_completed % 100 == 0:
-                        print(f"  Progress: {files_completed}/{len(file_paths)} files, {total_rows:,} rows")
-                else:
+        # Use ProcessPoolExecutor for CPU-bound tasks
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Set memory limit for each worker
+            if max_memory_gb:
+                max_memory_bytes = int(max_memory_gb * 1024 * 1024 * 1024)
+                try:
+                    resource.setrlimit(resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes))
+                except ValueError:
+                    logging.warning("Could not set memory limit, using system default")
+            
+            # Submit all tasks
+            future_to_file = {}
+            for file_path in file_paths:
+                future = executor.submit(
+                    ingest_worker_mp, 
+                    str(file_path), 
+                    db_path, 
+                    token_cache_path if token_cache_path else "core/data/token_lookup_enriched.json",
+                    True
+                )
+                future_to_file[future] = file_path
+            
+            # Process results as they complete
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    result = future.result()
+                    if result.get("success"):
+                        rows = result.get("row_count", 0)
+                        total_rows += rows
+                        files_completed += 1
+                        if files_completed % 100 == 0:
+                            print(f"  Progress: {files_completed}/{len(file_paths)} files, {total_rows:,} rows")
+                    else:
+                        errors += 1
+                        if errors <= 10:
+                            print(f"  ❌ {file_path.name}: {result.get('error', 'Unknown error')}")
+                except Exception as e:
                     errors += 1
-                    if errors <= 10:  # Show first 10 errors
-                        print(f"  ❌ {file_path.name}: {result.get('error', 'Unknown error')}")
-            except Exception as e:
-                errors += 1
-                if errors <= 10:
-                    print(f"  ❌ {file_path.name}: {e}")
+                    if errors <= 10:
+                        print(f"  ❌ {file_path.name}: {e}")
+    
+    if not use_multiprocessing:
+        print(f"\nProcessing with {max_workers} workers (threading)...")
+        
+        # Use ThreadPoolExecutor for parallel processing (better for I/O-bound tasks)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_file = {}
+            for file_path in file_paths:
+                future = executor.submit(ingest_parquet_file, file_path, db_path, token_cache, enrich=True)
+                future_to_file[future] = file_path
+            
+            # Process results as they complete
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    result = future.result()
+                    if result.get("success"):
+                        rows = result.get("row_count", 0)
+                        total_rows += rows
+                        files_completed += 1
+                        if files_completed % 100 == 0:
+                            print(f"  Progress: {files_completed}/{len(file_paths)} files, {total_rows:,} rows")
+                    else:
+                        errors += 1
+                        if errors <= 10:  # Show first 10 errors
+                            print(f"  ❌ {file_path.name}: {result.get('error', 'Unknown error')}")
+                except Exception as e:
+                    errors += 1
+                    if errors <= 10:
+                        print(f"  ❌ {file_path.name}: {e}")
     
     print(f"\n{'='*80}")
     print(f"INGESTION SUMMARY")
@@ -147,6 +226,36 @@ def ingest_parquet_files_batch(db_path: str, file_paths: list, token_cache_path:
         "rows_inserted": total_rows,
         "errors": errors
     }
+
+
+def ingest_worker_mp(file_path_str: str, db_path: str, token_cache_path: str, enrich: bool) -> dict:
+    """Worker function for multiprocessing ingestion."""
+    import sys
+    from pathlib import Path
+    
+    # Add project root to path (needed in worker process)
+    # Use current working directory which should be the project root
+    project_root = Path.cwd()
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    
+    from parquet_ingester import ingest_parquet_file
+    from token_cache import TokenCacheManager
+    
+    try:
+        # Load token cache in worker
+        token_cache = TokenCacheManager(cache_path=token_cache_path, verbose=False)
+        
+        # Ingest file
+        result = ingest_parquet_file(
+            file_path=Path(file_path_str),
+            db_path=db_path,
+            token_cache=token_cache,
+            enrich=enrich
+        )
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e), "row_count": 0}
 
 def main():
     import argparse
@@ -169,9 +278,12 @@ Examples:
     parser.add_argument("--auto", action="store_true", help="Automatically find and ingest pending parquet files")
     parser.add_argument("--token-cache", default="zerodha_token_list/all_extracted_tokens_merged.json", 
                        help="Path to enriched token lookup")
-    parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers")
+    parser.add_argument("--max-memory", type=float, default=None, help="Maximum memory per worker in GB")
+    parser.add_argument("--mp", action="store_true", help="Use multiprocessing instead of threading")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
     parser.add_argument("--limit", type=int, help="Limit number of files to process")
+    parser.add_argument("--date-filter", type=str, help="Filter files by date (e.g., '20251103' for Nov 3, 2025)")
     
     args = parser.parse_args()
     
@@ -182,9 +294,10 @@ Examples:
             "real_parquet_data",
             "parquet_output",
             "binary_to_parquet",
+            "crawlers/raw_data",  # Include crawlers directory
         ]
         
-        file_paths = get_pending_parquet_files(args.db, search_dirs)
+        file_paths = get_pending_parquet_files(args.db, search_dirs, date_filter=args.date_filter)
         print(f"   Found {len(file_paths):,} pending parquet files")
         
         if args.limit:
@@ -226,7 +339,9 @@ Examples:
             args.db, 
             file_paths, 
             token_cache_path=args.token_cache if Path(args.token_cache).exists() else None,
-            max_workers=args.workers
+            max_workers=args.workers,
+            max_memory_gb=args.max_memory,
+            use_multiprocessing=args.mp
         )
         
         print(f"\n{'='*80}")

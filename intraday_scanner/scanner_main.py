@@ -4462,44 +4462,8 @@ class MarketScanner:
                     logger.error(f"Error analyzing {baseline_key}: {e}")
                     continue
 
-            # Process alerts through PremarketAlertService
-            # if manipulation_candidates:
-            #     alerts = self.premarket_alert_service.process_manipulation_candidates(
-            #         manipulation_candidates
-            #     )
-            #     if alerts:
-            #         logger.info(
-            #             f"🚨 Premarket Alert Service generated {len(alerts)} alerts"
-            #         )
-                    # Send alerts through AlertManager
-                    # for alert in alerts:
-                    #     try:
-                    #         should_send = True
-                    #         if hasattr(
-                    #             self.alert_manager, "should_send_premarket_alert"
-                    #         ):
-                    #             should_send = self.alert_manager.should_send_premarket_alert(
-                    #                 alert
-                    #             )
-                    #         if not should_send:
-                    #             logger.info(
-                    #                 "🔇 Premarket alert filtered by AlertManager: %s",
-                    #                 alert.get("symbol"),
-                    #             )
-                    #             continue
-
-                    #         self.alert_manager.send_alert(alert)
-                    #         logger.info(
-                    #             "✅ Premarket alert sent: %s (conf: %.2f)",
-                    #             alert.get("symbol"),
-                    #             alert.get("confidence", 0.0),
-                    #         )
-                    #     except Exception as e:
-                    #         logger.error(
-                    #             "❌ Failed to send premarket alert for %s: %s",
-                    #             alert.get("symbol", "UNKNOWN"),
-                    #             e,
-                    #         )
+            # ✅ PREMARKET ALERTS: Handled via data_pipeline._process_premarket_order()
+            # which uses alert_manager.should_send_premarket_alert() (properly implemented in alerts.filters)
 
             logger.info(
                 f"✅ Premarket analysis complete: {signals_published} manipulation signals published"

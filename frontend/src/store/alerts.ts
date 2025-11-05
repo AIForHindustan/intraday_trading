@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { alertsAPI, AlertQueryParams } from '../services/api';
+import { adaptAlert } from '../services/adapters';
 
 export interface Alert {
   alert_id: string;
@@ -53,9 +54,12 @@ export const useAlertsStore = create<AlertsState>((set) => ({
     try {
       const response = await alertsAPI.getAll(params);
       const data = response.data;
+      // Adapt alerts using adapter to normalize fields
+      const rawAlerts = data.alerts || data || [];
+      const adaptedAlerts = Array.isArray(rawAlerts) ? rawAlerts.map(adaptAlert) : [];
       set({
-        alerts: data.alerts || [],
-        total: data.total,
+        alerts: adaptedAlerts,
+        total: data.total || adaptedAlerts.length,
         limit: data.limit,
         offset: data.offset,
         hasMore: data.has_more,
@@ -87,11 +91,11 @@ export const useAlertsStore = create<AlertsState>((set) => ({
         errorMessage = err.message;
       }
       set({ loading: false, error: errorMessage, alerts: [] });
-      // If 401, clear token and redirect to login
-      if (err?.response?.status === 401) {
-        localStorage.removeItem('access_token');
-        window.location.href = '/login';
-      }
+      // TEMPORARILY DISABLED: Authentication is disabled, no redirect needed
+      // if (err?.response?.status === 401) {
+      //   localStorage.removeItem('access_token');
+      //   window.location.href = '/login';
+      // }
     }
   },
   appendAlert: (alert: Alert) => {

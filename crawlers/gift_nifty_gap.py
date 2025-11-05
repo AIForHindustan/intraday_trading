@@ -655,56 +655,216 @@ class IndexDataUpdater:
         volume_keywords = ['BREAKING', 'URGENT', 'ALERT', 'SURGE', 'SPIKE', 'RALLY', 'CRASH', 'PLUNGE']
         return any(keyword in title for keyword in volume_keywords)
 
+    def _extract_underlying_symbol(self, symbol: str) -> str:
+        """Extract underlying symbol from option/future symbols"""
+        if not symbol:
+            return symbol
+        
+        symbol_upper = symbol.upper()
+        if ':' in symbol_upper:
+            symbol_upper = symbol_upper.split(':')[-1]
+        
+        index_match = re.search(r'(BANKNIFTY|NIFTY|FINNIFTY|MIDCPNIFTY)', symbol_upper)
+        if index_match:
+            return index_match.group(1)
+        
+        if 'CE' in symbol_upper or 'PE' in symbol_upper:
+            match = re.search(r'^([A-Z]+)\d{2}[A-Z]{3}', symbol_upper)
+            if match:
+                return match.group(1)
+            match = re.search(r'^([A-Z]+)\d', symbol_upper)
+            if match:
+                return match.group(1)
+        
+        if symbol_upper.endswith('FUT'):
+            match = re.search(r'^([A-Z]+)\d', symbol_upper)
+            if match:
+                return match.group(1)
+        
+        return symbol_upper
+
+    def _get_sector_from_symbol(self, symbol: str) -> str:
+        """Map symbol to sector based on naming patterns"""
+        if not symbol:
+            return ""
+        
+        symbol_upper = symbol.upper()
+        bank_keywords = ['BANK', 'HDFC', 'ICICI', 'SBI', 'AXIS', 'KOTAK', 'INDUSIND', 
+                         'YESBANK', 'FEDERAL', 'IDFC', 'BANDHAN', 'RBL', 'UNION',
+                         'PNB', 'CANARA', 'BANKOFBARODA', 'BANKOFINDIA']
+        it_keywords = ['INFOSYS', 'TCS', 'WIPRO', 'HCL', 'TECHMAHINDRA', 'LTIM', 
+                       'LTTS', 'PERSISTENT', 'MINDTREE', 'COFORGE', 'MPHASIS']
+        auto_keywords = ['MARUTI', 'M&M', 'TATA', 'MOTORS', 'BAJAJ', 'HERO', 
+                         'EICHER', 'ASHOK', 'LEYLAND', 'TVS', 'MOTHERSUM']
+        pharma_keywords = ['SUNPHARMA', 'DRREDDY', 'CIPLA', 'LUPIN', 'TORRENT', 
+                           'AUROBINDO', 'DIVIS', 'GLENMARK', 'CADILA']
+        fmcg_keywords = ['HUL', 'ITC', 'NESTLE', 'DABUR', 'MARICO', 'BRITANNIA', 
+                         'GODREJ', 'TATA', 'CONSUMER']
+        energy_keywords = ['RELIANCE', 'ONGC', 'GAIL', 'IOC', 'BPCL', 'HPCL', 
+                           'OIL', 'PETRONET']
+        metal_keywords = ['TATASTEEL', 'JSWSTEEL', 'SAIL', 'JINDAL', 'VEDANTA', 
+                          'HINDALCO', 'NMDC']
+        
+        for keyword in bank_keywords:
+            if keyword in symbol_upper:
+                return "BANK"
+        for keyword in it_keywords:
+            if keyword in symbol_upper:
+                return "IT"
+        for keyword in auto_keywords:
+            if keyword in symbol_upper:
+                return "AUTO"
+        for keyword in pharma_keywords:
+            if keyword in symbol_upper:
+                return "PHARMA"
+        for keyword in fmcg_keywords:
+            if keyword in symbol_upper:
+                return "FMCG"
+        for keyword in energy_keywords:
+            if keyword in symbol_upper:
+                return "ENERGY"
+        for keyword in metal_keywords:
+            if keyword in symbol_upper:
+                return "METAL"
+        return ""
+
     def _extract_symbols_from_news(self, news_item):
-        """Extract relevant symbols from news title/content - enhanced to extract individual stocks"""
-        symbols = []
-        content_upper = (news_item.get('title', '') + ' ' + news_item.get('content', '')).upper()
-        content_lower = content_upper.lower()
+        """Extract relevant symbols from news title/content using sector-based parsing"""
+        title = news_item.get('title', '')
+        content = news_item.get('content', '')
+        full_content = f"{title} {content}".strip()
         
-        # First, check for specific company names and map to symbols
-        found_stocks = set()
+        if not full_content:
+            return ['NSE:NIFTY BANK', 'NSE:NIFTY 50']
         
-        if self.company_symbol_map:
-            # Match company names in news content
-            for company_name, symbol_info_list in self.company_symbol_map.items():
-                # Check if company name appears in content (as whole word where possible)
-                company_upper = company_name.upper()
-                
-                # Try to match as whole word first (more precise)
-                pattern = r'\b' + re.escape(company_upper) + r'\b'
-                if re.search(pattern, content_upper):
-                    for sym_info in symbol_info_list:
-                        # Prefer equity cash or futures over options for news
-                        inst_type = sym_info.get('instrument_type', '')
-                        if inst_type in ['EQ', 'FUT', '']:
-                            found_stocks.add(sym_info['full_symbol'])
-                            # Also add base symbol without exchange prefix for flexibility
-                            if ':' in sym_info['full_symbol']:
-                                found_stocks.add(sym_info['symbol'])
-                
-                # Also check substring match (less precise, but catches variations)
-                elif company_upper in content_upper:
-                    for sym_info in symbol_info_list:
-                        inst_type = sym_info.get('instrument_type', '')
-                        if inst_type in ['EQ', 'FUT', '']:
-                            found_stocks.add(sym_info['full_symbol'])
+        symbols = set()
+        sectors = set()
+        sub_categories = set()
+        text_upper = full_content.upper()
         
-        # Add found stocks to symbols list
-        symbols.extend(sorted(found_stocks))
+        # Use token cache if available
+        token_cache = None
+        if hasattr(self, 'token_cache') and self.token_cache:
+            token_cache = self.token_cache
+        else:
+            try:
+                from token_cache import TokenCacheManager
+                token_cache = TokenCacheManager(cache_path="core/data/token_lookup_enriched.json", verbose=False)
+            except:
+                pass
         
-        # Check for NIFTY-related content and map to base symbols (keep for index-level news)
-        if any(keyword in content_upper for keyword in ['BANKNIFTY', 'BANK NIFTY']):
-            if 'NSE:NIFTY BANK' not in symbols:
-                symbols.append('NSE:NIFTY BANK')
-        if any(keyword in content_upper for keyword in ['NIFTY', 'NIFTY 50', 'NIFTY50']):
-            if 'NSE:NIFTY 50' not in symbols:
-                symbols.append('NSE:NIFTY 50')
+        # Extract potential symbol patterns from text
+        potential_symbols = set()
+        pattern = r'\b([A-Z]{2,15})\b'
+        matches = re.findall(pattern, text_upper)
+        common_words = {
+            'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS', 'ONE',
+            'OUR', 'OUT', 'DAY', 'GET', 'HAS', 'HIM', 'HIS', 'HOW', 'ITS', 'MAY', 'NEW', 'NOW',
+            'OLD', 'SEE', 'TWO', 'WAY', 'WHO', 'BOY', 'DID', 'LET', 'PUT', 'SAY',
+            'SHE', 'TOO', 'USE', 'NSE', 'BSE', 'FII', 'DII', 'IPO', 'EPS', 'PEG', 'PE', 'ROI',
+            'WITH', 'FROM', 'THIS', 'THAT', 'THAN', 'THEY', 'WHAT', 'WHEN', 'WHERE', 'WHICH'
+        }
         
-        # If no specific symbols found (neither stocks nor indices), publish to both major indices as fallback
-        if not symbols:
-            symbols = ['NSE:NIFTY BANK', 'NSE:NIFTY 50']
+        for match in matches:
+            if match not in common_words and len(match) >= 2:
+                potential_symbols.add(match)
         
-        return symbols
+        # Check for option/future symbols
+        option_pattern = r'\b([A-Z]+\d{2}[A-Z]{3}\d+(?:CE|PE|FUT))\b'
+        option_matches = re.findall(option_pattern, text_upper)
+        for opt_match in option_matches:
+            potential_symbols.add(opt_match)
+        
+        # Process each potential symbol
+        checked_symbols = set()
+        for potential in potential_symbols:
+            if potential in checked_symbols:
+                continue
+            checked_symbols.add(potential)
+            
+            # Extract underlying for options/futures
+            underlying = self._extract_underlying_symbol(potential)
+            
+            # Check if underlying exists in token cache
+            if token_cache:
+                token = token_cache.symbol_to_token(underlying)
+                if token:
+                    symbols.add(underlying)
+                    sector = self._get_sector_from_symbol(underlying)
+                    if sector:
+                        sectors.add(sector)
+                        sub_categories.add(underlying)
+                elif token_cache.symbol_to_token(potential):
+                    symbols.add(potential)
+                    sector = self._get_sector_from_symbol(potential)
+                    if sector:
+                        sectors.add(sector)
+                        sub_categories.add(potential)
+            else:
+                # Without token cache, use sector matching
+                sector = self._get_sector_from_symbol(underlying)
+                if sector:
+                    symbols.add(underlying)
+                    sectors.add(sector)
+                    sub_categories.add(underlying)
+        
+        # Check for index patterns
+        if 'BANKNIFTY' in text_upper or 'BANK NIFTY' in text_upper:
+            symbols.add('BANKNIFTY')
+            sectors.add('BANK')
+        if 'NIFTY' in text_upper:
+            symbols.add('NIFTY')
+            sectors.add('INDEX')
+        if 'FINNIFTY' in text_upper:
+            symbols.add('FINNIFTY')
+            sectors.add('INDEX')
+        
+        # Build result with NSE: prefixes
+        result_symbols = []
+        symbol_set = set()
+        
+        for symbol in symbols:
+            if ':' not in symbol:
+                nse_symbol = f"NSE:{symbol}"
+                if nse_symbol not in symbol_set:
+                    result_symbols.append(nse_symbol)
+                    symbol_set.add(nse_symbol)
+            else:
+                if symbol not in symbol_set:
+                    result_symbols.append(symbol)
+                    symbol_set.add(symbol)
+        
+        for sub_cat in sub_categories:
+            if ':' not in sub_cat:
+                nse_symbol = f"NSE:{sub_cat}"
+                if nse_symbol not in symbol_set:
+                    result_symbols.append(nse_symbol)
+                    symbol_set.add(nse_symbol)
+            else:
+                if sub_cat not in symbol_set:
+                    result_symbols.append(sub_cat)
+                    symbol_set.add(sub_cat)
+        
+        # Sector-based routing - if BANK sector, add BANKNIFTY
+        if 'BANK' in sectors:
+            if 'NSE:NIFTY BANK' not in symbol_set:
+                result_symbols.append('NSE:NIFTY BANK')
+                symbol_set.add('NSE:NIFTY BANK')
+        
+        # Index mentions
+        if 'BANKNIFTY' in text_upper or 'BANK NIFTY' in text_upper:
+            if 'NSE:NIFTY BANK' not in symbol_set:
+                result_symbols.append('NSE:NIFTY BANK')
+                symbol_set.add('NSE:NIFTY BANK')
+        if 'NIFTY' in text_upper:
+            if 'NSE:NIFTY 50' not in symbol_set:
+                result_symbols.append('NSE:NIFTY 50')
+                symbol_set.add('NSE:NIFTY 50')
+        
+        if not result_symbols:
+            result_symbols = ['NSE:NIFTY BANK', 'NSE:NIFTY 50']
+        
+        return result_symbols
 
     def _write_news_to_disk(self):
         """Write news data to disk with sentiment analysis - ALWAYS WRITES"""

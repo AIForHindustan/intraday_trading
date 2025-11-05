@@ -75,7 +75,8 @@ class AlertValidationDashboard:
         # Maintain single robust client for helper methods (get_time_buckets, retrieve_by_data_type, etc.)
         # Map of db -> redis.Redis client (direct connections from shared pool)
         self.redis_clients: Dict[int, Optional[redis.Redis]] = {}
-        for db in (0, 1, 2, 4, 5):
+        # ✅ DB 4 removed from architecture - only connect to (0, 1, 2, 5)
+        for db in (0, 1, 2, 5):
             try:
                 self.redis_clients[db] = RedisManager82.get_client(
                     process_name="dashboard",
@@ -100,8 +101,8 @@ class AlertValidationDashboard:
         self.redis_db1 = self.redis_clients.get(1) or self.redis_client
         # DB 2 is analytics database where volume profile is stored
         self.redis_db2 = self.redis_clients.get(2) or self.redis_db1
-        # DB 4 and DB 5 may also contain indicators/Greeks (user confirmed)
-        self.redis_db4 = self.redis_clients.get(4) or self.redis_db1
+        # ✅ DB 5 is PRIMARY for indicators/Greeks (single source of truth per redis_config.py)
+        # DB 4 removed from architecture - not part of new architecture per redis_config.py
         self.redis_db5 = self.redis_clients.get(5) or self.redis_db1
         self.alerts_data = []
         self.alerts_data_lock = threading.Lock()  # Thread-safe lock for alerts_data
@@ -265,10 +266,10 @@ class AlertValidationDashboard:
         """
         results: List[Dict[str, Any]] = []
         seen_keys: set[str] = set()
+        # ✅ DB 4 removed from architecture - only check DB 5 (PRIMARY) and DB 1 (fallback)
         redis_clients = [
-            ("DB1", self.redis_db1),
-            ("DB4", self.redis_db4),
-            ("DB5", self.redis_db5),
+            ("DB5", self.redis_db5),  # PRIMARY - single source of truth
+            ("DB1", self.redis_db1),  # Legacy fallback
         ]
         
         for variant in self._generate_symbol_variants(symbol):
@@ -762,7 +763,7 @@ class AlertValidationDashboard:
         # Step 3: Check database connections
         try:
             debug_info['redis_db1_connected'] = self.redis_db1.ping()
-            debug_info['redis_db4_connected'] = self.redis_db4.ping() if hasattr(self, 'redis_db4') else False
+            # DB 4 removed from architecture - no longer checking
             debug_info['redis_db5_connected'] = self.redis_db5.ping() if hasattr(self, 'redis_db5') else False
         except Exception as e:
             debug_info['steps'].append(f"Redis connection check error: {e}")
@@ -811,7 +812,8 @@ class AlertValidationDashboard:
                         f"ts:indicators:{variant}:bb_lower"
                     ]
                     
-                    for db_client in [self.redis_db1, self.redis_db4, self.redis_db5]:
+                    # ✅ DB 4 removed from architecture - only check DB 1 and DB 5
+                    for db_client in [self.redis_db5, self.redis_db1]:  # DB 5 first (PRIMARY), then DB 1 (fallback)
                         for ts_key in ts_keys:
                             if db_client.exists(ts_key):
                                 print(f"✅ Found time series: {ts_key}")
@@ -1017,11 +1019,12 @@ class AlertValidationDashboard:
     def _load_indicators_from_redis_fallback(self, symbol: str) -> dict:
         """
         ✅ SMART CACHING: Redis lookup logic with in-memory cache.
-        Checks cache first, then Redis (DB 5 → DB 1 → DB 4), then caches result.
+        Checks cache first, then Redis (DB 5 → DB 1), then caches result.
         
-        Scanner stores via: store_by_data_type("analysis_cache", f"indicators:{symbol}:{indicator_name}", value)
-        Storage location: DB 5 (primary per user), DB 1 (realtime fallback), DB 4 (fallback)
+        Scanner stores via: store_by_data_type("indicators_cache", f"indicators:{symbol}:{indicator_name}", value)
+        Storage location: DB 5 (PRIMARY - single source of truth per redis_config.py), DB 1 (legacy fallback only)
         Key format: indicators:{symbol}:{indicator_name} (stored AS-IS, no prefix added)
+        DB 4 removed from architecture per redis_config.py
         """
         indicators = {}
         
@@ -1092,7 +1095,8 @@ class AlertValidationDashboard:
         except:
             pass
         
-        # ✅ PRIORITY: Check DB 5 first (user confirmed indicators are in DB 5), then DB 1, then DB 4
+        # ✅ PRIORITY: Check DB 5 first (PRIMARY - single source of truth), then DB 1 (legacy fallback only)
+        # DB 4 removed from fallback chain per redis_config.py
         redis_dbs = [
             ('DB5', self.redis_db5),
             ('DB1', self.redis_db1),
@@ -1100,7 +1104,7 @@ class AlertValidationDashboard:
         
         # Method 1: Use retrieve_by_data_type if available (matches scanner exactly)
         if has_retrieve_method and redis_wrapper:
-            # Fetch missing indicators from Redis (check DB 5 → DB 1 → DB 4)
+            # ✅ Fetch missing indicators from Redis (check DB 5 → DB 1 only)
             missing_indicator_names = [name for name in indicator_names if name not in cached_indicators]
             
             for variant in symbol_variants:
@@ -1108,39 +1112,40 @@ class AlertValidationDashboard:
                 for indicator_name in missing_indicator_names:
                     redis_key = f"indicators:{variant}:{indicator_name}"
                     
-                    # Try each Redis DB in priority order (DB 5 → DB 1 → DB 4)
+                    # ✅ Try each Redis DB in priority order (DB 5 → DB 1 only)
                     value = None
                     for db_name, db_client in redis_dbs:
                         if not db_client:
                             continue
                         try:
-                            # Try retrieve_by_data_type first (matches scanner storage)
-                            # ✅ FIX: Check indicators_cache (DB 5) first, then analysis_cache (DB 1) for backward compatibility
-                            if hasattr(db_client, 'retrieve_by_data_type'):
-                                try:
-                                    # Priority 1: indicators_cache (DB 5) - where scanner now stores
-                                    value = db_client.retrieve_by_data_type(redis_key, "indicators_cache")
-                                    if value:
-                                        break
-                                except Exception:
-                                    pass
-                                
-                                # Priority 2: analysis_cache (DB 1) - legacy location for backward compatibility
-                                if not value:
-                                    try:
-                                        value = db_client.retrieve_by_data_type(redis_key, "analysis_cache")
-                                        if value:
-                                            break
-                                    except Exception:
-                                        pass
+                            # ✅ STANDARDIZED: Use retrieve_by_data_type() only - no direct GET fallback
+                            # Wrap client if needed to provide retrieve_by_data_type() method
+                            wrapped_client = db_client
+                            if not hasattr(db_client, 'retrieve_by_data_type'):
+                                from redis_files.redis_client import RobustRedisClient
+                                wrapped_client = RobustRedisClient(
+                                    redis_client=db_client,
+                                    process_name="dashboard"
+                                )
                             
-                            # Fallback to direct GET
-                            if not value:
+                            # Priority 1: indicators_cache (DB 5) - PRIMARY source of truth
+                            if hasattr(wrapped_client, 'retrieve_by_data_type'):
                                 try:
-                                    value = db_client.get(redis_key)
+                                    value = wrapped_client.retrieve_by_data_type(redis_key, "indicators_cache")
                                     if value:
                                         break
-                                except Exception:
+                                except Exception as e:
+                                    logger.debug(f"Error retrieving {redis_key} from {db_name} via indicators_cache: {e}")
+                                    pass
+                            
+                            # Priority 2: analysis_cache (DB 1) - legacy location for backward compatibility
+                            if not value and hasattr(wrapped_client, 'retrieve_by_data_type'):
+                                try:
+                                    value = wrapped_client.retrieve_by_data_type(redis_key, "analysis_cache")
+                                    if value:
+                                        break
+                                except Exception as e:
+                                    logger.debug(f"Error retrieving {redis_key} from {db_name} via analysis_cache: {e}")
                                     continue
                         except Exception as e:
                             logger.debug(f"Error checking {db_name} for {redis_key}: {e}")
@@ -1230,14 +1235,14 @@ class AlertValidationDashboard:
     def _fetch_greeks_from_redis(self, symbol: str) -> dict:
         """
         ✅ SMART CACHING: Fetch Options Greeks from Redis with in-memory cache.
-        Checks cache first, then Redis (DB 5 → DB 1 → DB 4), then caches result.
+        Checks cache first, then Redis (DB 5 → DB 1), then caches result.
         
-        Redis Storage Schema:
-        - DB 5 (primary per user): indicators:{symbol}:greeks (combined dict) and indicators:{symbol}:{greek} (individual)
-        - DB 1 (realtime): indicators:{symbol}:greeks (combined dict) and indicators:{symbol}:{greek} (individual)
-        - DB 4 (fallback): Additional indicator storage
+        Redis Storage Schema (SINGLE SOURCE OF TRUTH):
+        - DB 5 (PRIMARY): indicators:{symbol}:greeks via indicators_cache data type (per redis_config.py)
+        - DB 1 (fallback): indicators:{symbol}:greeks via analysis_cache data type (legacy, backward compatibility only)
         - Format: Combined stored as JSON with {'value': {'delta': ..., 'gamma': ..., ...}, ...}
                   Individual Greeks stored as string/number
+        - DB 4 removed from architecture per redis_config.py
         """
         greeks = {}
         
@@ -1249,11 +1254,11 @@ class AlertValidationDashboard:
             if cached_value is not None:
                 cached_greeks[greek_name] = cached_value
         
-        # ✅ PRIORITY: Check DB 5 first (user confirmed indicators/Greeks are in DB 5), then DB 1, then DB 4
+        # ✅ PRIORITY: Check DB 5 first (PRIMARY - single source of truth), then DB 1 (legacy fallback only)
+        # DB 4 removed from fallback chain per redis_config.py
         redis_dbs = [
             ('DB5', self.redis_db5),
             ('DB1', self.redis_db1),
-            ('DB4', self.redis_db4),
         ]
         
         try:
@@ -1268,11 +1273,11 @@ class AlertValidationDashboard:
                 f"NSE:{symbol.split(':')[-1]}" if ':' not in symbol else symbol,
             ]
             
-            # Fetch missing Greeks from Redis (check DB 5 → DB 1 → DB 4)
+            # ✅ Fetch missing Greeks from Redis (check DB 5 → DB 1 only)
             missing_greek_names = [name for name in greek_names if name not in cached_greeks]
             
             for variant in symbol_variants:
-                # Try combined greeks key first (check DB 5 → DB 1 → DB 4)
+                # ✅ Try combined greeks key first (check DB 5 → DB 1 only)
                 greeks_key = f"indicators:{variant}:greeks"
                 greeks_data = None
                 
@@ -1280,34 +1285,35 @@ class AlertValidationDashboard:
                     if not db_client:
                         continue
                     try:
-                             # Try retrieve_by_data_type first (matches scanner storage)
-                             # ✅ FIX: Check indicators_cache (DB 5) first, then analysis_cache (DB 1) for backward compatibility
-                             if hasattr(db_client, 'retrieve_by_data_type'):
+                             # ✅ STANDARDIZED: Use retrieve_by_data_type() only - no direct GET fallback
+                             # Wrap client if needed to provide retrieve_by_data_type() method
+                             wrapped_client = db_client
+                             if not hasattr(db_client, 'retrieve_by_data_type'):
+                                 from redis_files.redis_client import RobustRedisClient
+                                 wrapped_client = RobustRedisClient(
+                                     redis_client=db_client,
+                                     process_name="dashboard"
+                                 )
+                             
+                             # Priority 1: indicators_cache (DB 5) - PRIMARY source of truth
+                             if hasattr(wrapped_client, 'retrieve_by_data_type'):
                                  try:
-                                     # Priority 1: indicators_cache (DB 5) - where scanner now stores
-                                     greeks_data = db_client.retrieve_by_data_type(greeks_key, "indicators_cache")
+                                     greeks_data = wrapped_client.retrieve_by_data_type(greeks_key, "indicators_cache")
                                      if greeks_data:
                                          break
-                                 except Exception:
+                                 except Exception as e:
+                                     logger.debug(f"Error retrieving {greeks_key} from {db_name} via indicators_cache: {e}")
                                      pass
-                                 
-                                 # Priority 2: analysis_cache (DB 1) - legacy location for backward compatibility
-                                 if not greeks_data:
-                                     try:
-                                         greeks_data = db_client.retrieve_by_data_type(greeks_key, "analysis_cache")
-                                         if greeks_data:
-                                             break
-                                     except Exception:
-                                         pass
-                                 
-                                 # Fallback to direct GET
-                                 if not greeks_data:
-                                     try:
-                                         greeks_data = db_client.get(greeks_key)
-                                         if greeks_data:
-                                             break
-                                     except Exception:
-                                         continue
+                             
+                             # Priority 2: analysis_cache (DB 1) - legacy location for backward compatibility
+                             if not greeks_data and hasattr(wrapped_client, 'retrieve_by_data_type'):
+                                 try:
+                                     greeks_data = wrapped_client.retrieve_by_data_type(greeks_key, "analysis_cache")
+                                     if greeks_data:
+                                         break
+                                 except Exception as e:
+                                     logger.debug(f"Error retrieving {greeks_key} from {db_name} via analysis_cache: {e}")
+                                     continue
                     except Exception as e:
                         logger.debug(f"Error checking {db_name} for {greeks_key}: {e}")
                         continue
@@ -1334,7 +1340,7 @@ class AlertValidationDashboard:
                     except Exception as e:
                         logger.debug(f"Error getting combined Greeks for {variant}: {e}")
                 
-                # Try individual Greeks (check DB 5 → DB 1 → DB 4)
+                # ✅ Try individual Greeks (check DB 5 → DB 1 only)
                 found_any = False
                 for greek_name in missing_greek_names:
                     greek_key = f"indicators:{variant}:{greek_name}"
@@ -1345,43 +1351,37 @@ class AlertValidationDashboard:
                         if not db_client:
                             continue
                         try:
-                                    # Try retrieve_by_data_type first
-                                    # ✅ FIX: Check indicators_cache (DB 5) first, then analysis_cache (DB 1) for backward compatibility
-                                    if hasattr(db_client, 'retrieve_by_data_type'):
-                                        try:
-                                            # Priority 1: indicators_cache (DB 5) - where scanner now stores
-                                            greek_value = db_client.retrieve_by_data_type(greek_key, "indicators_cache")
-                                            if greek_value:
-                                                break
-                                        except Exception:
-                                            pass
-                                        
-                                        # Priority 2: analysis_cache (DB 1) - legacy location for backward compatibility
-                                        if not greek_value:
-                                            try:
-                                                greek_value = db_client.retrieve_by_data_type(greek_key, "analysis_cache")
-                                                if greek_value:
-                                                    break
-                                            except Exception:
-                                                pass
-                                        
-                                        # Fallback to direct GET
-                                        if not greek_value:
-                                            try:
-                                                greek_value = db_client.get(greek_key)
-                                                if greek_value:
-                                                    break
-                                            except Exception:
-                                                continue
+                                    # ✅ STANDARDIZED: Use retrieve_by_data_type() only - no direct GET fallback
+                                    # Wrap client if needed to provide retrieve_by_data_type() method
+                                    wrapped_client = db_client
+                                    if not hasattr(db_client, 'retrieve_by_data_type'):
+                                        from redis_files.redis_client import RobustRedisClient
+                                        wrapped_client = RobustRedisClient(
+                                            redis_client=db_client,
+                                            process_name="dashboard"
+                                        )
                                     
-                                    # Fallback to direct GET if retrieve_by_data_type not available
-                                    if not greek_value:
+                                    # Priority 1: indicators_cache (DB 5) - PRIMARY source of truth
+                                    if hasattr(wrapped_client, 'retrieve_by_data_type'):
                                         try:
-                                            greek_value = db_client.get(greek_key)
+                                            greek_value = wrapped_client.retrieve_by_data_type(greek_key, "indicators_cache")
                                             if greek_value:
                                                 break
-                                        except Exception:
+                                        except Exception as e:
+                                            logger.debug(f"Error retrieving {greek_key} from {db_name} via indicators_cache: {e}")
+                                            pass
+                                    
+                                    # Priority 2: analysis_cache (DB 1) - legacy location for backward compatibility
+                                    if not greek_value and hasattr(wrapped_client, 'retrieve_by_data_type'):
+                                        try:
+                                            greek_value = wrapped_client.retrieve_by_data_type(greek_key, "analysis_cache")
+                                            if greek_value:
+                                                break
+                                        except Exception as e:
+                                            logger.debug(f"Error retrieving {greek_key} from {db_name} via analysis_cache: {e}")
                                             continue
+                                    
+                                    # ✅ STANDARDIZED: No direct GET fallback - use retrieve_by_data_type() only
                         except Exception as e:
                             logger.debug(f"Error checking {db_name} for {greek_key}: {e}")
                             continue
@@ -1524,10 +1524,10 @@ class AlertValidationDashboard:
         """Debug what indicator keys actually exist in Redis for a symbol"""
         print(f"\n🔍 DEBUGGING REDIS FOR SYMBOL: {symbol}")
         
+        # ✅ DB 4 removed from architecture - only check DB 5 (PRIMARY) and DB 1 (fallback)
         redis_clients = [
-            ("DB1", self.redis_db1),
-            ("DB4", self.redis_db4),
-            ("DB5", self.redis_db5),
+            ("DB5", self.redis_db5),  # PRIMARY - single source of truth
+            ("DB1", self.redis_db1),  # Legacy fallback
         ]
         symbol_variants = self._generate_symbol_variants(symbol)
         
@@ -1711,12 +1711,12 @@ class AlertValidationDashboard:
             # Greek names (from EnhancedGreekCalculator)
             greek_names = ['delta', 'gamma', 'theta', 'vega', 'rho']
             
-            # Check multiple databases: DB 1 (primary), DB 2 (analytics), DB 4, DB 5 (fallbacks)
+            # ✅ Check multiple databases: DB 5 (PRIMARY for indicators), DB 1 (legacy fallback), DB 2 (analytics for OHLC)
+            # DB 4 removed from architecture per redis_config.py
             redis_clients = [
-                ('DB1', self.redis_db1),  # Primary location (realtime, analysis_cache)
-                ('DB2', self.redis_db2),  # Analytics database (may have analysis_cache)
-                ('DB4', self.redis_db4),  # Fallback
-                ('DB5', self.redis_db5)   # Fallback
+                ('DB5', self.redis_db5),  # PRIMARY - indicators_cache (single source of truth)
+                ('DB1', self.redis_db1),  # Legacy fallback - analysis_cache (backward compatibility)
+                ('DB2', self.redis_db2),  # Analytics database (for OHLC data)
             ]
             
             # CRITICAL: Try using retrieve_by_data_type first (matches scanner exactly)
@@ -6843,7 +6843,7 @@ class AlertValidationDashboard:
             import time
             status = {
                 'db1_connected': self.redis_db1.ping(),
-                'db4_connected': getattr(self, 'redis_db4', None) and self.redis_db4.ping(),
+                # DB 4 removed from architecture - no longer tracked
                 'db5_connected': getattr(self, 'redis_db5', None) and self.redis_db5.ping(),
                 'stream_length': self.redis_db1.xlen("alerts:stream"),
                 'timestamp': time.time()

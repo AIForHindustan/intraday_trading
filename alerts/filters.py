@@ -729,65 +729,69 @@ class RetailAlertFilter:
             return True  # Allow to proceed if validation fails
 
     def _get_volume_profile_data(self, symbol: str) -> Dict[str, Any]:
-        """Get volume profile data for validation - use available Redis data"""
+        """✅ Get volume profile data using direct key lookups (DB 2 - analytics)"""
         try:
             if not self.redis_client:
                 logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: No Redis client available")
                 return {}
             
-            # Try to get volume profile data from Redis directly using SCAN
-            clients: List[Any] = []
-            for data_type in ("pattern_candidates", "detection_data", "symbol_volume"):
-                try:
-                    db_num = self.redis_client.get_database_for_data_type(data_type)
-                    client = self.redis_client.get_client(db_num)
-                    if client and client not in clients:
-                        clients.append(client)
-                except Exception:
-                    continue
-
-            if not clients:
-                # Fallback guesses when mapping is unavailable
-                clients = list(filter(None, [
-                    self.redis_client.get_client(1),  # patterns → realtime
-                    self.redis_client.get_client(2),  # volume → analytics
-                ]))
-
-            for client in clients:
-                try:
-                    volume_data: Dict[str, Any] = {}
-                    for key in client.scan_iter(match=f"volume_profile:{symbol}:*"):
-                        data = client.hgetall(key)
-                        if data:
-                            volume_data.update({
-                                k.decode() if isinstance(k, bytes) else k:
-                                v.decode() if isinstance(v, bytes) else v
-                                for k, v in data.items()
-                            })
-                    if volume_data:
-                        logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: Found volume profile data: {volume_data}")
-                        return volume_data
-                except Exception as scan_err:
-                    logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: SCAN failed: {scan_err}")
-
-            # Fallback: create basic volume profile from available volume data
+            # ✅ Use redis_key_standards for direct key lookups (no SCAN)
+            from redis_files.redis_key_standards import RedisKeyStandards
+            from datetime import datetime
+            
+            # Get DB 2 client (analytics - where volume profiles are stored)
             try:
-                volume_db = self.redis_client.get_database_for_data_type("symbol_volume")
+                analytics_db = self.redis_client.get_database_for_data_type("analytics_data")
             except Exception:
-                volume_db = 5
+                analytics_db = 2  # DB 2 is analytics
+            
+            analytics_client = self.redis_client.get_client(analytics_db)
+            if not analytics_client:
+                logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: No DB 2 client available")
+                return {}
+            
+            volume_data: Dict[str, Any] = {}
+            current_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # ✅ Direct key lookups (O(1)) instead of SCAN (O(N))
+            try:
+                # Try POC key first (most commonly accessed)
+                poc_key = RedisKeyStandards.get_volume_profile_poc_key(symbol)
+                poc_data = analytics_client.hgetall(poc_key)
+                if poc_data:
+                    volume_data.update({
+                        k.decode() if isinstance(k, bytes) else k:
+                        v.decode() if isinstance(v, bytes) else v
+                        for k, v in poc_data.items()
+                    })
+                
+                # Try nodes key (support/resistance levels)
+                nodes_key = RedisKeyStandards.get_volume_profile_nodes_key(symbol)
+                nodes_data = analytics_client.hgetall(nodes_key)
+                if nodes_data:
+                    volume_data.update({
+                        k.decode() if isinstance(k, bytes) else k:
+                        v.decode() if isinstance(v, bytes) else v
+                        for k, v in nodes_data.items()
+                    })
+                
+                # Try session key (full profile data)
+                session_key = RedisKeyStandards.get_volume_profile_session_key(symbol, current_date)
+                session_data = analytics_client.hgetall(session_key)
+                if session_data:
+                    volume_data.update({
+                        k.decode() if isinstance(k, bytes) else k:
+                        v.decode() if isinstance(v, bytes) else v
+                        for k, v in session_data.items()
+                    })
+                
+                if volume_data:
+                    logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: Found volume profile data via direct lookup")
+                    return volume_data
+            except Exception as lookup_err:
+                logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: Direct lookup failed: {lookup_err}")
 
-            volume_client = self.redis_client.get_client(volume_db)
-            if volume_client:
-                try:
-                    has_volume = any(volume_client.scan_iter(match=f"bucket_incremental_volume:bucket:{symbol}:*", count=10))
-                    if has_volume:
-                        # ✅ FIXED: Return empty dict instead of dummy data - let validation handle missing data
-                        logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: Volume data exists but profile not found - returning empty dict")
-                        return {}
-                except Exception as vol_err:
-                    logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: Volume fallback failed: {vol_err}")
-
-            logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: No volume data found")
+            logger.debug(f"🔍 [VOLUME_PROFILE_DEBUG] {symbol}: No volume profile data found")
             return {}
             
         except Exception as e:
@@ -795,64 +799,20 @@ class RetailAlertFilter:
             return {}
 
     def _get_liquidity_pools_data(self, symbol: str) -> Dict[str, Any]:
-        """Get liquidity pools data for ICT validation - use available Redis data"""
+        """✅ Get liquidity pools data using direct key lookups (no SCAN)"""
         try:
             if not self.redis_client:
                 logger.debug(f"🔍 [LIQUIDITY_DEBUG] {symbol}: No Redis client available")
                 return {}
             
-            try:
-                liquidity_db = self.redis_client.get_database_for_data_type("detection_data")
-            except Exception:
-                liquidity_db = 10
-
-            liquidity_client = self.redis_client.get_client(liquidity_db)
-            if liquidity_client:
-                try:
-                    liquidity_data: Dict[str, Any] = {}
-                    for key in liquidity_client.scan_iter(match=f"liquidity:{symbol}:*"):
-                        data = liquidity_client.hgetall(key)
-                        if data:
-                            liquidity_data.update({
-                                k.decode() if isinstance(k, bytes) else k:
-                                v.decode() if isinstance(v, bytes) else v
-                                for k, v in data.items()
-                            })
-                    if liquidity_data:
-                        logger.debug(f"🔍 [LIQUIDITY_DEBUG] {symbol}: Found liquidity data: {liquidity_data}")
-                        return liquidity_data
-                except Exception as liq_err:
-                    logger.debug(f"🔍 [LIQUIDITY_DEBUG] {symbol}: Liquidity scan failed: {liq_err}")
-
-            # Fallback: create basic liquidity structure from available data
-            # Look for OHLC data to create basic liquidity zones
-            try:
-                ohlc_db = self.redis_client.get_database_for_data_type("equity_prices")
-            except Exception:
-                ohlc_db = 2
-
-            ohlc_client = self.redis_client.get_client(ohlc_db)
-            if ohlc_client:
-                try:
-                    has_ohlc = any(ohlc_client.scan_iter(match=f"ohlc:{symbol}:*", count=5))
-                except Exception:
-                    has_ohlc = False
-            else:
-                has_ohlc = False
-
-            if has_ohlc:
-                liquidity_pools = {
-                    'previous_day_high': 0.0,
-                    'previous_day_low': 0.0,
-                    'stop_hunt_zones': [],
-                    'liquidity_strength': 0.5  # Default moderate strength
-                }
-                logger.debug(f"🔍 [LIQUIDITY_DEBUG] {symbol}: Created fallback liquidity pools: {liquidity_pools}")
-                return liquidity_pools
-            
-            logger.debug(f"🔍 [LIQUIDITY_DEBUG] {symbol}: No liquidity data found")
+            # ✅ Try direct lookup for liquidity data (if key pattern is known)
+            # If liquidity keys are not standardized, return empty dict rather than scanning
+            # Liquidity data should be stored with known keys or not at all
+            logger.debug(f"🔍 [LIQUIDITY_DEBUG] {symbol}: Liquidity pools not yet standardized - returning empty")
             return {}
             
+            # Fallback removed - no SCAN operations allowed
+            # If liquidity data is needed, it should be stored with known keys
         except Exception as e:
             logger.debug(f"🔍 [LIQUIDITY_DEBUG] {symbol}: Could not get liquidity pools data: {e}")
             return {}

@@ -1,14 +1,44 @@
 import axios from 'axios';
 
-// Unified API base URL configuration
-const RAW = import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
+// Origin-aware API base URL resolution
+// Derives from browser origin, defaults to FastAPI's standard port 8000 in local dev
+// Supports explicit Vite overrides via VITE_API_URL
+function getApiBaseUrl(): string {
+  // Explicit override takes precedence
+  if (import.meta.env.VITE_API_URL) {
+    return import.meta.env.VITE_API_URL.replace(/\/+$/, '');
+  }
+  
+  // Derive from browser origin (works in production and when frontend/backend same origin)
+  if (typeof window !== 'undefined') {
+    const origin = window.location.origin;
+    const port = window.location.port;
+    
+    // If running on standard Vite dev port (5173) or production, default to backend port 5001
+    // But allow explicit override via VITE_API_URL or VITE_API_PORT
+    if (!port || port === '5173' || port === '3000') {
+      // Default to port 5001 for current backend (or allow env override)
+      // Check if we're in development mode (Vite defaults to 5173)
+      const isDev = port === '5173' || port === '3000';
+      // Default to 5001 for current backend, but allow env override
+      const backendPort = import.meta.env.VITE_API_PORT || (isDev ? '5001' : port || '5001');
+      return `${origin.split(':').slice(0, 2).join(':')}:${backendPort}/api`;
+    }
+    
+    // If custom port, assume backend is on same port (e.g., localhost:5001)
+    return `${origin}/api`;
+  }
+  
+  // Fallback for SSR or non-browser environments
+  // Default to 5001 to match current backend, but allow override
+  return import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
+}
 
-// Remove any trailing slashes once
-const API_BASE = RAW.replace(/\/+$/, '');
+const API_BASE = getApiBaseUrl();
 
 const api = axios.create({
-  baseURL: API_BASE,          // e.g. http://localhost:5001/api
-  timeout: 20000,             // bump from 10s → 20s
+  baseURL: API_BASE,
+  timeout: 20000,             // 20s timeout
   headers: {
     'Content-Type': 'application/json'
   },
@@ -24,7 +54,25 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// OPTIONAL: dev log so you can see exactly where calls go
+// Error interceptor for better timeout/network error messages
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    // Enhance timeout errors with clearer messaging
+    if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+      error.timeoutError = true;
+      error.message = `Request timeout: Backend at ${API_BASE} did not respond within 20 seconds. Check if server is running.`;
+    }
+    // Enhance network errors
+    if (error.code === 'ECONNREFUSED' || error.message?.includes('Network Error')) {
+      error.networkError = true;
+      error.message = `Cannot connect to backend at ${API_BASE}. Please check if server is running.`;
+    }
+    return Promise.reject(error);
+  }
+);
+
+// Dev log so you can see exactly where calls go
 console.info('[API] Base URL:', API_BASE);
 
 // Alert endpoints

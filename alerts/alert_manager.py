@@ -5,11 +5,22 @@ Alert Manager - Core Alert Processing Pipeline
 Core alert management functionality with conflict resolution and pattern-specific thresholds.
 Consolidated from scanner/alert_manager.py.
 
-Classes:
-- AlertManager: Base alert management
-- EnhancedAlertManager: Enhanced with conflict resolution
-- ProductionAlertManager: Production-ready alert manager
+Class Hierarchy (all classes are actively used):
+- AlertManager: Base alert management with basic filtering and validation
+- EnhancedAlertManager(AlertManager): Enhanced with conflict resolution and pattern-specific thresholds
+- ProductionAlertManager(EnhancedAlertManager): Production-ready alert manager with RiskManager integration
 - AlertConflictResolver: Resolves conflicts between pattern detectors
+
+Usage:
+- scanner_main.py uses ProductionAlertManager (full production stack)
+- All classes form a hierarchy - base functionality → enhanced → production
+
+Architecture:
+- Fetches indicators from DB 5 (PRIMARY) via indicators_cache data type
+- Falls back to DB 1 (legacy) via analysis_cache data type
+- DB 4 fallback removed (not part of new architecture per redis_config.py)
+- Uses centralized Redis client management (RedisManager82)
+- Implements should_send_premarket_alert() by delegating to alerts.filters
 
 Created: October 9, 2025
 """
@@ -20,11 +31,7 @@ import json
 import time
 import logging
 import threading
-import subprocess
 import re
-import glob
-import calendar
-import requests
 import redis
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
@@ -104,10 +111,9 @@ project_root = os.path.dirname(
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-try:
-    from redis_files.redis_calculations import RedisCalculations
-except ImportError:
-    RedisCalculations = None
+# REMOVED: RedisCalculations import - was unused
+# Purpose: Was intended to provide in-server calculations via Lua for performance
+# Status: Never actually used - HybridCalculations handles all calculations
 
 # Load threshold configuration from consolidated config
 try:
@@ -1347,12 +1353,10 @@ class EnhancedAlertManager(AlertManager):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._load_alert_thresholds()
-        self.redis_calculations = None
-        if self.redis_client and RedisCalculations:
-            try:
-                self.redis_calculations = RedisCalculations(self.redis_client)
-            except Exception as e:
-                logger.debug(f"⚠️ Failed to initialize RedisCalculations: {e}")
+        # REMOVED: self.redis_calculations - was initializing unused RedisCalculations
+        # Purpose: Was intended to provide in-server calculations via Lua for performance
+        # Status: Never actually used - HybridCalculations handles all calculations
+        # Impact: Removed to eliminate dead code and initialization overhead
     
     def _load_alert_thresholds(self):
         """Load alert thresholds from config/thresholds.py (single source of truth)."""
@@ -1567,12 +1571,11 @@ class EnhancedAlertManager(AlertManager):
     def _fetch_basic_indicators_from_redis(self, symbol: str) -> Dict[str, Any]:
         """
         ✅ SMART CACHING: Fetch indicators from Redis with in-memory cache.
-        Checks cache first, then Redis (DB 5 → DB 1 → DB 4), then caches result.
+        Checks cache first, then Redis (DB 5 → DB 1), then caches result.
         
         Redis Storage Schema (SINGLE SOURCE OF TRUTH):
         - DB 5 (PRIMARY): indicators:{symbol}:{indicator_name} via indicators_cache data type (per redis_config.py)
-        - DB 1 (fallback): indicators:{symbol}:{indicator_name} via analysis_cache data type (legacy, backward compatibility)
-        - DB 4 (fallback): Additional indicator storage
+        - DB 1 (fallback): indicators:{symbol}:{indicator_name} via analysis_cache data type (legacy, backward compatibility only)
         - Format: Simple indicators (RSI, EMA, ATR, VWAP) stored as string/number
                   Complex indicators (MACD, BB) stored as JSON with {'value': {...}, 'timestamp': ..., 'symbol': ...}
         - TTL: 300 seconds (5 minutes) for all indicators
@@ -1600,18 +1603,16 @@ class EnhancedAlertManager(AlertManager):
             if len(cached_indicators) == len(indicator_names):
                 return cached_indicators
             
-            # Get Redis clients for DB 5 (primary), DB 1 (fallback), DB 4 (fallback)
+            # ✅ Get Redis clients for DB 5 (primary) and DB 1 (fallback only)
+            # DB 4 fallback removed - not part of new architecture per redis_config.py
             redis_db5 = self.redis_client.get_client(5) if hasattr(self.redis_client, 'get_client') else None
             redis_db1 = self.redis_client.get_client(1) if hasattr(self.redis_client, 'get_client') else self.redis_client
-            redis_db4 = self.redis_client.get_client(4) if hasattr(self.redis_client, 'get_client') else None
             
-            # ✅ PRIORITY: Check DB 5 first (user confirmed indicators are in DB 5)
+            # ✅ PRIORITY: Check DB 5 first (PRIMARY - single source of truth), then DB 1 (legacy fallback)
             redis_clients = []
             if redis_db5:
                 redis_clients.append(('DB5', redis_db5))
             redis_clients.append(('DB1', redis_db1))
-            if redis_db4:
-                redis_clients.append(('DB4', redis_db4))
             
             # Normalize symbol for Redis key lookup (same variants as dashboard)
             symbol_variants = [
@@ -1624,7 +1625,8 @@ class EnhancedAlertManager(AlertManager):
             # Merge cached indicators into result
             indicators.update(cached_indicators)
             
-            # Fetch missing indicators from Redis (check DB 5 → DB 1 → DB 4)
+            # ✅ Fetch missing indicators from Redis (check DB 5 → DB 1 only)
+            # DB 4 removed from fallback chain per new architecture
             missing_indicator_names = [name for name in indicator_names if name not in cached_indicators]
             
             for variant in symbol_variants:
@@ -1632,26 +1634,29 @@ class EnhancedAlertManager(AlertManager):
                 for indicator_name in missing_indicator_names:
                     redis_key = f"indicators:{variant}:{indicator_name}"
                     
-                    # Try each Redis DB in priority order (DB 5 → DB 1 → DB 4)
+                    # ✅ Try each Redis DB in priority order (DB 5 → DB 1 only)
                     value = None
                     for db_name, redis_client in redis_clients:
                         try:
-                            # Try retrieve_by_data_type first (matches scanner storage)
-                            if hasattr(redis_client, 'retrieve_by_data_type'):
-                                try:
-                                    value = redis_client.retrieve_by_data_type(redis_key, "analysis_cache")
-                                    if value:
-                                        break
-                                except Exception:
-                                    pass
+                            # ✅ STANDARDIZED: Use retrieve_by_data_type() only - no direct GET fallback
+                            # Wrap client if needed to provide retrieve_by_data_type() method
+                            wrapped_client = redis_client
+                            if not hasattr(redis_client, 'retrieve_by_data_type'):
+                                from redis_files.redis_client import RobustRedisClient
+                                wrapped_client = RobustRedisClient(
+                                    redis_client=redis_client,
+                                    process_name="alert_manager"
+                                )
                             
-                            # Fallback to direct GET
-                            if not value:
+                            # DB 5 uses "indicators_cache" (PRIMARY), DB 1 uses "analysis_cache" (legacy)
+                            data_type = "indicators_cache" if db_name == "DB5" else "analysis_cache"
+                            if hasattr(wrapped_client, 'retrieve_by_data_type'):
                                 try:
-                                    value = redis_client.get(redis_key)
+                                    value = wrapped_client.retrieve_by_data_type(redis_key, data_type)
                                     if value:
                                         break
-                                except Exception:
+                                except Exception as e:
+                                    logger.debug(f"Error retrieving {redis_key} from {db_name} via retrieve_by_data_type: {e}")
                                     continue
                         except Exception as e:
                             logger.debug(f"Error checking {db_name} for {redis_key}: {e}")
@@ -1743,12 +1748,32 @@ class EnhancedAlertManager(AlertManager):
             # Greek fields to fetch
             greek_names = ['delta', 'gamma', 'theta', 'vega', 'rho']
             
+            # ✅ STANDARDIZED: Use retrieve_by_data_type() for all Greeks retrieval
+            # Wrap client if needed to provide retrieve_by_data_type() method
+            wrapped_client = redis_client
+            if not hasattr(redis_client, 'retrieve_by_data_type'):
+                from redis_files.redis_client import RobustRedisClient
+                wrapped_client = RobustRedisClient(
+                    redis_client=redis_client,
+                    process_name="alert_manager"
+                )
+            
             # Try each symbol variant
             for variant in symbol_variants:
                 # Try combined greeks first (preferred format)
                 greeks_key = f"indicators:{variant}:greeks"
                 try:
-                    greeks_data = redis_client.get(greeks_key)
+                    # ✅ STANDARDIZED: Use retrieve_by_data_type() - PRIMARY DB 5, fallback DB 1
+                    greeks_data = None
+                    
+                    # Try indicators_cache (DB 5) first - PRIMARY source of truth
+                    if hasattr(wrapped_client, 'retrieve_by_data_type'):
+                        greeks_data = wrapped_client.retrieve_by_data_type(greeks_key, "indicators_cache")
+                    
+                    # Fallback to analysis_cache (DB 1) for backward compatibility
+                    if not greeks_data and hasattr(wrapped_client, 'retrieve_by_data_type'):
+                        greeks_data = wrapped_client.retrieve_by_data_type(greeks_key, "analysis_cache")
+                    
                     if greeks_data:
                         if isinstance(greeks_data, bytes):
                             greeks_data = greeks_data.decode('utf-8')
@@ -1765,14 +1790,24 @@ class EnhancedAlertManager(AlertManager):
                                 greeks.update(parsed)
                             break  # Found combined greeks, no need to try individual
                 except Exception as e:
-                    logger.debug(f"Error getting combined Greeks for {variant}: {e}")
+                    logger.debug(f"Error retrieving combined Greeks for {variant}: {e}")
                 
                 # Try individual Greeks if combined not found
                 found_any = False
                 for greek_name in greek_names:
                     greek_key = f"indicators:{variant}:{greek_name}"
                     try:
-                        greek_value = redis_client.get(greek_key)
+                        # ✅ STANDARDIZED: Use retrieve_by_data_type() - PRIMARY DB 5, fallback DB 1
+                        greek_value = None
+                        
+                        # Try indicators_cache (DB 5) first - PRIMARY source of truth
+                        if hasattr(wrapped_client, 'retrieve_by_data_type'):
+                            greek_value = wrapped_client.retrieve_by_data_type(greek_key, "indicators_cache")
+                        
+                        # Fallback to analysis_cache (DB 1) for backward compatibility
+                        if not greek_value and hasattr(wrapped_client, 'retrieve_by_data_type'):
+                            greek_value = wrapped_client.retrieve_by_data_type(greek_key, "analysis_cache")
+                        
                         if greek_value:
                             if isinstance(greek_value, bytes):
                                 greek_value = greek_value.decode('utf-8')
@@ -1792,7 +1827,7 @@ class EnhancedAlertManager(AlertManager):
                                     greeks[greek_name] = greek_value
                             found_any = True
                     except Exception as e:
-                        logger.debug(f"Error getting {greek_name} for {variant}: {e}")
+                        logger.debug(f"Error retrieving Greek {greek_name} for {variant}: {e}")
                 
                 if found_any or greeks:
                     break  # Found Greeks for this variant
@@ -2286,6 +2321,21 @@ class ProductionAlertManager(EnhancedAlertManager):
             return True
         logger.warning(f"Alert {alert_data.get('pattern')} failed validation (confidence {confidence})")
         return False
+    
+    def should_send_premarket_alert(self, premarket_data: Dict[str, Any]) -> bool:
+        """
+        ✅ Check if premarket alert should be sent.
+        Delegates to standalone function in filters.py for consistency.
+        """
+        try:
+            from alerts.filters import should_send_premarket_alert as filter_should_send
+            # Extract indicator from premarket_data if needed
+            indicator = premarket_data.get('indicator') if isinstance(premarket_data, dict) else premarket_data
+            return filter_should_send(indicator)
+        except ImportError:
+            logger.warning("Could not import should_send_premarket_alert from filters, using default logic")
+            # Default: allow premarket alerts
+            return True
 
     def _prepare_alert(self, pattern: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Normalize and enrich alert payload prior to delivery."""

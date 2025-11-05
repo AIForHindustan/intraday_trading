@@ -1,9 +1,11 @@
 import React from 'react';
 import { Box, Grid, Paper, Typography, Card, CardContent, Divider } from '@mui/material';
 import AlertList from './AlertList';
-import { alertsAPI, newsAPI } from '../services/api';
+import PriceChart from './PriceChart';
+import { alertsAPI, newsAPI, chartsAPI } from '../services/api';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { adaptOhlcPayload, adaptOverlays } from '../services/adapters';
 
 interface QuickStats {
   total_alerts: number;
@@ -26,13 +28,17 @@ interface NewsItem {
 const Dashboard: React.FC = () => {
   const [quickStats, setQuickStats] = useState<QuickStats | null>(null);
   const [recentNews, setRecentNews] = useState<NewsItem[]>([]);
+  const [chartData, setChartData] = useState<any>(null);
+  const [chartSymbol, setChartSymbol] = useState<string>('NIFTY');
 
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
-        const [statsRes, newsRes] = await Promise.all([
+        // First fetch stats and alerts to get a real symbol for the chart
+        const [statsRes, alertsRes, newsRes] = await Promise.all([
           alertsAPI.getStats(),
+          alertsAPI.getAll({ limit: 10 }).catch(() => ({ data: { alerts: [] } })),
           newsAPI.getLatestMarket().catch(() => ({ data: [] }))
         ]);
         if (!mounted) return;
@@ -48,6 +54,34 @@ const Dashboard: React.FC = () => {
         // Set recent news (limit to 5)
         const news = Array.isArray(newsRes.data) ? newsRes.data.slice(0, 5) : [];
         setRecentNews(news);
+        
+        // Get symbol from first alert if available, otherwise use default
+        const alerts = alertsRes.data?.alerts || [];
+        const symbolForChart = alerts.length > 0 
+          ? (alerts[0].base_symbol || alerts[0].symbol || chartSymbol)
+          : chartSymbol;
+        
+        // Fetch chart data for the symbol
+        try {
+          const chartRes = await chartsAPI.getData(symbolForChart, { include_indicators: true });
+          if (mounted && chartRes.data) {
+            setChartData(chartRes.data);
+            setChartSymbol(symbolForChart);
+          }
+        } catch (chartErr) {
+          console.warn(`Failed to fetch chart data for ${symbolForChart}:`, chartErr);
+          // Try with default symbol if first attempt failed
+          if (symbolForChart !== chartSymbol) {
+            try {
+              const fallbackChartRes = await chartsAPI.getData(chartSymbol, { include_indicators: true });
+              if (mounted && fallbackChartRes.data) {
+                setChartData(fallbackChartRes.data);
+              }
+            } catch {
+              // Ignore fallback errors
+            }
+          }
+        }
       } catch (err) {
         console.error('Failed to fetch dashboard data', err);
         if (mounted) {
@@ -125,6 +159,56 @@ const Dashboard: React.FC = () => {
           </Card>
         </Grid>
       </Grid>
+
+      {/* Chart Section */}
+      <Paper sx={{ p: 2, mb: 3 }}>
+        <Typography variant="h6" gutterBottom>
+          Market Chart - {chartSymbol}
+        </Typography>
+        {chartData ? (() => {
+          const ohlc = adaptOhlcPayload(chartData);
+          const overlay = adaptOverlays(chartData);
+          const ema = overlay.ema_20?.length > 0 ? {
+            ema_20: overlay.ema_20,
+            ema_50: overlay.ema_50,
+            ema_100: overlay.ema_100,
+            ema_200: overlay.ema_200,
+          } : undefined;
+          const vwap = overlay.vwap;
+          
+          if (ohlc.length > 0) {
+            return (
+              <Box sx={{ width: '100%', height: 400 }}>
+                <PriceChart 
+                  ohlc={ohlc} 
+                  ema={ema} 
+                  vwap={vwap} 
+                  height={400}
+                  symbol={chartSymbol}
+                  enableRealtime={true}
+                />
+              </Box>
+            );
+          } else {
+            return (
+              <Box sx={{ p: 3, textAlign: 'center', height: 400, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Typography variant="body1" color="text.secondary">
+                  No chart data available for {chartSymbol}
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                  Chart data will appear here once market data is available
+                </Typography>
+              </Box>
+            );
+          }
+        })() : (
+          <Box sx={{ p: 3, textAlign: 'center', height: 400, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Typography variant="body1" color="text.secondary">
+              Loading chart data...
+            </Typography>
+          </Box>
+        )}
+      </Paper>
 
       {/* Two Column Layout: Alerts + News */}
       <Grid container spacing={2}>

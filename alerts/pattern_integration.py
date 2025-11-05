@@ -1,4 +1,9 @@
 # dashboard/pattern_integration.py
+import redis
+import json
+from typing import List, Dict
+import pandas as pd
+
 class PatternVisualization:
     def __init__(self):
         self.redis = redis.Redis()

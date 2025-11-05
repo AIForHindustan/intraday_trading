@@ -319,7 +319,7 @@ class ConnectionPooledRedisClient:
 
 
 class RobustRedisClient:
-    """Consolidated Redis client with circuit breaker and Redis-powered calculations"""
+    """Consolidated Redis client with circuit breaker"""
 
     def __init__(
         self,
@@ -416,25 +416,14 @@ class RobustRedisClient:
         self.cumulative_tracker = CumulativeDataTracker(self)
         self._fallback_session = datetime.now().strftime("%Y-%m-%d")
 
-        # Initialize Redis-powered calculations
-        self._init_redis_calculations()
-
         # Initial connection
         logger.info("Initializing Redis connection...")
         self._connect()
     
-    def _init_redis_calculations(self):
-        """Initialize Redis-powered calculations"""
-        try:
-            from redis_files.redis_calculations import RedisCalculations
-            self.calculations = RedisCalculations(self)
-            logger.info("✅ Redis calculations initialized")
-        except ImportError as e:
-            logger.warning(f"Redis calculations not available: {e}")
-            self.calculations = None
-        except Exception as e:
-            logger.warning(f"Redis calculations initialization failed: {e}")
-            self.calculations = None
+    # REMOVED: _init_redis_calculations() - was initializing unused RedisCalculations
+    # Purpose: Was intended to provide in-server calculations via Lua for performance
+    # Status: Never actually used - HybridCalculations handles all calculations
+    # Impact: Removed to eliminate dead code and initialization overhead
 
     @property
     def current_session(self) -> str:

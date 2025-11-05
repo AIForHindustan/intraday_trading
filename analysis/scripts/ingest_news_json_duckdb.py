@@ -46,55 +46,205 @@ def ensure_news_schema(conn: duckdb.DuckDBPyConnection):
     conn.execute(schema_sql)
 
 
-def extract_symbols_from_text(text: str, token_cache=None) -> List[str]:
-    """Extract stock symbols from news text using token cache - optimized"""
+def extract_underlying_symbol(symbol: str) -> str:
+    """Extract underlying symbol from option/future symbols"""
+    if not symbol:
+        return symbol
+    
+    symbol_upper = symbol.upper()
+    
+    # Remove exchange prefixes
+    if ':' in symbol_upper:
+        symbol_upper = symbol_upper.split(':')[-1]
+    
+    # Check for index names first (BANKNIFTY, NIFTY, etc.)
+    index_match = re.search(r'(BANKNIFTY|NIFTY|FINNIFTY|MIDCPNIFTY)', symbol_upper)
+    if index_match:
+        return index_match.group(1)
+    
+    # For options (CE/PE), extract everything before the date pattern
+    if 'CE' in symbol_upper or 'PE' in symbol_upper:
+        # Pattern: SYMBOL + DDMMM + STRIKE + CE/PE (e.g., BANKNIFTY25OCT23400CE)
+        match = re.search(r'^([A-Z]+)\d{2}[A-Z]{3}', symbol_upper)
+        if match:
+            return match.group(1)
+        # Fallback: extract before digits
+        match = re.search(r'^([A-Z]+)\d', symbol_upper)
+        if match:
+            return match.group(1)
+    
+    # For futures (FUT), extract everything before the date
+    if symbol_upper.endswith('FUT'):
+        match = re.search(r'^([A-Z]+)\d', symbol_upper)
+        if match:
+            return match.group(1)
+    
+    return symbol_upper
+
+
+def get_sector_from_symbol(symbol: str, token_cache=None) -> str:
+    """Map symbol to sector based on naming patterns and token cache"""
+    if not symbol:
+        return ""
+    
+    symbol_upper = symbol.upper()
+    
+    # Bank sector indicators
+    bank_keywords = ['BANK', 'HDFC', 'ICICI', 'SBI', 'AXIS', 'KOTAK', 'INDUSIND', 
+                     'YESBANK', 'FEDERAL', 'IDFC', 'BANDHAN', 'RBL', 'UNION',
+                     'PNB', 'CANARA', 'BANKOFBARODA', 'BANKOFINDIA']
+    
+    # IT sector indicators
+    it_keywords = ['INFOSYS', 'TCS', 'WIPRO', 'HCL', 'TECHMAHINDRA', 'LTIM', 
+                   'LTTS', 'PERSISTENT', 'MINDTREE', 'COFORGE', 'MPHASIS']
+    
+    # Auto sector indicators
+    auto_keywords = ['MARUTI', 'M&M', 'TATA', 'MOTORS', 'BAJAJ', 'HERO', 
+                     'EICHER', 'ASHOK', 'LEYLAND', 'TVS', 'MOTHERSUM']
+    
+    # Pharma sector indicators
+    pharma_keywords = ['SUNPHARMA', 'DRREDDY', 'CIPLA', 'LUPIN', 'TORRENT', 
+                       'AUROBINDO', 'DIVIS', 'GLENMARK', 'CADILA']
+    
+    # FMCG sector indicators
+    fmcg_keywords = ['HUL', 'ITC', 'NESTLE', 'DABUR', 'MARICO', 'BRITANNIA', 
+                     'GODREJ', 'TATA', 'CONSUMER']
+    
+    # Energy sector indicators
+    energy_keywords = ['RELIANCE', 'ONGC', 'GAIL', 'IOC', 'BPCL', 'HPCL', 
+                       'OIL', 'PETRONET']
+    
+    # Metal sector indicators
+    metal_keywords = ['TATASTEEL', 'JSWSTEEL', 'SAIL', 'JINDAL', 'VEDANTA', 
+                      'HINDALCO', 'NMDC']
+    
+    # Check symbol against keywords
+    for keyword in bank_keywords:
+        if keyword in symbol_upper:
+            return "BANK"
+    
+    for keyword in it_keywords:
+        if keyword in symbol_upper:
+            return "IT"
+    
+    for keyword in auto_keywords:
+        if keyword in symbol_upper:
+            return "AUTO"
+    
+    for keyword in pharma_keywords:
+        if keyword in symbol_upper:
+            return "PHARMA"
+    
+    for keyword in fmcg_keywords:
+        if keyword in symbol_upper:
+            return "FMCG"
+    
+    for keyword in energy_keywords:
+        if keyword in symbol_upper:
+            return "ENERGY"
+    
+    for keyword in metal_keywords:
+        if keyword in symbol_upper:
+            return "METAL"
+    
+    # Check token cache for instrument_type if available
+    if token_cache:
+        token = token_cache.symbol_to_token(symbol)
+        if token:
+            info = token_cache.get_instrument_info(token)
+            inst_type = info.get('instrument_type', '')
+            if inst_type == 'EQ':
+                # Try to infer from symbol name patterns
+                if any(kw in symbol_upper for kw in bank_keywords):
+                    return "BANK"
+                elif any(kw in symbol_upper for kw in it_keywords):
+                    return "IT"
+    
+    return ""
+
+
+def extract_symbols_from_text(text: str, token_cache=None) -> Dict[str, Any]:
+    """
+    Extract stock symbols from news text with sector categorization.
+    Returns dict with 'symbols', 'sectors', and 'sub_categories'.
+    """
     if not text:
-        return []
+        return {'symbols': [], 'sectors': [], 'sub_categories': []}
     
     symbols = set()
+    sectors = set()
+    sub_categories = set()
     text_upper = text.upper()
-    text_words = set(text_upper.split())
     
     # If token_cache available, use optimized lookup
     if token_cache:
-        # Build word set for fast lookup
-        # Check symbols directly from token cache
-        # Only check symbols that are likely to be in the text
         checked_symbols = set()
         
-        # First, extract potential symbol patterns from text (uppercase words 2-10 chars)
+        # Extract potential symbol patterns from text (uppercase words 2-15 chars)
         potential_symbols = set()
-        pattern = r'\b([A-Z]{2,10})\b'
+        pattern = r'\b([A-Z]{2,15})\b'
         matches = re.findall(pattern, text_upper)
         common_words = {
             'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS', 'ONE',
             'OUR', 'OUT', 'DAY', 'GET', 'HAS', 'HIM', 'HIS', 'HOW', 'ITS', 'MAY', 'NEW', 'NOW',
             'OLD', 'SEE', 'TWO', 'WAY', 'WHO', 'BOY', 'DID', 'LET', 'PUT', 'SAY',
-            'SHE', 'TOO', 'USE', 'NSE', 'BSE', 'FII', 'DII', 'IPO', 'EPS', 'PEG', 'PE', 'ROI'
+            'SHE', 'TOO', 'USE', 'NSE', 'BSE', 'FII', 'DII', 'IPO', 'EPS', 'PEG', 'PE', 'ROI',
+            'WITH', 'FROM', 'THIS', 'THAT', 'THAN', 'THEY', 'WHAT', 'WHEN', 'WHERE', 'WHICH'
         }
         
         for match in matches:
             if match not in common_words and len(match) >= 2:
                 potential_symbols.add(match)
         
-        # Now check if these potential symbols exist in token cache
+        # Check for option/future symbols (longer patterns)
+        option_pattern = r'\b([A-Z]+\d{2}[A-Z]{3}\d+(?:CE|PE|FUT))\b'
+        option_matches = re.findall(option_pattern, text_upper)
+        for opt_match in option_matches:
+            potential_symbols.add(opt_match)
+        
+        # Now process each potential symbol
         for potential in potential_symbols:
             if potential in checked_symbols:
                 continue
             checked_symbols.add(potential)
             
-            # Check if symbol exists in token cache
-            token = token_cache.symbol_to_token(potential)
+            # Check if it's an option/future and extract underlying
+            underlying = extract_underlying_symbol(potential)
+            
+            # Check if underlying exists in token cache
+            token = token_cache.symbol_to_token(underlying)
             if token:
+                symbols.add(underlying)  # Use underlying symbol, not the option
+                
+                # Get sector for underlying
+                sector = get_sector_from_symbol(underlying, token_cache)
+                if sector:
+                    sectors.add(sector)
+                    sub_categories.add(underlying)  # Add underlying as sub-category
+            elif token_cache.symbol_to_token(potential):
+                # Direct symbol match (equity)
                 symbols.add(potential)
+                sector = get_sector_from_symbol(potential, token_cache)
+                if sector:
+                    sectors.add(sector)
+                    sub_categories.add(potential)
         
-        # Also check for common index patterns
+        # Check for common index patterns
         if 'BANKNIFTY' in text_upper or 'BANK NIFTY' in text_upper:
             symbols.add('BANKNIFTY')
-        if 'NIFTY' in text_upper and '50' in text_upper:
+            sectors.add('BANK')
+        if 'NIFTY' in text_upper:
             symbols.add('NIFTY')
+            sectors.add('INDEX')
+        if 'FINNIFTY' in text_upper:
+            symbols.add('FINNIFTY')
+            sectors.add('INDEX')
         
-        return list(symbols)[:20]  # Limit to 20 symbols per news item
+        return {
+            'symbols': list(symbols)[:20],
+            'sectors': list(sectors),
+            'sub_categories': list(sub_categories)[:20]
+        }
     
     # Fallback: basic pattern matching
     pattern = r'\b([A-Z]{2,10})\b'
@@ -110,8 +260,16 @@ def extract_symbols_from_text(text: str, token_cache=None) -> List[str]:
     for match in matches:
         if match not in common_words and len(match) >= 2:
             symbols.add(match)
+            sector = get_sector_from_symbol(match)
+            if sector:
+                sectors.add(sector)
+                sub_categories.add(match)
     
-    return list(symbols)[:10]
+    return {
+        'symbols': list(symbols)[:10],
+        'sectors': list(sectors),
+        'sub_categories': list(sub_categories)[:10]
+    }
 
 
 def normalize_sentiment(sentiment: Any) -> tuple:
@@ -240,7 +398,11 @@ def ingest_news_json_file(
                 if 'description' in item:
                     content += ' ' + str(item['description'])
                 
-                symbols = extract_symbols_from_text(content, token_cache)
+                # Extract symbols with sector categorization
+                symbol_data = extract_symbols_from_text(content, token_cache)
+                symbols = symbol_data.get('symbols', [])
+                extracted_sectors = symbol_data.get('sectors', [])
+                sub_categories = symbol_data.get('sub_categories', [])
                 
                 # Parse sentiment
                 sentiment_data = item.get('sentiment') or item.get('sentiment_score')
@@ -259,31 +421,53 @@ def ingest_news_json_file(
                 # Market impact and sector
                 market_impact = item.get('market_impact', 'LOW')
                 
-                # Handle sector_relevance - could be list or string
+                # Build comprehensive sector_relevance structure
+                # Format: {"sectors": ["BANK", "IT"], "symbols": ["HDFCBANK", "INFY"], "sub_categories": ["HDFCBANK", "ICICIBANK"]}
+                sector_relevance_dict = {
+                    "sectors": list(extracted_sectors),
+                    "symbols": symbols,
+                    "sub_categories": sub_categories
+                }
+                
+                # Merge with existing sector_relevance if present
                 sector_relevance_raw = item.get('sector_relevance') or item.get('sector') or []
                 if isinstance(sector_relevance_raw, list):
-                    sector_relevance = json.dumps(sector_relevance_raw)
+                    # Merge existing sectors
+                    for existing in sector_relevance_raw:
+                        if isinstance(existing, str):
+                            if existing not in sector_relevance_dict["sectors"]:
+                                sector_relevance_dict["sectors"].append(existing)
+                            if existing not in sector_relevance_dict["symbols"]:
+                                sector_relevance_dict["symbols"].append(existing)
                 elif isinstance(sector_relevance_raw, str):
-                    # Try to parse if it's JSON string
                     try:
                         parsed = json.loads(sector_relevance_raw)
-                        if isinstance(parsed, list):
-                            sector_relevance = json.dumps(parsed)
-                        else:
-                            sector_relevance = json.dumps([sector_relevance_raw])
+                        if isinstance(parsed, dict):
+                            # Merge with existing structure
+                            if "sectors" in parsed:
+                                sector_relevance_dict["sectors"].extend(parsed["sectors"])
+                            if "symbols" in parsed:
+                                sector_relevance_dict["symbols"].extend(parsed["symbols"])
+                            if "sub_categories" in parsed:
+                                sector_relevance_dict["sub_categories"].extend(parsed["sub_categories"])
+                        elif isinstance(parsed, list):
+                            for item in parsed:
+                                if isinstance(item, str):
+                                    if item not in sector_relevance_dict["sectors"]:
+                                        sector_relevance_dict["sectors"].append(item)
+                                    if item not in sector_relevance_dict["symbols"]:
+                                        sector_relevance_dict["symbols"].append(item)
                     except:
-                        sector_relevance = json.dumps([sector_relevance_raw])
-                else:
-                    sector_relevance = json.dumps([])
+                        # Treat as plain string
+                        if sector_relevance_raw not in sector_relevance_dict["sectors"]:
+                            sector_relevance_dict["sectors"].append(sector_relevance_raw)
                 
-                # Add extracted symbols to sector_relevance
-                if symbols:
-                    sector_list = json.loads(sector_relevance) if sector_relevance else []
-                    # Add symbols if not already present
-                    for sym in symbols:
-                        if sym not in sector_list:
-                            sector_list.append(sym)
-                    sector_relevance = json.dumps(sector_list)
+                # Remove duplicates and convert to JSON
+                sector_relevance_dict["sectors"] = list(set(sector_relevance_dict["sectors"]))
+                sector_relevance_dict["symbols"] = list(set(sector_relevance_dict["symbols"]))
+                sector_relevance_dict["sub_categories"] = list(set(sector_relevance_dict["sub_categories"]))
+                
+                sector_relevance = json.dumps(sector_relevance_dict)
                 
                 # Generate ID
                 news_id = item.get('id') or generate_news_id(item)
@@ -367,6 +551,116 @@ def get_pending_news_files(db_path: str, search_dirs: List[str] = None) -> List[
     return sorted(news_files)
 
 
+def update_existing_news_sectors(conn: duckdb.DuckDBPyConnection, token_cache=None, batch_size: int = 1000, dry_run: bool = False) -> dict:
+    """Update existing news records with new sector categorization"""
+    logger.info("Starting update of existing news records with new sector categorization...")
+    
+    # Get all news items that need updating
+    try:
+        news_items = conn.execute("""
+            SELECT id, title, link, sector_relevance
+            FROM news_data
+            WHERE sector_relevance IS NOT NULL
+        """).fetchall()
+    except Exception as e:
+        logger.error(f"Error fetching news items: {e}")
+        return {"success": False, "error": str(e), "updated": 0}
+    
+    total_items = len(news_items)
+    logger.info(f"Found {total_items:,} news items to potentially update")
+    
+    updated_count = 0
+    skipped_count = 0
+    
+    for i, (news_id, title, link, old_sector_rel) in enumerate(news_items):
+        try:
+            # Check if already in new format
+            if old_sector_rel:
+                try:
+                    parsed = json.loads(old_sector_rel)
+                    if isinstance(parsed, dict) and "sectors" in parsed and "symbols" in parsed:
+                        skipped_count += 1
+                        if i % 10000 == 0:
+                            logger.info(f"Progress: {i}/{total_items} (skipped: {skipped_count}, updated: {updated_count})")
+                        continue
+                except:
+                    pass
+            
+            # Re-extract symbols and sectors from title
+            content = title or ""
+            if link:
+                # Sometimes link contains useful info
+                content += " " + str(link)
+            
+            # Extract symbols with sector categorization
+            symbol_data = extract_symbols_from_text(content, token_cache)
+            symbols = symbol_data.get('symbols', [])
+            extracted_sectors = symbol_data.get('sectors', [])
+            sub_categories = symbol_data.get('sub_categories', [])
+            
+            # Build new sector_relevance structure
+            sector_relevance_dict = {
+                "sectors": list(extracted_sectors),
+                "symbols": symbols,
+                "sub_categories": sub_categories
+            }
+            
+            # Try to merge with old data if it exists
+            if old_sector_rel:
+                try:
+                    old_parsed = json.loads(old_sector_rel)
+                    if isinstance(old_parsed, list):
+                        # Old format: list of sectors
+                        for old_sector in old_parsed:
+                            if isinstance(old_sector, str) and old_sector.upper() not in [s.upper() for s in sector_relevance_dict["sectors"]]:
+                                sector_relevance_dict["sectors"].append(old_sector.upper())
+                    elif isinstance(old_parsed, str):
+                        # Plain string
+                        if old_parsed.upper() not in [s.upper() for s in sector_relevance_dict["sectors"]]:
+                            sector_relevance_dict["sectors"].append(old_parsed.upper())
+                except:
+                    # If parsing fails, ignore old data
+                    pass
+            
+            # Remove duplicates
+            sector_relevance_dict["sectors"] = list(set(sector_relevance_dict["sectors"]))
+            sector_relevance_dict["symbols"] = list(set(sector_relevance_dict["symbols"]))
+            sector_relevance_dict["sub_categories"] = list(set(sector_relevance_dict["sub_categories"]))
+            
+            new_sector_rel = json.dumps(sector_relevance_dict)
+            
+            if not dry_run:
+                # Update the record
+                conn.execute("""
+                    UPDATE news_data
+                    SET sector_relevance = ?
+                    WHERE id = ?
+                """, (new_sector_rel, news_id))
+            
+            updated_count += 1
+            
+            if (i + 1) % batch_size == 0:
+                if not dry_run:
+                    conn.commit()
+                logger.info(f"Progress: {i+1}/{total_items} (updated: {updated_count}, skipped: {skipped_count})")
+        
+        except Exception as e:
+            logger.error(f"Error updating news item {news_id}: {e}")
+            continue
+    
+    if not dry_run:
+        conn.commit()
+    
+    logger.info(f"✅ Update complete: {updated_count:,} updated, {skipped_count:,} skipped (already in new format)")
+    
+    return {
+        "success": True,
+        "updated": updated_count,
+        "skipped": skipped_count,
+        "total": total_items
+    }
+
+
 def main():
     import argparse
     from token_cache import TokenCacheManager
@@ -375,10 +669,12 @@ def main():
     parser.add_argument("--db", default="tick_data_production.db", help="Database path")
     parser.add_argument("--file", help="Specific news JSON file to ingest")
     parser.add_argument("--search-dirs", nargs="+", help="Directories to search for news files")
-    parser.add_argument("--token-cache", default="zerodha_token_list/all_extracted_tokens_merged.json",
+    parser.add_argument("--token-cache", default="core/data/token_lookup_enriched.json",
                        help="Token cache for symbol validation")
     parser.add_argument("--auto", action="store_true", help="Auto-find and ingest pending files")
     parser.add_argument("--dry-run", action="store_true", help="Dry run")
+    parser.add_argument("--update-existing", action="store_true", help="Update existing news records with new sector categorization")
+    parser.add_argument("--batch-size", type=int, default=1000, help="Batch size for updates")
     
     args = parser.parse_args()
     
@@ -391,6 +687,16 @@ def main():
     # Connect to DuckDB
     conn = duckdb.connect(args.db)
     ensure_news_schema(conn)
+    
+    if args.update_existing:
+        # Update existing news records
+        result = update_existing_news_sectors(conn, token_cache, args.batch_size, args.dry_run)
+        if result.get("success"):
+            logger.info(f"✅ Updated {result['updated']:,} news records")
+        else:
+            logger.error(f"❌ Update failed: {result.get('error')}")
+        conn.close()
+        return
     
     if args.file:
         # Ingest specific file

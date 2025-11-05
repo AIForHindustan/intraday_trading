@@ -298,22 +298,37 @@ def map_to_duckdb_schema(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
 def ingest_parquet_file(file_path: Path, db_path: str, token_cache: Optional[TokenCacheManager] = None, enrich: bool = True) -> Dict[str, Any]:
     """Ingest a parquet file into DuckDB with optional metadata enrichment."""
     try:
-        # Load parquet file with error handling for corrupt files
+        # Load parquet file - try multiple methods
+        df = None
+        read_error = None
+        
+        # Method 1: Try pandas (standard)
         try:
             df = pd.read_parquet(file_path)
-        except Exception as read_error:
-            # Handle corrupt parquet files specifically
-            if "invalid number of bytes" in str(read_error).lower() or "corrupt" in str(read_error).lower():
-                logger.warning(f"⚠️  Corrupt parquet file detected: {file_path.name} - {read_error}")
-                return {
-                    "success": False,
-                    "error": f"Corrupt file: {read_error}",
-                    "row_count": 0,
-                    "original_rows": 0,
-                    "corrupt": True
-                }
-            # Re-raise other errors
-            raise
+        except Exception as e1:
+            # Method 2: Try pandas with different engine
+            try:
+                df = pd.read_parquet(file_path, engine='pyarrow')
+            except Exception as e2:
+                # Method 3: Try fastparquet engine
+                try:
+                    df = pd.read_parquet(file_path, engine='fastparquet')
+                except Exception as e3:
+                    # Method 4: Try pyarrow directly
+                    try:
+                        import pyarrow.parquet as pq
+                        table = pq.read_table(file_path)
+                        df = table.to_pandas()
+                    except Exception as e4:
+                        # All methods failed - skip this file
+                        logger.warning(f"⚠️  Cannot read parquet file: {file_path.name} - tried 4 methods, all failed")
+                        logger.debug(f"   Errors: pandas={e1}, pyarrow={e2}, fastparquet={e3}, pyarrow_direct={e4}")
+                        return {
+                            "success": False,
+                            "error": f"Cannot read file with any method: {str(e1)[:100]}",
+                            "row_count": 0,
+                            "original_rows": 0
+                        }
         
         original_rows = len(df)
         

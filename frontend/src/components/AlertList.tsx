@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAlertsStore } from '../store/alerts';
 import { subscribeAlerts } from '../services/socket';
+import { adaptAlert } from '../services/adapters';
 import {
   Box,
   Paper,
@@ -102,7 +103,13 @@ const AlertList: React.FC = () => {
         <Typography sx={{ color: value === 'BUY' ? 'success.main' : 'error.main' }}>{value}</Typography>
       )
     },
-    { field: 'last_price', headerName: 'Price', width: 120, valueFormatter: ({ value }) => value.toFixed(2) },
+    {
+      field: 'last_price',
+      headerName: 'Price',
+      width: 120,
+      valueGetter: (params) => (params.row.last_price != null ? Number(params.row.last_price) : null),
+      valueFormatter: ({ value }) => (value != null ? value.toFixed(2) : '--')
+    },
     {
       field: 'timestamp',
       headerName: 'Time',

@@ -1,0 +1,59 @@
+================================================================================
+UNUSED SCRIPTS REPORT
+================================================================================
+
+Total files analyzed: 226
+Files imported: 185
+Files not imported: 41
+Library modules (potentially unused): 4
+Standalone scripts: 37
+
+
+================================================================================
+LIBRARY MODULES NOT IMPORTED
+================================================================================
+build_volume_baseline.py
+legacy_unused_scripts/premium_collection.py
+merge_enrichments.py
+scaled_processor.py
+
+================================================================================
+STANDALONE SCRIPTS
+================================================================================
+alert_correlation_analyzer.py
+alert_validation_dashboard.py
+analyze_databases.py
+analyze_file_ingestion.py
+backup_database.py
+check_token_files.py
+dashboard_status_summary.py
+data_processing_pipeline.py
+diagnose_binary_format.py
+diagnostic.py
+export_duckdb_to_parquet.py
+fix_timestamp_as_token.py
+fix_timestamps.py
+generate_comprehensive_report_package.py
+ingest_parquet_with_polars.py
+ingest_pending_parquet.py
+migrate_legacy_alerts_to_stream.py
+post_top3_alerts_reddit.py
+process_all_remaining_dates.py
+quality_dashboard.py
+quality_monitor.py
+recover_corrupted_parquet.py
+refresh_expired_instruments.py
+reingest_dropped_files.py
+reprocess_ingested_files.py
+send_community_notification.py
+send_concise_validation_reports.py
+send_dashboard_announcement.py
+send_dashboard_link_fix.py
+send_dashboard_notification.py
+send_final_notification.py
+send_morning_instructions.py
+send_validation_reports_via_bots.py
+setup_external_dashboard.py
+setup_public_dashboard.py
+signal_provider_report.py
+update_rows_with_enriched_metadata.py

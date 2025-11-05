@@ -542,8 +542,10 @@ class ProductionZerodhaBinaryConverter:
                     best_packets = []
                     best_offset = 0
                     
-                    # Test offsets: 0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18 (comprehensive range)
-                    for skip_bytes in [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18]:
+                    # Test offsets: Expanded range to catch more misalignments
+                    # Include more offsets, especially odd ones that might occur after variable-length headers
+                    # Also test offsets that might align with timestamp fields (44, 60 bytes into packet)
+                    for skip_bytes in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 26, 28, 30, 32]:
                         if skip_bytes >= len(data_after_json):
                             continue
                         
@@ -551,6 +553,17 @@ class ProductionZerodhaBinaryConverter:
                         
                         # Try length-prefixed first (most common format)
                         packets_lp = self._parse_length_prefixed_packets(test_data)
+                        # Validate packets - reject if too many have suspicious tokens
+                        if len(packets_lp) > 10:
+                            suspicious_count = sum(1 for p in packets_lp[:100] if (
+                                p.get("instrument_token", 0) > 256 and 
+                                (p.get("instrument_token", 0) & (p.get("instrument_token", 0) - 1) == 0)
+                            ))
+                            # If more than 10% are suspicious, this offset is likely wrong
+                            if suspicious_count > len(packets_lp[:100]) * 0.1:
+                                logger.debug(f"Skipping {skip_bytes}-byte offset: {suspicious_count} suspicious tokens in first 100 packets")
+                                continue
+                        
                         if len(packets_lp) > len(best_packets):
                             best_packets = packets_lp
                             best_offset = skip_bytes
@@ -558,6 +571,15 @@ class ProductionZerodhaBinaryConverter:
                         
                         # Try raw stream
                         packets_rs = self._parse_raw_packet_stream(test_data)
+                        if len(packets_rs) > 10:
+                            suspicious_count = sum(1 for p in packets_rs[:100] if (
+                                p.get("instrument_token", 0) > 256 and 
+                                (p.get("instrument_token", 0) & (p.get("instrument_token", 0) - 1) == 0)
+                            ))
+                            if suspicious_count > len(packets_rs[:100]) * 0.1:
+                                logger.debug(f"Skipping {skip_bytes}-byte offset (raw stream): {suspicious_count} suspicious tokens")
+                                continue
+                        
                         if len(packets_rs) > len(best_packets):
                             best_packets = packets_rs
                             best_offset = skip_bytes
@@ -678,13 +700,22 @@ class ProductionZerodhaBinaryConverter:
                         logger.debug(f"Fixed misaligned packet: original token {packet.get('instrument_token')} -> actual token {token}")
                         packet = fallback_packet
                 
-                # Final validation
-                if 50 <= token < 50_000_000:
+                # Final validation - reject suspicious tokens
+                is_valid_token = (
+                    50 <= token < 50_000_000 and
+                    # Reject powers of 2 > 256 (common misalignment artifacts)
+                    not (token > 256 and (token & (token - 1) == 0)) and
+                    # Reject round numbers that are suspiciously large
+                    not (token > 1000 and token % 1000 == 0 and token < 10000)
+                )
+                
+                if is_valid_token:
                     packets.append(packet)
                     consecutive_failures = 0  # Reset on success
                 else:
-                    # Invalid token even after fallback
-                    logger.debug(f"Skipping packet with invalid token: {token}")
+                    # Invalid or suspicious token
+                    if token > 0:
+                        logger.debug(f"Skipping packet with suspicious/invalid token: {token} (power of 2: {token > 256 and (token & (token - 1) == 0)})")
                     consecutive_failures += 1
                     if consecutive_failures > max_consecutive_failures:
                         logger.warning(f"Too many consecutive failures, stopping at position {position}")
@@ -780,16 +811,30 @@ class ProductionZerodhaBinaryConverter:
                     continue
                 packet = self._parse_single_packet(data[position:end_pos], packet_length)
                 if packet:
-                    # Validate that instrument_token is reasonable (not a timestamp)
+                    # Validate that instrument_token is reasonable (not a timestamp or misaligned)
                     token = packet.get("instrument_token", 0)
-                    # Accept tokens in reasonable range (50-1e9) - allow small tokens for indices/special instruments
-                    # Reject tokens >= 1e9 as they're likely timestamps
-                    if 50 <= token < 10**9:
+                    
+                    # Reject suspicious tokens (powers of 2, round numbers, timestamps)
+                    is_valid_token = (
+                        50 <= token < 50_000_000 and
+                        # Reject powers of 2 > 256 (common misalignment artifacts)
+                        not (token > 256 and (token & (token - 1) == 0)) and
+                        # Reject round numbers that are suspiciously large
+                        not (token > 1000 and token % 1000 == 0 and token < 10000) and
+                        # Reject timestamp-like values
+                        token < 1_000_000_000
+                    )
+                    
+                    if is_valid_token:
                         packets.append(packet)
                         position = end_pos
                         parsed = True
                         consecutive_failures = 0
                         break
+                    else:
+                        # Log suspicious tokens for debugging
+                        if token > 0:
+                            logger.debug(f"Skipping packet with suspicious token: {token} at position {position}")
             
             if not parsed:
                 position += 1

@@ -86,20 +86,20 @@ class BaseCrawler(ABC):
             self.redis_client = None
             logger.info("Redis disabled - file-writing only mode")
             return
-
+            
         try:
             # ✅ Use ONLY RedisManager82 - remove all fallbacks
-            from redis_files.redis_manager import RedisManager82
-
+                from redis_files.redis_manager import RedisManager82
+                
             process_name = "intraday_crawler"  # Fixed name for all crawlers
             max_connections = 3  # Conservative limit for crawlers
 
-            self.redis_client = RedisManager82.get_client(
-                process_name=process_name,
+                self.redis_client = RedisManager82.get_client(
+                    process_name=process_name,
                 max_connections=max_connections,
-                host=self.config.redis_host,
-                port=self.config.redis_port,
-                db=self.config.redis_db,
+                                host=self.config.redis_host,
+                                port=self.config.redis_port,
+                                db=self.config.redis_db,
             )
 
             # ✅ Remove RobustRedisClient wrapping - it creates duplicate connections

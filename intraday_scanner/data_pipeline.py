@@ -334,7 +334,7 @@ from utils.yaml_field_loader import (
 from intraday_scanner.math_dispatcher import MathDispatcher
 from patterns.pattern_mathematics import PatternMathematics
 
-# Legacy spoofing detector removed - no longer needed
+# ✅ Spoofing detection simplified - uses Redis-based detection only (no detector object)
 
 # Timezone utilities
 import pytz
@@ -452,7 +452,7 @@ class DataPipeline:
                 self.logger.warning(f"⚠️ Historical archive unavailable: {e}. Continuing without archival.")
                 self.historical_archive = None
 
-        # Enhanced spoofing detector state
+        # ✅ Spoofing detection simplified - uses Redis-based detection only (no detector object)
         self.spoofing_detector = None
         self.spoofing_enabled = False
 
@@ -517,8 +517,7 @@ class DataPipeline:
         # DataPipeline should NOT call VolumeStateManager - this violates single source of truth
         self.logger.info("✅ DataPipeline using pre-calculated volume from WebSocket parser")
 
-        # Legacy spoofing detector removed - no longer needed
-        self.spoofing_detector = None
+        # ✅ Spoofing detection removed - simplified architecture
 
         # Partial message buffers to recover from split/corrupt pubsub payloads
         self.partial_message_buffers: Dict[str, str] = {}
@@ -2047,9 +2046,87 @@ class DataPipeline:
         
         return unique_keys
 
+    def _extract_underlying_from_symbol(self, symbol: str) -> str:
+        """Extract underlying symbol from option/future symbols"""
+        import re
+        
+        if not symbol:
+            return symbol
+        
+        symbol_upper = symbol.upper()
+        if ':' in symbol_upper:
+            symbol_upper = symbol_upper.split(':')[-1]
+        
+        # Check for index names first
+        index_match = re.search(r'(BANKNIFTY|NIFTY|FINNIFTY|MIDCPNIFTY)', symbol_upper)
+        if index_match:
+            return index_match.group(1)
+        
+        # For options (CE/PE), extract everything before the date pattern
+        if 'CE' in symbol_upper or 'PE' in symbol_upper:
+            match = re.search(r'^([A-Z]+)\d{2}[A-Z]{3}', symbol_upper)
+            if match:
+                return match.group(1)
+            match = re.search(r'^([A-Z]+)\d', symbol_upper)
+            if match:
+                return match.group(1)
+        
+        # For futures (FUT), extract everything before the date
+        if symbol_upper.endswith('FUT'):
+            match = re.search(r'^([A-Z]+)\d', symbol_upper)
+            if match:
+                return match.group(1)
+        
+        return symbol_upper
+
+    def _get_sector_from_symbol_name(self, symbol: str) -> str:
+        """Map symbol to sector based on naming patterns"""
+        if not symbol:
+            return ""
+        
+        symbol_upper = symbol.upper()
+        bank_keywords = ['BANK', 'HDFC', 'ICICI', 'SBI', 'AXIS', 'KOTAK', 'INDUSIND', 
+                         'YESBANK', 'FEDERAL', 'IDFC', 'BANDHAN', 'RBL', 'UNION',
+                         'PNB', 'CANARA', 'BANKOFBARODA', 'BANKOFINDIA']
+        it_keywords = ['INFOSYS', 'TCS', 'WIPRO', 'HCL', 'TECHMAHINDRA', 'LTIM', 
+                       'LTTS', 'PERSISTENT', 'MINDTREE', 'COFORGE', 'MPHASIS']
+        auto_keywords = ['MARUTI', 'M&M', 'TATA', 'MOTORS', 'BAJAJ', 'HERO', 
+                         'EICHER', 'ASHOK', 'LEYLAND', 'TVS', 'MOTHERSUM']
+        pharma_keywords = ['SUNPHARMA', 'DRREDDY', 'CIPLA', 'LUPIN', 'TORRENT', 
+                           'AUROBINDO', 'DIVIS', 'GLENMARK', 'CADILA']
+        fmcg_keywords = ['HUL', 'ITC', 'NESTLE', 'DABUR', 'MARICO', 'BRITANNIA', 
+                         'GODREJ', 'TATA', 'CONSUMER']
+        energy_keywords = ['RELIANCE', 'ONGC', 'GAIL', 'IOC', 'BPCL', 'HPCL', 
+                           'OIL', 'PETRONET']
+        metal_keywords = ['TATASTEEL', 'JSWSTEEL', 'SAIL', 'JINDAL', 'VEDANTA', 
+                          'HINDALCO', 'NMDC']
+        
+        for keyword in bank_keywords:
+            if keyword in symbol_upper:
+                return "BANK"
+        for keyword in it_keywords:
+            if keyword in symbol_upper:
+                return "IT"
+        for keyword in auto_keywords:
+            if keyword in symbol_upper:
+                return "AUTO"
+        for keyword in pharma_keywords:
+            if keyword in symbol_upper:
+                return "PHARMA"
+        for keyword in fmcg_keywords:
+            if keyword in symbol_upper:
+                return "FMCG"
+        for keyword in energy_keywords:
+            if keyword in symbol_upper:
+                return "ENERGY"
+        for keyword in metal_keywords:
+            if keyword in symbol_upper:
+                return "METAL"
+        return ""
+
     def _calculate_news_relevance(self, symbol, news_data):
         """
-        Calculate how relevant a news item is to a specific symbol
+        Calculate how relevant a news item is to a specific symbol using sector-based matching
         Returns a score from 0.0 (not relevant) to 1.0 (highly relevant)
         """
         if not news_data:
@@ -2059,92 +2136,56 @@ class DataPipeline:
         content = news_data.get("content", "").upper()
         full_text = f"{title} {content}"
         
-        # Extract symbol name for matching
-        if ":" in symbol:
-            exchange, name = symbol.split(":", 1)
-            # Remove futures/options suffixes
-            base_name = name.split("28OCT")[0] if "28OCT" in name else name.split("FUT")[0] if "FUT" in name else name.split("OPT")[0] if "OPT" in name else name
-        else:
-            base_name = symbol
-            
+        # Extract underlying symbol from option/future symbols
+        underlying_symbol = self._extract_underlying_from_symbol(symbol)
+        base_name = underlying_symbol.upper()
+        
         # Direct symbol match (highest relevance)
-        if base_name.upper() in full_text:
+        if base_name in full_text:
             return 1.0
-            
-        # Company name variations
-        company_mappings = {
-            "RELIANCE": ["RELIANCE", "RIL"],
-            "TCS": ["TCS", "TATA CONSULTANCY"],
-            "HDFC": ["HDFC", "HDFC BANK"],
-            "INFY": ["INFOSYS", "INFY"],
-            "HDFCBANK": ["HDFC BANK", "HDFC"],
-            "ICICIBANK": ["ICICI BANK", "ICICI"],
-            "KOTAKBANK": ["KOTAK BANK", "KOTAK"],
-            "AXISBANK": ["AXIS BANK", "AXIS"],
-            "ITC": ["ITC"],
-            "BHARTIARTL": ["BHARTI AIRTEL", "AIRTEL", "BHARTI"],
-            "SBIN": ["SBI", "STATE BANK"],
-            "LT": ["LARSEN", "L&T", "LARSEN & TOUBRO"],
-            "ASIANPAINT": ["ASIAN PAINTS", "ASIANPAINT"],
-            "MARUTI": ["MARUTI", "MARUTI SUZUKI"],
-            "NESTLEIND": ["NESTLE", "NESTLE INDIA"],
-            "ULTRACEMCO": ["ULTRATECH", "ULTRATECH CEMENT"],
-            "TITAN": ["TITAN"],
-            "SUNPHARMA": ["SUN PHARMA", "SUNPHARMA"],
-            "TATAMOTORS": ["TATA MOTORS", "TATAMOTORS"],
-            "POWERGRID": ["POWER GRID", "POWERGRID"],
-            "NTPC": ["NTPC"],
-            "ONGC": ["ONGC", "OIL & NATURAL GAS"],
-            "TECHM": ["TECH MAHINDRA", "TECHM"],
-            "WIPRO": ["WIPRO"],
-            "HCLTECH": ["HCL", "HCL TECH", "HCLTECH"],
-            "COALINDIA": ["COAL INDIA", "COALINDIA"],
-            "JSWSTEEL": ["JSW STEEL", "JSWSTEEL"],
-            "TATASTEEL": ["TATA STEEL", "TATASTEEL"],
-            "DRREDDY": ["DR REDDY", "DRREDDY"],
-            "BAJFINANCE": ["BAJAJ FINANCE", "BAJFINANCE"],
-            "BAJAJFINSV": ["BAJAJ FINSERV", "BAJAJFINSV"],
-            "ADANIPORTS": ["ADANI PORTS", "ADANIPORTS"],
-            "TATACONSUM": ["TATA CONSUMER", "TATACONSUM"],
-            "GRASIM": ["GRASIM"],
-            "BRITANNIA": ["BRITANNIA"],
-            "CIPLA": ["CIPLA"],
-            "EICHERMOT": ["EICHER MOTORS", "EICHERMOT"],
-            "HEROMOTOCO": ["HERO MOTOCORP", "HEROMOTOCO"],
-            "INDUSINDBK": ["INDUSIND BANK", "INDUSINDBK"],
-            "SHREECEM": ["SHREE CEMENT", "SHREECEM"],
-            "UPL": ["UPL"],
-            "BAJAJHLDNG": ["BAJAJ HOLDINGS", "BAJAJHLDNG"],
-            "APOLLOHOSP": ["APOLLO HOSPITALS", "APOLLOHOSP"],
-            "DIVISLAB": ["DIVI'S LAB", "DIVISLAB"],
-            "HINDALCO": ["HINDALCO"],
-            "SBILIFE": ["SBI LIFE", "SBILIFE"]
-        }
         
-        # Check for company name variations
-        if base_name.upper() in company_mappings:
-            for variation in company_mappings[base_name.upper()]:
-                if variation.upper() in full_text:
-                    return 0.9
-                    
-        # Sector-based relevance (lower score)
+        # Check if news mentions the symbol directly (with exchange prefix)
+        if ':' in symbol:
+            exchange, name = symbol.split(":", 1)
+            if name.upper() in full_text:
+                return 1.0
+        
+        # Get sector from symbol
+        symbol_sector = self._get_sector_from_symbol_name(base_name)
+        
+        # Sector-based relevance matching
         sector_keywords = {
-            "BANK": ["BANKING", "BANK", "FINANCIAL", "CREDIT", "LOAN"],
-            "AUTO": ["AUTOMOTIVE", "AUTO", "VEHICLE", "CAR", "BIKE"],
-            "PHARMA": ["PHARMACEUTICAL", "DRUG", "MEDICINE", "HEALTHCARE"],
-            "IT": ["TECHNOLOGY", "SOFTWARE", "IT", "DIGITAL"],
-            "ENERGY": ["OIL", "GAS", "ENERGY", "POWER", "PETROLEUM"],
-            "METAL": ["STEEL", "METAL", "MINING", "ALUMINIUM"],
-            "CEMENT": ["CEMENT", "CONSTRUCTION", "BUILDING"]
+            "BANK": ["BANKING", "BANK", "FINANCIAL", "CREDIT", "LOAN", "LENDING", "INTEREST RATE"],
+            "AUTO": ["AUTOMOTIVE", "AUTO", "VEHICLE", "CAR", "BIKE", "MOTORCYCLE", "AUTOMOBILE"],
+            "PHARMA": ["PHARMACEUTICAL", "DRUG", "MEDICINE", "HEALTHCARE", "MEDICAL"],
+            "IT": ["TECHNOLOGY", "SOFTWARE", "IT", "DIGITAL", "TECH", "COMPUTER"],
+            "ENERGY": ["OIL", "GAS", "ENERGY", "POWER", "PETROLEUM", "REFINERY", "CRUDE"],
+            "METAL": ["STEEL", "METAL", "MINING", "ALUMINIUM", "IRON", "COPPER"],
+            "FMCG": ["FMCG", "CONSUMER", "FMCG PRODUCTS", "RETAIL"],
+            "CEMENT": ["CEMENT", "CONSTRUCTION", "BUILDING", "INFRASTRUCTURE"]
         }
         
-        # Check sector relevance
-        for sector, keywords in sector_keywords.items():
-            if sector in base_name.upper():
-                for keyword in keywords:
-                    if keyword.upper() in full_text:
-                        return 0.6
-                        
+        # If symbol has a sector, check if news mentions that sector
+        if symbol_sector and symbol_sector in sector_keywords:
+            for keyword in sector_keywords[symbol_sector]:
+                if keyword.upper() in full_text:
+                    return 0.8  # High relevance for sector match
+        
+        # Check for sub-category company names (specific companies in the sector)
+        # For banks
+        if symbol_sector == "BANK":
+            bank_companies = ["HDFC", "ICICI", "SBI", "AXIS", "KOTAK", "INDUSIND", "YES BANK", "FEDERAL"]
+            for company in bank_companies:
+                if company in full_text and company in base_name:
+                    return 0.9  # Very high for specific company match
+        
+        # For IT
+        if symbol_sector == "IT":
+            it_companies = ["INFOSYS", "TCS", "WIPRO", "HCL", "TECH MAHINDRA"]
+            for company in it_companies:
+                if company in full_text and company in base_name:
+                    return 0.9
+        
         # General market news (lowest relevance)
         market_keywords = ["MARKET", "STOCK", "SHARE", "EQUITY", "NIFTY", "SENSEX"]
         for keyword in market_keywords:
@@ -2254,7 +2295,7 @@ class DataPipeline:
             pass
         return "Spoofing activity detected"
 
-    # Legacy spoofing detection methods removed - no longer needed
+    # ✅ Spoofing detection methods removed - simplified architecture
 
     def _cleanup_spoofing_cache(self):
         """Cleanup old spoofing alerts from cache periodically"""
@@ -2889,7 +2930,7 @@ class DataPipeline:
         if news_data:
             cleaned["news_context"] = news_data
 
-        # Legacy spoofing detection removed - simplified to basic Redis-based detection
+        # ✅ Spoofing detection: Uses simplified Redis-based detection (legacy detector object removed)
         spoofing_data = self._get_spoofing_for_symbol(symbol)
         if spoofing_data:
             cleaned["spoofing_detected"] = True
@@ -3287,23 +3328,14 @@ class DataPipeline:
                 build_enhanced_premarket_indicator,
                 build_premarket_indicator,
             )
-            # Order flow metrics calculation disabled (legacy service removed)
-            def calculate_order_flow_metrics(data):
-                return None
-
-            # Build standardized premarket indicator
+            # ✅ Build standardized premarket indicator
             premarket_data = build_premarket_indicator(data)
             symbol = premarket_data.get("symbol", "UNKNOWN")
 
-            # Order flow storage removed
-
-            # Pull recent order flow history for enhanced indicator
-            order_flow_analysis = None
-            # Order flow analysis disabled
-
+            # ✅ Order flow analysis removed - simplified premarket indicator
             enhanced_indicator = build_enhanced_premarket_indicator(
                 data,
-                order_flow_analysis=order_flow_analysis,
+                order_flow_analysis=None,  # Order flow analysis disabled
                 base_indicator=premarket_data,
             )
             premarket_data.update(enhanced_indicator)

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { alertsAPI, chartsAPI, volumeProfileAPI, newsAPI, validationAPI } from '../services/api';
 import { subscribeValidation } from '../services/socket';
+import { adaptOhlcPayload, adaptOverlays } from '../services/adapters';
 import {
   Box,
   Typography,
@@ -102,15 +103,18 @@ const AlertDetail: React.FC = () => {
 
   const { alert, chart_data, volume_profile, news, validation } = data;
 
-  // Prepare data for PriceChart
-  const ohlc = chart_data?.ohlc || chart_data?.data || [];
-  const ema = chart_data?.indicators_overlay ? {
-    ema_20: chart_data.indicators_overlay.ema_20,
-    ema_50: chart_data.indicators_overlay.ema_50,
-    ema_100: chart_data.indicators_overlay.ema_100,
-    ema_200: chart_data.indicators_overlay.ema_200,
+  // Adapt chart data using adapters
+  const ohlc = adaptOhlcPayload(chart_data || {});
+  const overlay = adaptOverlays(chart_data || {});
+  
+  // Extract EMA and VWAP from overlay
+  const ema = overlay.ema_20?.length > 0 ? {
+    ema_20: overlay.ema_20,
+    ema_50: overlay.ema_50,
+    ema_100: overlay.ema_100,
+    ema_200: overlay.ema_200,
   } : undefined;
-  const vwap = chart_data?.indicators_overlay?.vwap;
+  const vwap = overlay.vwap;
 
   return (
     <Box sx={{ p: 2 }}>
@@ -135,13 +139,25 @@ const AlertDetail: React.FC = () => {
         </Tabs>
 
         {tab === 0 && (
-          <Box sx={{ mt: 2 }}>
+          <Box sx={{ mt: 2, width: '100%', height: 380 }}>
             {ohlc && ohlc.length > 0 ? (
-              <PriceChart ohlc={ohlc} ema={ema} vwap={vwap} />
+              <PriceChart 
+                ohlc={ohlc} 
+                ema={ema} 
+                vwap={vwap} 
+                height={380}
+                symbol={alert?.base_symbol || alert?.symbol}
+                enableRealtime={true}
+              />
             ) : (
-              <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
-                No chart data available for this symbol
-              </Typography>
+              <Paper sx={{ p: 3, textAlign: 'center' }}>
+                <Typography variant="body1" color="text.secondary">
+                  No chart data available for {alert.symbol}
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                  Chart data will appear here once market data is available
+                </Typography>
+              </Paper>
             )}
           </Box>
         )}
