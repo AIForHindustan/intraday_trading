@@ -195,6 +195,13 @@ async def redis_alert_listener(redis: Optional[Redis] = None):
                             # Acknowledge message
                             await redis.xack(stream, group, message_id)
                             
+                            # Ensure alert_id exists for frontend compatibility
+                            if 'alert_id' not in alert_data or not alert_data.get('alert_id'):
+                                import time as time_module
+                                timestamp_ms = alert_data.get('timestamp_ms') or alert_data.get('timestamp', int(time_module.time() * 1000))
+                                symbol = alert_data.get('symbol', 'UNKNOWN')
+                                alert_data['alert_id'] = f"{symbol}_{timestamp_ms}"
+                            
                             # Broadcast to all WebSocket clients
                             # Wrap in consistent format for frontend compatibility
                             broadcast_data = {

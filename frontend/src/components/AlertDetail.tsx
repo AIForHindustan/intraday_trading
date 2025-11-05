@@ -12,10 +12,12 @@ import {
   CircularProgress,
   List,
   ListItem,
-  ListItemText
+  ListItemText,
+  Tabs,
+  Tab
 } from '@mui/material';
-// @ts-ignore - react-plotly.js doesn't have type definitions
-import Plot from 'react-plotly.js';
+import PriceChart from './PriceChart';
+import VolumeProfileChart from './VolumeProfileChart';
 import { format } from 'date-fns';
 
 interface AlertDetailData {
@@ -30,6 +32,7 @@ const AlertDetail: React.FC = () => {
   const { alertId } = useParams<{ alertId: string }>();
   const [data, setData] = useState<AlertDetailData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState(0);
 
   useEffect(() => {
     if (!alertId) return;
@@ -87,74 +90,18 @@ const AlertDetail: React.FC = () => {
 
   const { alert, chart_data, volume_profile, news, validation } = data;
 
-  // Prepare candlestick data for Plotly
-  // API returns {ohlc: [...], indicators_overlay: {...}, ...}
+  // Prepare data for PriceChart
   const ohlc = chart_data?.ohlc || chart_data?.data || [];
-  
-  // Convert timestamps to Date objects for Plotly
-  const convertTimestamp = (ts: number): Date => {
-    // If timestamp is in milliseconds (10+ digits), use as-is
-    // If timestamp is in seconds (10 digits), multiply by 1000
-    if (ts > 1e10) {
-      return new Date(ts);
-    }
-    return new Date(ts * 1000);
-  };
-  
-  const trace = {
-    x: ohlc.map((d: any) => convertTimestamp(d.timestamp)),
-    open: ohlc.map((d: any) => d.open),
-    high: ohlc.map((d: any) => d.high),
-    low: ohlc.map((d: any) => d.low),
-    close: ohlc.map((d: any) => d.close),
-    type: 'candlestick',
-    name: alert.symbol,
-    increasing: { line: { color: '#4caf50' } },
-    decreasing: { line: { color: '#f44336' } }
-  };
-  
-  const indicatorTraces: any[] = [];
-  if (chart_data?.indicators_overlay && ohlc.length > 0) {
-    Object.keys(chart_data.indicators_overlay).forEach((key) => {
-      const indicatorValue = chart_data.indicators_overlay[key];
-      // Handle both array and single value
-      if (Array.isArray(indicatorValue)) {
-        if (indicatorValue.length === ohlc.length) {
-          indicatorTraces.push({
-            x: ohlc.map((d: any) => convertTimestamp(d.timestamp)),
-            y: indicatorValue,
-            type: 'scatter',
-            mode: 'lines',
-            name: key.toUpperCase(),
-            line: { width: 1 }
-          });
-        }
-      } else if (typeof indicatorValue === 'number') {
-        // Single value - draw horizontal line
-        indicatorTraces.push({
-          x: ohlc.map((d: any) => convertTimestamp(d.timestamp)),
-          y: Array(ohlc.length).fill(indicatorValue),
-          type: 'scatter',
-          mode: 'lines',
-          name: key.toUpperCase(),
-          line: { width: 1, dash: 'dash' }
-        });
-      }
-    });
-  }
-  
-  const layout = {
-    title: `${alert.symbol} Price Chart`,
-    xaxis: { type: 'date' },
-    yaxis: { title: 'Price' },
-    showlegend: true,
-    margin: { l: 40, r: 40, t: 40, b: 40 },
-    paper_bgcolor: 'transparent',
-    plot_bgcolor: 'transparent'
-  };
+  const ema = chart_data?.indicators_overlay ? {
+    ema_20: chart_data.indicators_overlay.ema_20,
+    ema_50: chart_data.indicators_overlay.ema_50,
+    ema_100: chart_data.indicators_overlay.ema_100,
+    ema_200: chart_data.indicators_overlay.ema_200,
+  } : undefined;
+  const vwap = chart_data?.indicators_overlay?.vwap;
 
   return (
-    <Box>
+    <Box sx={{ p: 2 }}>
       <Box sx={{ mb: 2 }}>
         <Typography variant="h5" gutterBottom>
           {alert.symbol} - {alert.pattern_label}
@@ -166,76 +113,123 @@ const AlertDetail: React.FC = () => {
         <Chip label={`Confidence: ${(alert.confidence * 100).toFixed(1)}%`} sx={{ mr: 1, mt: 1 }} />
         <Chip label={`Last Price: ${alert.last_price.toFixed(2)}`} sx={{ mr: 1, mt: 1 }} />
       </Box>
-      <Grid container spacing={2}>
-        {/* @ts-ignore - MUI Grid API mismatch */}
-        <Grid item xs={12} md={8}>
-          <Paper sx={{ p: 2 }}>
-            <Plot
-              data={[trace, ...indicatorTraces]}
-              layout={layout as any}
-              config={{ responsive: true, displaylogo: false }}
-              style={{ width: '100%', height: '400px' }}
+
+      <Paper sx={{ p: 2, mb: 2 }}>
+        <Tabs value={tab} onChange={(_, v) => setTab(v)}>
+          <Tab label="Price" />
+          <Tab label="Indicators" />
+          <Tab label="Volume Profile" />
+          <Tab label="Validation" />
+        </Tabs>
+
+        {tab === 0 && (
+          <Box sx={{ mt: 2 }}>
+            <PriceChart ohlc={ohlc} ema={ema} vwap={vwap} />
+          </Box>
+        )}
+
+        {tab === 1 && (
+          <Grid container spacing={2} sx={{ mt: 1 }}>
+            {/* @ts-ignore - MUI Grid API mismatch */}
+            <Grid item xs={12} md={6}>
+              <Paper sx={{ p: 2 }}>
+                <Typography variant="h6" gutterBottom>Indicators</Typography>
+                {alert.indicators && Object.keys(alert.indicators).length > 0 ? (
+                  Object.keys(alert.indicators).map((key) => {
+                    const value = alert.indicators[key];
+                    let displayValue: string;
+                    if (typeof value === 'object' && value !== null) {
+                      // Handle complex indicators like MACD, Bollinger Bands
+                      displayValue = JSON.stringify(value, null, 2);
+                    } else if (typeof value === 'number') {
+                      displayValue = value.toFixed(2);
+                    } else {
+                      displayValue = String(value);
+                    }
+                    return (
+                      <Typography key={key} variant="body2" sx={{ mb: 0.5 }}>
+                        <strong>{key.toUpperCase()}:</strong> {displayValue}
+                      </Typography>
+                    );
+                  })
+                ) : (
+                  <Typography variant="body2" color="text.secondary">
+                    No indicators available
+                  </Typography>
+                )}
+              </Paper>
+            </Grid>
+            {/* @ts-ignore - MUI Grid API mismatch */}
+            <Grid item xs={12} md={6}>
+              {alert.instrument_type === 'OPTIONS' && alert.greeks && Object.keys(alert.greeks).length > 0 && (
+                <Paper sx={{ p: 2 }}>
+                  <Typography variant="h6" gutterBottom>Greeks</Typography>
+                  {Object.keys(alert.greeks).map((key) => {
+                    const value = alert.greeks[key];
+                    const displayValue = typeof value === 'number' ? value.toFixed(4) : String(value);
+                    const color = typeof value === 'number' && value < 0 ? 'error.main' : 'success.main';
+                    return (
+                      <Typography key={key} variant="body2" sx={{ mb: 0.5 }}>
+                        <strong>{key.toUpperCase()}:</strong>{' '}
+                        <span style={{ color: color === 'error.main' ? '#f44336' : '#4caf50' }}>
+                          {displayValue}
+                        </span>
+                      </Typography>
+                    );
+                  })}
+                </Paper>
+              )}
+            </Grid>
+          </Grid>
+        )}
+
+        {tab === 2 && volume_profile && (
+          <Box sx={{ mt: 2 }}>
+            <VolumeProfileChart
+              distribution={volume_profile.distribution || {}}
+              poc_price={volume_profile.poc_price}
+              value_area_low={volume_profile.value_area_low}
+              value_area_high={volume_profile.value_area_high}
             />
-          </Paper>
-        </Grid>
-        {/* @ts-ignore - MUI Grid API mismatch */}
-        <Grid item xs={12} md={4}>
-          <Paper sx={{ p: 2, mb: 2 }}>
-            <Typography variant="h6" gutterBottom>Indicators</Typography>
-            {alert.indicators && Object.keys(alert.indicators).length > 0 ? (
-              Object.keys(alert.indicators).map((key) => {
-                const value = alert.indicators[key];
-                let displayValue: string;
-                if (typeof value === 'object' && value !== null) {
-                  // Handle complex indicators like MACD, Bollinger Bands
-                  displayValue = JSON.stringify(value, null, 2);
-                } else if (typeof value === 'number') {
-                  displayValue = value.toFixed(2);
-                } else {
-                  displayValue = String(value);
-                }
-                return (
-                  <Typography key={key} variant="body2" sx={{ mb: 0.5 }}>
-                    <strong>{key.toUpperCase()}:</strong> {displayValue}
-                  </Typography>
-                );
-              })
-            ) : (
-              <Typography variant="body2" color="text.secondary">
-                No indicators available
-              </Typography>
-            )}
-          </Paper>
-          {alert.instrument_type === 'OPTIONS' && alert.greeks && Object.keys(alert.greeks).length > 0 && (
-            <Paper sx={{ p: 2, mb: 2 }}>
-              <Typography variant="h6" gutterBottom>Greeks</Typography>
-              {Object.keys(alert.greeks).map((key) => {
-                const value = alert.greeks[key];
-                const displayValue = typeof value === 'number' ? value.toFixed(4) : String(value);
-                const color = typeof value === 'number' && value < 0 ? 'error.main' : 'success.main';
-                return (
-                  <Typography key={key} variant="body2" sx={{ mb: 0.5 }}>
-                    <strong>{key.toUpperCase()}:</strong>{' '}
-                    <span style={{ color: color === 'error.main' ? '#f44336' : '#4caf50' }}>
-                      {displayValue}
-                    </span>
-                  </Typography>
-                );
-              })}
+          </Box>
+        )}
+
+        {tab === 3 && (
+          <Box sx={{ mt: 2 }}>
+            <Paper sx={{ p: 2 }}>
+              <Typography variant="h6" gutterBottom>Validation</Typography>
+              {validation && (
+                <Box>
+                  <Typography variant="body2">Status: {validation.status}</Typography>
+                  {validation.confidence_score != null && (
+                    <Typography variant="body2">Confidence Score: {(validation.confidence_score * 100).toFixed(1)}%</Typography>
+                  )}
+                  {validation.price_movement_pct != null && (
+                    <Typography variant="body2">Price Move: {validation.price_movement_pct}%</Typography>
+                  )}
+                  {validation.duration_minutes != null && (
+                    <Typography variant="body2">Duration: {validation.duration_minutes} minutes</Typography>
+                  )}
+                  {validation.max_move_pct != null && (
+                    <Typography variant="body2">Max Move: {validation.max_move_pct}%</Typography>
+                  )}
+                  {validation.rolling_windows && typeof validation.rolling_windows === 'object' && (
+                    <Box sx={{ mt: 2 }}>
+                      <Typography variant="subtitle2" gutterBottom>Rolling Windows</Typography>
+                      <Typography variant="body2">
+                        Success: {validation.rolling_windows.success_count || 0} / {validation.rolling_windows.total_windows || 0}
+                      </Typography>
+                      <Typography variant="body2">
+                        Success Ratio: {((validation.rolling_windows.success_ratio || 0) * 100).toFixed(1)}%
+                      </Typography>
+                    </Box>
+                  )}
+                </Box>
+              )}
             </Paper>
-          )}
-          <Paper sx={{ p: 2 }}>
-            <Typography variant="h6">Volume Profile</Typography>
-            {volume_profile && (
-              <Box>
-                <Typography variant="body2">POC: {volume_profile.poc_price}</Typography>
-                <Typography variant="body2">Value Area High: {volume_profile.value_area_high}</Typography>
-                <Typography variant="body2">Value Area Low: {volume_profile.value_area_low}</Typography>
-              </Box>
-            )}
-          </Paper>
-        </Grid>
-      </Grid>
+          </Box>
+        )}
+      </Paper>
       <Box sx={{ mt: 2 }}>
         <Paper sx={{ p: 2, mb: 2 }}>
           <Typography variant="h6">News</Typography>

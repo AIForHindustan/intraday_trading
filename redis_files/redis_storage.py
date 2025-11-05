@@ -119,6 +119,13 @@ class HighPerformanceAlertStream:
 
     async def publish_alert(self, alert_data: dict) -> None:
         """Ultra-fast alert publishing using binary JSON."""
+        # Ensure alert_id exists for frontend compatibility
+        if 'alert_id' not in alert_data or not alert_data.get('alert_id'):
+            import time as time_module
+            timestamp_ms = alert_data.get('timestamp_ms') or int(alert_data.get('timestamp', time_module.time()) * 1000)
+            symbol = alert_data.get('symbol', 'UNKNOWN')
+            alert_data['alert_id'] = f"{symbol}_{timestamp_ms}"
+        
         binary_data = orjson.dumps(alert_data)
         await self.redis.xadd(
             self.stream_key,
@@ -1302,14 +1309,18 @@ class RedisStorage:
 
                 # Additionally publish compact alert to alerts:stream for SSE
                 try:
-                    # Build minimal alert payload
+                    # Build minimal alert payload with alert_id for frontend compatibility
+                    timestamp_ms = int(time.time() * 1000)
+                    alert_id = f"{symbol}_{timestamp_ms}"
                     alert_payload = {
+                        'alert_id': alert_id,  # Required for frontend DataGrid
                         'symbol': symbol,
                         'pattern': pattern.get('pattern_type') or pattern.get('pattern') or 'unknown',
                         'confidence': float(pattern.get('confidence', 0.0)),
                         'last_price': pattern.get('current_price', 0.0),
-                        'timestamp': int(time.time() * 1000),
+                        'timestamp': timestamp_ms,
                         'direction': pattern.get('signal', 'NEUTRAL'),
+                        'signal': pattern.get('signal', 'NEUTRAL'),  # Add signal for frontend
                     }
                     # Serialize to binary using orjson if available
                     try:

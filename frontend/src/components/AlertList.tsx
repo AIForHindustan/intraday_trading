@@ -35,7 +35,7 @@ const patternOptions = [
 
 const AlertList: React.FC = () => {
   const navigate = useNavigate();
-  const { alerts, fetchAlerts, appendAlert, loading, total } = useAlertsStore();
+  const { alerts, fetchAlerts, appendAlert, loading, total, error } = useAlertsStore();
   const [filters, setFilters] = useState<FilterState>({
     symbol: '',
     pattern: '',
@@ -53,9 +53,16 @@ const AlertList: React.FC = () => {
   // Subscribe to new alerts via WebSocket
   useEffect(() => {
     if (!subscribed) {
-      const unsubscribe = subscribeAlerts({ symbol: filters.symbol || undefined, pattern: filters.pattern || undefined }, (data) => {
-        appendAlert(data);
-      });
+      const unsubscribe = subscribeAlerts(
+        { symbol: filters.symbol || undefined, pattern: filters.pattern || undefined },
+        (data) => {
+          appendAlert(data);
+        },
+        (updatedData) => {
+          // Handle alert updates if needed
+          appendAlert(updatedData);
+        }
+      );
       setSubscribed(true);
       return () => {
         unsubscribe();
@@ -108,6 +115,26 @@ const AlertList: React.FC = () => {
       width: 100
     }
   ];
+
+  if (error) {
+    // Ensure error is a string, not an object
+    const errorText = typeof error === 'string' ? error : JSON.stringify(error);
+    return (
+      <Box sx={{ p: 2 }}>
+        <Paper sx={{ p: 2 }}>
+          <Typography variant="h6" color="error" gutterBottom>
+            Error loading alerts
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            {errorText}
+          </Typography>
+          <Button variant="contained" onClick={() => fetchAlerts({ limit: 100, offset: 0 })} sx={{ mt: 2 }}>
+            Retry
+          </Button>
+        </Paper>
+      </Box>
+    );
+  }
 
   return (
     <Box>
@@ -173,16 +200,29 @@ const AlertList: React.FC = () => {
             Apply
           </Button>
         </Box>
-        <div style={{ height: 600, width: '100%' }}>
-          <DataGrid
-            rows={alerts}
-            columns={columns}
-            getRowId={(row) => row.alert_id}
-            loading={loading}
-            onRowClick={(params) => navigate(`/alerts/${params.row.alert_id}`)}
-            pageSizeOptions={[25, 50, 100]}
-          />
-        </div>
+        {loading ? (
+          <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}>
+            <Typography>Loading alerts...</Typography>
+          </Box>
+        ) : alerts.length === 0 ? (
+          <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}>
+            <Typography color="text.secondary">No alerts found</Typography>
+          </Box>
+        ) : (
+          <div style={{ height: 600, width: '100%' }}>
+            <DataGrid
+              rows={alerts}
+              columns={columns}
+              getRowId={(row) => row.alert_id || `${row.symbol}_${row.timestamp}`}
+              loading={loading}
+              onRowClick={(params) => {
+                const alertId = params.row.alert_id || `${params.row.symbol}_${params.row.timestamp || Date.now()}`;
+                navigate(`/alerts/${alertId}`);
+              }}
+              pageSizeOptions={[25, 50, 100]}
+            />
+          </div>
+        )}
       </Paper>
     </Box>
   );

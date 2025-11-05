@@ -500,6 +500,18 @@ class RedisNotifier:
             # Enhance alert with channel-specific content
             enhanced_alert = self.enhance_alert_for_channels(alert_data)
             
+            # Ensure alert_id exists for frontend compatibility
+            if 'alert_id' not in enhanced_alert or not enhanced_alert.get('alert_id'):
+                timestamp_ms = enhanced_alert.get('timestamp_ms') or int(enhanced_alert.get('timestamp', time.time()) * 1000)
+                symbol = enhanced_alert.get('symbol', 'UNKNOWN')
+                enhanced_alert['alert_id'] = f"{symbol}_{timestamp_ms}"
+            
+            # Ensure required fields for frontend
+            if 'signal' not in enhanced_alert:
+                enhanced_alert['signal'] = enhanced_alert.get('direction', enhanced_alert.get('action', 'NEUTRAL'))
+            if 'pattern_label' not in enhanced_alert:
+                enhanced_alert['pattern_label'] = enhanced_alert.get('pattern', enhanced_alert.get('pattern_type', 'Unknown Pattern'))
+            
             # Determine target channels based on alert type
             target_channels = self._determine_channels(enhanced_alert)
             
