@@ -46,23 +46,35 @@ const AlertDetail: React.FC = () => {
         const symbol = alertData.alert.base_symbol || alertData.alert.symbol?.split(':')?.[1]?.split(/\d/)?.[0] || alertData.alert.symbol;
         
         // Fetch additional chart and volume data
-        const [chartRes, volumeRes, newsRes, validationRes] = await Promise.all([
-          chartsAPI.getData(alertData.alert.symbol, { include_indicators: true }),
-          volumeProfileAPI.getData(alertData.alert.symbol),
-          newsAPI.getBySymbol(symbol),
-          validationAPI.getByAlertId(alertId)
+        const [chartRes, volumeRes, newsRes, validationRes] = await Promise.allSettled([
+          chartsAPI.getData(alertData.alert.symbol, { include_indicators: true }).catch(e => ({ data: { ohlc: [], indicators_overlay: {} } })),
+          volumeProfileAPI.getData(alertData.alert.symbol).catch(e => ({ data: { distribution: {}, poc_price: 0 } })),
+          newsAPI.getBySymbol(symbol).catch(e => ({ data: [] })),
+          validationAPI.getByAlertId(alertId).catch(e => ({ data: null }))
         ]);
         if (!mounted) return;
         
+        // Extract data from Promise.allSettled results
+        const chartData = chartRes.status === 'fulfilled' ? chartRes.value.data : { ohlc: [], indicators_overlay: {} };
+        const volumeData = volumeRes.status === 'fulfilled' ? volumeRes.value.data : { distribution: {}, poc_price: 0 };
+        const newsResponse = newsRes.status === 'fulfilled' ? newsRes.value.data : [];
+        const validationData = validationRes.status === 'fulfilled' ? validationRes.value.data : null;
+        
         // Handle news response - API returns array directly, not wrapped in {news: [...]}
-        const newsData = Array.isArray(newsRes.data) ? newsRes.data : (newsRes.data?.news || []);
+        const newsData = Array.isArray(newsResponse) ? newsResponse : (newsResponse?.news || []);
+        
+        console.log('Chart data received:', { 
+          ohlc_count: chartData.ohlc?.length || 0, 
+          has_indicators: !!chartData.indicators_overlay,
+          volume_dist_keys: Object.keys(volumeData.distribution || {}).length
+        });
         
         setData({
           alert: alertData.alert,
-          chart_data: chartRes.data,
-          volume_profile: volumeRes.data,
+          chart_data: chartData,
+          volume_profile: volumeData,
           news: newsData,
-          validation: validationRes.data
+          validation: validationData
         });
         setLoading(false);
       } catch (err) {
@@ -124,7 +136,13 @@ const AlertDetail: React.FC = () => {
 
         {tab === 0 && (
           <Box sx={{ mt: 2 }}>
-            <PriceChart ohlc={ohlc} ema={ema} vwap={vwap} />
+            {ohlc && ohlc.length > 0 ? (
+              <PriceChart ohlc={ohlc} ema={ema} vwap={vwap} />
+            ) : (
+              <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
+                No chart data available for this symbol
+              </Typography>
+            )}
           </Box>
         )}
 
@@ -184,13 +202,25 @@ const AlertDetail: React.FC = () => {
         )}
 
         {tab === 2 && volume_profile && (
-          <Box sx={{ mt: 2 }}>
-            <VolumeProfileChart
-              distribution={volume_profile.distribution || {}}
-              poc_price={volume_profile.poc_price}
-              value_area_low={volume_profile.value_area_low}
-              value_area_high={volume_profile.value_area_high}
-            />
+          <Box sx={{ mt: 2, minHeight: 300 }}>
+            {volume_profile.distribution && Object.keys(volume_profile.distribution).length > 0 ? (
+              <VolumeProfileChart
+                distribution={volume_profile.distribution || {}}
+                poc_price={volume_profile.poc_price}
+                value_area_low={volume_profile.value_area_low}
+                value_area_high={volume_profile.value_area_high}
+                height={300}
+              />
+            ) : (
+              <Paper sx={{ p: 3, textAlign: 'center' }}>
+                <Typography variant="body1" color="text.secondary">
+                  No volume profile data available for {alert.symbol}
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                  Volume profile will appear here once trading data is available
+                </Typography>
+              </Paper>
+            )}
           </Box>
         )}
 

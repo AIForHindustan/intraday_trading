@@ -115,21 +115,52 @@ def save_user_to_redis(username: str, password_hash: str, metadata: Optional[Dic
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify password against hash"""
-    if not HAS_PASSLIB or not pwd_context:
-        # Fallback: plain text comparison (NOT SECURE - only for development)
+    if not hashed_password:
+        return False
+    
+    # Try passlib first
+    if HAS_PASSLIB and pwd_context:
+        try:
+            return pwd_context.verify(plain_password, hashed_password)
+        except Exception as e:
+            # Fallback to direct bcrypt if passlib fails (version compatibility issue)
+            print(f"passlib verification failed, trying direct bcrypt: {e}")
+    
+    # Fallback: Use bcrypt directly
+    try:
+        import bcrypt
+        password_bytes = plain_password.encode('utf-8')
+        if len(password_bytes) > 72:
+            password_bytes = password_bytes[:72]
+        return bcrypt.checkpw(password_bytes, hashed_password.encode('utf-8'))
+    except Exception as e:
+        print(f"bcrypt verification failed: {e}")
+        # Last resort: plain text (NOT SECURE - only for development)
         return plain_password == hashed_password
-    return pwd_context.verify(plain_password, hashed_password)
 
 def hash_password(password: str) -> str:
     """Hash password (bcrypt has 72-byte limit)"""
-    if not HAS_PASSLIB or not pwd_context:
-        # Fallback: return plain text (NOT SECURE - only for development)
-        return password
     # Truncate password to 72 bytes if needed (bcrypt limitation)
     password_bytes = password.encode('utf-8')
     if len(password_bytes) > 72:
-        password = password_bytes[:72].decode('utf-8', errors='ignore')
-    return pwd_context.hash(password)
+        password_bytes = password_bytes[:72]
+    
+    # Try passlib first
+    if HAS_PASSLIB and pwd_context:
+        try:
+            return pwd_context.hash(password)
+        except Exception as e:
+            # Fallback to direct bcrypt if passlib fails (version compatibility issue)
+            print(f"passlib hashing failed, using direct bcrypt: {e}")
+    
+    # Fallback: Use bcrypt directly
+    try:
+        import bcrypt
+        return bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode('utf-8')
+    except Exception as e:
+        print(f"bcrypt hashing failed: {e}")
+        # Last resort: return plain text (NOT SECURE - only for development)
+        return password
 
 # Initialize default users if they don't exist
 def initialize_default_users():
@@ -140,9 +171,12 @@ def initialize_default_users():
     }
     for username, password in default_users.items():
         existing = get_user_from_redis(username)
-        if not existing:
-            password_hash = hash_password(password)
-            save_user_to_redis(username, password_hash, {"role": "admin" if username == "admin" else "user"})
+        # Always reset password hash to ensure it's correct (in case hash format changed)
+        password_hash = hash_password(password)
+        save_user_to_redis(username, password_hash, {"role": "admin" if username == "admin" else "user"}, update_existing=True)
+        if existing:
+            print(f"✅ Updated password for existing user: {username}")
+        else:
             print(f"✅ Initialized default user: {username}")
 
 def verify_api_key(x_api_key: str = Depends(API_KEY_HEADER)):
@@ -1400,12 +1434,15 @@ async def get_greeks(symbol: str):
 
 
 @app.get("/api/charts/{symbol}")
+@limiter.limit("100/minute")
 async def get_charts(
+    request: Request,
     symbol: str,
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
     resolution: str = Query("5m"),
-    include_indicators: bool = Query(False)
+    include_indicators: bool = Query(False),
+    current_user: dict = Depends(get_current_user)
 ):
     """Get OHLC chart data from Redis DB 2 (analytics)"""
     return await get_chart_data_internal(symbol, date_from, date_to, resolution, include_indicators)
@@ -1484,14 +1521,52 @@ async def get_chart_data_internal(
         
         # Get indicators overlay if requested
         indicators_overlay = {}
-        if include_indicators and symbol:
+        if include_indicators and symbol and len(ohlc_data) > 0:
             try:
-                indicators = await get_indicators(symbol)
-                # TODO: Calculate indicator values for each OHLC point
-                # For now, return current indicator values
-                indicators_overlay = indicators.get('indicators', {})
-            except Exception:
-                pass
+                # Get indicators from DB 5
+                db5_client = RedisManager82.get_client(process_name="api", db=5, decode_responses=False)
+                
+                # Fetch current indicator values
+                ema_20 = db5_client.get(f"indicators:{symbol}:ema_20")
+                ema_50 = db5_client.get(f"indicators:{symbol}:ema_50")
+                ema_100 = db5_client.get(f"indicators:{symbol}:ema_100")
+                ema_200 = db5_client.get(f"indicators:{symbol}:ema_200")
+                vwap_val = db5_client.get(f"indicators:{symbol}:vwap")
+                
+                # Helper to parse indicator value
+                def parse_indicator(val):
+                    if not val:
+                        return None
+                    if isinstance(val, bytes):
+                        val = val.decode('utf-8')
+                    try:
+                        return float(val)
+                    except:
+                        return None
+                
+                # Calculate EMA arrays (simple: use current EMA for all points, or calculate if we have historical)
+                # For now, use current EMA values as constant lines (can be enhanced with historical calculation)
+                ema_20_val = parse_indicator(ema_20)
+                ema_50_val = parse_indicator(ema_50)
+                ema_100_val = parse_indicator(ema_100)
+                ema_200_val = parse_indicator(ema_200)
+                vwap_val_parsed = parse_indicator(vwap_val)
+                
+                # Create arrays matching OHLC length
+                if ema_20_val is not None:
+                    indicators_overlay['ema_20'] = [ema_20_val] * len(ohlc_data)
+                if ema_50_val is not None:
+                    indicators_overlay['ema_50'] = [ema_50_val] * len(ohlc_data)
+                if ema_100_val is not None:
+                    indicators_overlay['ema_100'] = [ema_100_val] * len(ohlc_data)
+                if ema_200_val is not None:
+                    indicators_overlay['ema_200'] = [ema_200_val] * len(ohlc_data)
+                if vwap_val_parsed is not None:
+                    indicators_overlay['vwap'] = [vwap_val_parsed] * len(ohlc_data)
+            except Exception as e:
+                print(f"Error loading indicators overlay: {e}")
+                import traceback
+                traceback.print_exc()
         
         return {
             "symbol": symbol,
@@ -1508,7 +1583,13 @@ async def get_chart_data_internal(
 
 
 @app.get("/api/volume-profile/{symbol}")
-async def get_volume_profile(symbol: str, date: Optional[str] = Query(None)):
+@limiter.limit("100/minute")
+async def get_volume_profile(
+    request: Request,
+    symbol: str,
+    date: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user)
+):
     """Get volume profile from Redis DB 2 (analytics)"""
     try:
         from redis_files.redis_manager import RedisManager82

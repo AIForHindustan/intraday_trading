@@ -301,7 +301,7 @@ from redis_files.redis_ohlc_keys import normalize_symbol, ohlc_latest_hash
 def check_ohlc_data_health():
     """Monitor OHLC data completeness."""
     try:
-        from core.redis_config import ohlc_redis
+        from redis_files.redis_config import ohlc_redis
         client = ohlc_redis.client
     except Exception as exc:
         print(f"Unable to create OHLC Redis client: {exc}")

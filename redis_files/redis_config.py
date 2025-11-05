@@ -145,7 +145,7 @@ REDIS_DATABASES: Dict[int, Dict[str, Any]] = {
         "use_json": True,  # Enable for complex alert/pattern structures
     },
     # Analytics / Historical data (consolidated from DBs 5,13)
-    # Historical data, metrics, volume profiles
+    # Historical data, metrics, volume profiles, volume state, straddle volumes
     2: {
         "name": "analytics",
         "ttl": 57_600,
@@ -158,6 +158,10 @@ REDIS_DATABASES: Dict[int, Dict[str, Any]] = {
             "performance_data",
             "metrics_cache",
             "analytics_data",
+            # ✅ Volume state and analytics (consolidated from DB 0)
+            "volume_state",  # Session state for incremental volume calculation (volume_state:{token})
+            "straddle_volume",  # Straddle volume analytics (straddle_volume:{underlying}:{date})
+            "volume_profile",  # Volume profile data (volume_profile:poc:*, volume_profile:session:*, etc.)
         ],
         "client_tracking": True,  # ideal for local cache invalidation
         "use_json": False,

@@ -50,9 +50,17 @@ class RedisKeyStandards:
         'bucket_history': 'bucket_incremental_volume:history:{resolution}:{symbol}',
         'bucket_daily': 'bucket_incremental_volume:bucket_incremental_volume:bucket:{symbol}:daily:{date}',
         
-        # Volume profile
-        'volume_profile': 'volume_profile:nodes:{symbol}',
-        'volume_patterns': 'volume_profile:patterns:{symbol}:daily',
+        # Volume profile (DB 2 - analytics)
+        'volume_profile_poc': 'volume_profile:poc:{symbol}',
+        'volume_profile_nodes': 'volume_profile:nodes:{symbol}',
+        'volume_profile_session': 'volume_profile:session:{symbol}:{date}',
+        'volume_profile_distribution': 'volume_profile:distribution:{symbol}:{date}',
+        'volume_profile_patterns': 'volume_profile:patterns:{symbol}:daily',
+        'volume_profile_historical': 'volume_profile:historical:{symbol}',
+        
+        # Volume state (DB 2 - analytics)
+        'volume_state': 'volume_state:{instrument_token}',
+        'straddle_volume': 'straddle_volume:{underlying_symbol}:{date}',
         
         # Session data
         'session': 'session:{symbol}:{date}',
@@ -187,6 +195,46 @@ class RedisKeyStandards:
     def get_metrics_key(symbol: str, window: int) -> str:
         """Get metrics key - direct lookup (DB 2 - analytics)"""
         return f"metrics:{symbol}:{window}min"
+    
+    @staticmethod
+    def get_volume_profile_poc_key(symbol: str) -> str:
+        """Get volume profile POC key - direct lookup (DB 2 - analytics)"""
+        return f"volume_profile:poc:{symbol}"
+    
+    @staticmethod
+    def get_volume_profile_nodes_key(symbol: str) -> str:
+        """Get volume profile nodes key - direct lookup (DB 2 - analytics)"""
+        return f"volume_profile:nodes:{symbol}"
+    
+    @staticmethod
+    def get_volume_profile_session_key(symbol: str, date: str) -> str:
+        """Get volume profile session key - direct lookup (DB 2 - analytics)"""
+        return f"volume_profile:session:{symbol}:{date}"
+    
+    @staticmethod
+    def get_volume_profile_distribution_key(symbol: str, date: str) -> str:
+        """Get volume profile distribution key - direct lookup (DB 2 - analytics)"""
+        return f"volume_profile:distribution:{symbol}:{date}"
+    
+    @staticmethod
+    def get_volume_profile_patterns_key(symbol: str) -> str:
+        """Get volume profile patterns key - direct lookup (DB 2 - analytics)"""
+        return f"volume_profile:patterns:{symbol}:daily"
+    
+    @staticmethod
+    def get_volume_profile_historical_key(symbol: str) -> str:
+        """Get volume profile historical key - direct lookup (DB 2 - analytics)"""
+        return f"volume_profile:historical:{symbol}"
+    
+    @staticmethod
+    def get_volume_state_key(instrument_token: str) -> str:
+        """Get volume state key - direct lookup (DB 2 - analytics)"""
+        return f"volume_state:{instrument_token}"
+    
+    @staticmethod
+    def get_straddle_volume_key(underlying_symbol: str, date: str) -> str:
+        """Get straddle volume key - direct lookup (DB 2 - analytics)"""
+        return f"straddle_volume:{underlying_symbol}:{date}"
     
     @staticmethod
     def validate_no_pattern_matching(client, operation_description: str = ""):

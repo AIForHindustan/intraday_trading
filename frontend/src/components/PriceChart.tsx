@@ -16,7 +16,7 @@ export default function PriceChart({ ohlc, ema, vwap, height = 380 }: Props) {
   const chartRef = useRef<IChartApi | null>(null);
 
   useEffect(() => {
-    if (!ref.current) return;
+    if (!ref.current || !ohlc || ohlc.length === 0) return;
     if (chartRef.current) { 
       chartRef.current.remove(); 
       chartRef.current = null; 
