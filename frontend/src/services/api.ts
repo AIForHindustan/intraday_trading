@@ -36,6 +36,12 @@ function getApiBaseUrl(): string {
 
 const API_BASE = getApiBaseUrl();
 
+// Debug logging for API base URL (helpful for troubleshooting)
+if (typeof window !== 'undefined' && import.meta.env.DEV) {
+  console.log('🔌 API Base URL:', API_BASE);
+  console.log('🔌 VITE_API_URL env:', import.meta.env.VITE_API_URL || 'not set');
+}
+
 const api = axios.create({
   baseURL: API_BASE,
   timeout: 20000,             // 20s timeout
@@ -52,6 +58,17 @@ api.interceptors.request.use((config) => {
     config.headers.Authorization = `Bearer ${token}`;
   }
   return config;
+});
+
+// Request interceptor for debugging
+api.interceptors.request.use((config) => {
+  if (typeof window !== 'undefined' && import.meta.env.DEV) {
+    console.log('🌐 API Request:', config.method?.toUpperCase(), config.url, config.baseURL);
+  }
+  return config;
+}, (error) => {
+  console.error('❌ API Request Error:', error);
+  return Promise.reject(error);
 });
 
 // Error interceptor for better timeout/network error messages
@@ -168,8 +185,11 @@ export const authAPI = {
       }
     });
   },
-  refresh: (refreshToken?: string) => 
-    api.post<AuthResponse>('/auth/refresh', { refresh_token: refreshToken }),
+  refresh: async (refreshToken?: string) => {
+    // Backend expects refresh_token as query parameter or JSON body
+    // Using JSON body for consistency with other endpoints
+    return api.post<AuthResponse>('/auth/refresh', { refresh_token: refreshToken });
+  },
   logout: () => {
     localStorage.removeItem('access_token');
     localStorage.removeItem('refresh_token');

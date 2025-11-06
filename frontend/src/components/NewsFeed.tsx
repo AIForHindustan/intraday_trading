@@ -1,32 +1,37 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { newsAPI } from '../services/api';
 import { Box, Typography, Paper, List, ListItem, ListItemText, TextField, Button } from '@mui/material';
 import { formatDistanceToNow } from 'date-fns';
 
-const NewsFeed: React.FC = () => {
+const NewsFeed: React.FC = React.memo(() => {
   const [symbol, setSymbol] = useState('');
   const [news, setNews] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
 
-  const fetchNews = async () => {
+  // Memoized fetch function to avoid recreation on each render
+  const fetchNews = useCallback(async () => {
     setLoading(true);
     try {
+      console.log('📰 NewsFeed: Fetching news...');
       const response = symbol ? await newsAPI.getBySymbol(symbol, 50, 180) : await newsAPI.getLatestMarket();
+      console.log('📰 NewsFeed: Response received:', response?.status, response?.data?.length || 'N/A');
       // API returns array directly, not wrapped in {news: [...]}
       const newsData = Array.isArray(response.data) ? response.data : (response.data?.news || []);
-      setNews(newsData);
-    } catch (err) {
-      console.error('Failed to fetch news', err);
+      console.log('📰 NewsFeed: Parsed news items:', newsData.length);
+      setNews(newsData); // Always update - React.memo will handle re-render optimization
+    } catch (err: any) {
+      console.error('❌ NewsFeed: Failed to fetch news', err);
+      console.error('❌ Error details:', err?.response?.status, err?.response?.data, err?.message);
+      console.error('❌ Request URL:', err?.config?.url, err?.config?.baseURL);
       setNews([]);
     } finally {
       setLoading(false);
     }
-  };
+  }, [symbol]);
 
   useEffect(() => {
     fetchNews();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [fetchNews]);
 
   return (
     <Box>
@@ -44,18 +49,29 @@ const NewsFeed: React.FC = () => {
           </Button>
         </Box>
         <List>
-          {news.map((item, index) => (
-            <ListItem key={index} component="a" href={item.url} target="_blank" rel="noopener noreferrer" sx={{ color: 'inherit' }}>
-              <ListItemText
-                primary={item.headline}
-                secondary={`${item.source} — ${formatDistanceToNow(new Date(item.timestamp), { addSuffix: true })}`}
-              />
-            </ListItem>
-          ))}
+          {news.map((item, index) => {
+            // Handle both backend formats: {title, link} or {headline, url}
+            const title = item.headline || item.title || 'No title';
+            const url = item.url || item.link || '#';
+            const source = item.source || item.publisher || 'Unknown';
+            const timestamp = item.timestamp || item.collected_at || item.date || item.written_at || new Date().toISOString();
+            const timeAgo = formatDistanceToNow(new Date(timestamp), { addSuffix: true });
+            
+            return (
+              <ListItem key={`${index}-${title}`} component="a" href={url} target="_blank" rel="noopener noreferrer" sx={{ color: 'inherit' }}>
+                <ListItemText
+                  primary={title}
+                  secondary={`${source} — ${timeAgo}`}
+                />
+              </ListItem>
+            );
+          })}
         </List>
       </Paper>
     </Box>
   );
-};
+});
+
+NewsFeed.displayName = 'NewsFeed';
 
 export default NewsFeed;

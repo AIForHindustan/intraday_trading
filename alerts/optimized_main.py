@@ -22,7 +22,7 @@ import json
 import time
 import os
 import random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -30,6 +30,21 @@ import concurrent.futures
 
 # Shared executor for Redis operations (created once, reused for all requests)
 redis_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="redis_worker")
+
+# Redis connection cache for reuse across requests (performance optimization)
+_redis_client_cache: Dict[str, Any] = {}
+
+def get_cached_redis_client(process_name: str = "api", db: int = 0, decode_responses: bool = False):
+    """Get or create a cached Redis client to avoid connection overhead"""
+    cache_key = f"{process_name}:db{db}:decode{decode_responses}"
+    if cache_key not in _redis_client_cache:
+        from redis_files.redis_manager import RedisManager82
+        _redis_client_cache[cache_key] = RedisManager82.get_client(
+            process_name=process_name, 
+            db=db, 
+            decode_responses=decode_responses
+        )
+    return _redis_client_cache[cache_key]
 
 # Use uvloop for better async performance if available
 try:
@@ -113,15 +128,18 @@ async def initialize_redis_connections():
     """Pre-warm Redis connections to avoid first-connection delays"""
     def warmup_redis():
         try:
-            from redis_files.redis_manager import RedisManager82
-            # Warm up connections for all dbs you use
-            client_db0 = RedisManager82.get_client(process_name="api", db=0, decode_responses=True)
+            # Pre-warm connections for all databases used by the API
+            # This populates the cache so first requests are fast
+            client_db0 = get_cached_redis_client(process_name="api", db=0, decode_responses=True)
             client_db0.ping()
-            print("✓ Redis DB0 connection warmed up")
             
-            # Add other databases if you use them
-            # client_db1 = RedisManager82.get_client(process_name="api", db=1, decode_responses=True)
-            # client_db1.ping()
+            client_db1 = get_cached_redis_client(process_name="api", db=1, decode_responses=False)
+            client_db1.ping()
+            
+            client_db2 = get_cached_redis_client(process_name="api", db=2, decode_responses=False)
+            client_db2.ping()
+            
+            print("✓ Redis connections warmed up (DB0, DB1, DB2)")
             
         except Exception as e:
             print(f"❌ Redis warmup failed: {e}")
@@ -1108,8 +1126,16 @@ async def create_user(
         raise HTTPException(status_code=500, detail="Failed to create user")
 
 @app.post("/api/auth/refresh")
-async def refresh_token(refresh_token: Optional[str] = None):
+async def refresh_token(request: Request):
     """Refresh access token (for future implementation)"""
+    # Parse refresh_token from JSON body (frontend sends JSON)
+    try:
+        body = await request.json()
+        refresh_token = body.get("refresh_token")
+    except Exception:
+        # Fallback to query parameter for backward compatibility
+        refresh_token = request.query_params.get("refresh_token")
+    
     # For now, just return a new token if refresh_token is valid
     # In production, implement proper refresh token validation
     return {"access_token": create_access_token(data={"sub": "user"}), "token_type": "bearer"}
@@ -2800,14 +2826,13 @@ async def get_market_indices():
     Priority:
     1. ohlc_latest:{symbol} hash in DB 2 (bucket format when market is on)
     2. index:NSE:{name} JSON in DB 1 (gift_nifty_gap.py format when market is off)
+    
+    Optimized: Uses cached Redis connections to avoid connection overhead.
     """
     try:
-        from redis_files.redis_manager import RedisManager82
-        
-        # Get clients for both DB 1 (realtime) and DB 2 (analytics)
-        # Per REDIS_STORAGE_SIGNATURE.md: ohlc_latest is in DB 2, index:NSE: is in DB 1
-        db1_client = RedisManager82.get_client(process_name="api", db=1, decode_responses=False)
-        db2_client = RedisManager82.get_client(process_name="api", db=2, decode_responses=False)
+        # Use cached Redis clients to avoid connection overhead on each request
+        db1_client = get_cached_redis_client(process_name="api", db=1, decode_responses=False)
+        db2_client = get_cached_redis_client(process_name="api", db=2, decode_responses=False)
         
         indices = {}
         # Map index names to symbol variations for bucket lookup

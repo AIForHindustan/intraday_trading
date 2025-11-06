@@ -12,11 +12,11 @@ function getWebSocketBaseUrl(): string {
     const origin = window.location.origin;
     const port = window.location.port;
     
-    // If running on standard Vite dev port (5173) or production, default to FastAPI port 8000
+    // If running on standard Vite dev port (5173) or production, default to backend port 5001
     if (!port || port === '5173' || port === '3000') {
-      // Default to port 8000 for FastAPI standard, but allow env override
+      // Default to port 5001 for current backend, but allow env override
       const isDev = port === '5173' || port === '3000';
-      const backendPort = import.meta.env.VITE_WS_PORT || import.meta.env.VITE_API_PORT || (isDev ? '8000' : port || '8000');
+      const backendPort = import.meta.env.VITE_WS_PORT || import.meta.env.VITE_API_PORT || (isDev ? '5001' : port || '5001');
       return `${origin.split(':').slice(0, 2).join(':')}:${backendPort}`;
     }
     
@@ -26,7 +26,7 @@ function getWebSocketBaseUrl(): string {
   
   // Fallback for SSR or non-browser environments
   // Default to 5001 to match current backend, but allow override
-  return import.meta.env.VITE_WS_URL || 'http://localhost:5001';
+  return import.meta.env.VITE_WS_URL || 'ws://localhost:5001';
 }
 
 const WS_BASE_URL = getWebSocketBaseUrl();
