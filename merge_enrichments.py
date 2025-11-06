@@ -99,8 +99,8 @@ print(f"✅ Merged file saved: {output_file}")
 print(f"\n🔧 Running enrichment on merged file...")
 print("=" * 70)
 
-# Import enrichment functions
-from enrich_metadata_comprehensive import (
+# Import enrichment functions (consolidated in parquet_ingester)
+from parquet_ingester import (
     enrich_metadata_comprehensive,
     generate_final_statistics,
     save_enriched_metadata

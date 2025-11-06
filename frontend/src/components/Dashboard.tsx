@@ -6,6 +6,7 @@ import { alertsAPI, newsAPI, chartsAPI } from '../services/api';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { adaptOhlcPayload, adaptOverlays } from '../services/adapters';
+import { formatDistanceToNow } from 'date-fns';
 
 interface QuickStats {
   total_alerts: number;
@@ -21,8 +22,13 @@ interface NewsItem {
   description?: string;
   published_at?: string;
   timestamp?: string;
+  collected_at?: string;
+  written_at?: string;
+  date?: string;
   source?: string;
+  publisher?: string;
   url?: string;
+  link?: string;
 }
 
 const Dashboard: React.FC = () => {
@@ -253,9 +259,9 @@ const Dashboard: React.FC = () => {
                         })()}
                       </Typography>
                     )}
-                    {(news.published_at || news.timestamp) && (
+                    {(news.published_at || news.timestamp || news.collected_at || news.written_at || news.date) && (
                       <Typography variant="caption" color="text.secondary">
-                        {new Date(news.published_at || news.timestamp || Date.now()).toLocaleDateString()}
+                        {formatDistanceToNow(new Date(news.published_at || news.timestamp || news.collected_at || news.written_at || news.date || Date.now()), { addSuffix: true })}
                       </Typography>
                     )}
                   </Box>

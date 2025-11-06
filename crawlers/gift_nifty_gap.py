@@ -729,7 +729,7 @@ class IndexDataUpdater:
         return ""
 
     def _extract_symbols_from_news(self, news_item):
-        """Extract relevant symbols from news title/content using sector-based parsing"""
+        """Extract relevant symbols from news using company name matching and sectoral mapping"""
         title = news_item.get('title', '')
         content = news_item.get('content', '')
         full_content = f"{title} {content}".strip()
@@ -737,130 +737,107 @@ class IndexDataUpdater:
         if not full_content:
             return ['NSE:NIFTY BANK', 'NSE:NIFTY 50']
         
-        symbols = set()
-        sectors = set()
-        sub_categories = set()
         text_upper = full_content.upper()
-        
-        # Use token cache if available
-        token_cache = None
-        if hasattr(self, 'token_cache') and self.token_cache:
-            token_cache = self.token_cache
-        else:
-            try:
-                from token_cache import TokenCacheManager
-                token_cache = TokenCacheManager(cache_path="core/data/token_lookup_enriched.json", verbose=False)
-            except:
-                pass
-        
-        # Extract potential symbol patterns from text
-        potential_symbols = set()
-        pattern = r'\b([A-Z]{2,15})\b'
-        matches = re.findall(pattern, text_upper)
-        common_words = {
-            'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS', 'ONE',
-            'OUR', 'OUT', 'DAY', 'GET', 'HAS', 'HIM', 'HIS', 'HOW', 'ITS', 'MAY', 'NEW', 'NOW',
-            'OLD', 'SEE', 'TWO', 'WAY', 'WHO', 'BOY', 'DID', 'LET', 'PUT', 'SAY',
-            'SHE', 'TOO', 'USE', 'NSE', 'BSE', 'FII', 'DII', 'IPO', 'EPS', 'PEG', 'PE', 'ROI',
-            'WITH', 'FROM', 'THIS', 'THAT', 'THAN', 'THEY', 'WHAT', 'WHEN', 'WHERE', 'WHICH'
-        }
-        
-        for match in matches:
-            if match not in common_words and len(match) >= 2:
-                potential_symbols.add(match)
-        
-        # Check for option/future symbols
-        option_pattern = r'\b([A-Z]+\d{2}[A-Z]{3}\d+(?:CE|PE|FUT))\b'
-        option_matches = re.findall(option_pattern, text_upper)
-        for opt_match in option_matches:
-            potential_symbols.add(opt_match)
-        
-        # Process each potential symbol
-        checked_symbols = set()
-        for potential in potential_symbols:
-            if potential in checked_symbols:
-                continue
-            checked_symbols.add(potential)
-            
-            # Extract underlying for options/futures
-            underlying = self._extract_underlying_symbol(potential)
-            
-            # Check if underlying exists in token cache
-            if token_cache:
-                token = token_cache.symbol_to_token(underlying)
-                if token:
-                    symbols.add(underlying)
-                    sector = self._get_sector_from_symbol(underlying)
-                    if sector:
-                        sectors.add(sector)
-                        sub_categories.add(underlying)
-                elif token_cache.symbol_to_token(potential):
-                    symbols.add(potential)
-                    sector = self._get_sector_from_symbol(potential)
-                    if sector:
-                        sectors.add(sector)
-                        sub_categories.add(potential)
-            else:
-                # Without token cache, use sector matching
-                sector = self._get_sector_from_symbol(underlying)
-                if sector:
-                    symbols.add(underlying)
-                    sectors.add(sector)
-                    sub_categories.add(underlying)
-        
-        # Check for index patterns
-        if 'BANKNIFTY' in text_upper or 'BANK NIFTY' in text_upper:
-            symbols.add('BANKNIFTY')
-            sectors.add('BANK')
-        if 'NIFTY' in text_upper:
-            symbols.add('NIFTY')
-            sectors.add('INDEX')
-        if 'FINNIFTY' in text_upper:
-            symbols.add('FINNIFTY')
-            sectors.add('INDEX')
-        
-        # Build result with NSE: prefixes
         result_symbols = []
         symbol_set = set()
+        sectors = set()
+        matched_symbols = set()
         
-        for symbol in symbols:
+        # Load token lookup for sector information
+        token_lookup = {}
+        try:
+            token_lookup_file = Path(__file__).parent.parent / "core" / "data" / "token_lookup_enriched.json"
+            if token_lookup_file.exists():
+                with open(token_lookup_file, 'r') as f:
+                    token_lookup = json.load(f)
+        except Exception as e:
+            logger.debug(f"Could not load token lookup: {e}")
+        
+        # Step 1: Match company names from news text to company_symbol_map
+        # Only match equity stocks, exclude options/futures
+        if self.company_symbol_map:
+            for company_name, symbol_list in self.company_symbol_map.items():
+                # Skip very short company names (likely false matches)
+                if len(company_name) < 4:
+                    continue
+                
+                # Check if company name appears in news text (exact match or significant words)
+                company_words = [w for w in company_name.split() if len(w) > 3]
+                if company_name in text_upper or (company_words and any(word in text_upper for word in company_words)):
+                    for symbol_info in symbol_list:
+                        symbol = symbol_info.get('symbol', '')
+                        full_symbol = symbol_info.get('full_symbol', '')
+                        instrument_type = symbol_info.get('instrument_type', '')
+                        
+                        # Skip options, futures, and indices - only match equity stocks
+                        if instrument_type in ['CE', 'PE', 'FUT', 'OPT']:
+                            continue
+                        if 'CE' in symbol or 'PE' in symbol or 'FUT' in symbol:
+                            continue
+                        if symbol in ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX']:
+                            continue
+                        
+                        if full_symbol:
+                            # Get sector from token lookup
+                            for token_str, inst_data in token_lookup.items():
+                                if inst_data.get('key') == full_symbol:
+                                    sector = inst_data.get('sector', '').upper()
+                                    if sector and sector not in ['UNKNOWN', 'OTHER', 'MISSING', '']:
+                                        sectors.add(sector)
+                                    
+                                    # Add the symbol (only equity stocks)
+                                    inst_type = inst_data.get('instrument_type', '')
+                                    if inst_type not in ['CE', 'PE', 'FUT', 'OPT'] and full_symbol not in symbol_set:
+                                        matched_symbols.add(full_symbol)
+                                        symbol_set.add(full_symbol)
+                                    break
+                        elif symbol and symbol not in ['NIFTY', 'BANKNIFTY', 'FINNIFTY']:
+                            # Fallback to symbol matching (only equity)
+                            nse_symbol = f"NSE:{symbol}" if ':' not in symbol else symbol
+                            if 'CE' not in nse_symbol and 'PE' not in nse_symbol and 'FUT' not in nse_symbol:
+                                if nse_symbol not in symbol_set:
+                                    matched_symbols.add(nse_symbol)
+                                    symbol_set.add(nse_symbol)
+        
+        # Step 2: Add matched symbols to result
+        for symbol in matched_symbols:
             if ':' not in symbol:
                 nse_symbol = f"NSE:{symbol}"
-                if nse_symbol not in symbol_set:
-                    result_symbols.append(nse_symbol)
-                    symbol_set.add(nse_symbol)
+                result_symbols.append(nse_symbol)
             else:
-                if symbol not in symbol_set:
-                    result_symbols.append(symbol)
-                    symbol_set.add(symbol)
+                result_symbols.append(symbol)
         
-        for sub_cat in sub_categories:
-            if ':' not in sub_cat:
-                nse_symbol = f"NSE:{sub_cat}"
-                if nse_symbol not in symbol_set:
-                    result_symbols.append(nse_symbol)
-                    symbol_set.add(nse_symbol)
-            else:
-                if sub_cat not in symbol_set:
-                    result_symbols.append(sub_cat)
-                    symbol_set.add(sub_cat)
-        
-        # Sector-based routing - if BANK sector, add BANKNIFTY
-        if 'BANK' in sectors:
+        # Step 3: Route to indices based on sectoral mapping
+        # Banking sector companies → NIFTY BANK
+        if 'BANK' in sectors or any('BANK' in str(s).upper() for s in sectors):
             if 'NSE:NIFTY BANK' not in symbol_set:
                 result_symbols.append('NSE:NIFTY BANK')
                 symbol_set.add('NSE:NIFTY BANK')
         
-        # Index mentions
+        # Check for explicit index mentions in text
         if 'BANKNIFTY' in text_upper or 'BANK NIFTY' in text_upper:
             if 'NSE:NIFTY BANK' not in symbol_set:
                 result_symbols.append('NSE:NIFTY BANK')
                 symbol_set.add('NSE:NIFTY BANK')
-        if 'NIFTY' in text_upper:
+        
+        if 'FINNIFTY' in text_upper:
+            if 'NSE:FINNIFTY' not in symbol_set:
+                result_symbols.append('NSE:FINNIFTY')
+                symbol_set.add('NSE:FINNIFTY')
+        
+        # Generic NIFTY mention (only if not already covered)
+        if 'NIFTY' in text_upper and 'NSE:NIFTY BANK' not in symbol_set and 'NSE:FINNIFTY' not in symbol_set:
             if 'NSE:NIFTY 50' not in symbol_set:
                 result_symbols.append('NSE:NIFTY 50')
                 symbol_set.add('NSE:NIFTY 50')
         
+        # If we found any company symbols but no indices, default to NIFTY 50
+        if matched_symbols and not any('NIFTY' in s for s in result_symbols):
+            if 'NSE:NIFTY 50' not in symbol_set:
+                result_symbols.append('NSE:NIFTY 50')
+                symbol_set.add('NSE:NIFTY 50')
+        
+        # Default fallback
         if not result_symbols:
             result_symbols = ['NSE:NIFTY BANK', 'NSE:NIFTY 50']
         

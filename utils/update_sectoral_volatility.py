@@ -1,32 +1,31 @@
 #!/usr/bin/env python3
 """
-Update Sectoral Volatility Data from NSE
-Fetches sectoral indices and their constituents directly from NSE for backtesting and sector correlation analysis
+Update Sectoral Volatility Data for Baseline Understanding
+Fetches sectoral indices (not constituents) and calculates their overall volatility for baseline market regime analysis
 
 USAGE:
-    - Used by: Backtesting system, sector correlation analysis
+    - Used by: Market regime analysis, baseline volatility understanding
     - Called from: Production scheduler, manual execution
     - Saves to: config/sector_volatility.json
-    - Dependencies: requests, json, datetime, pathlib
+    - Dependencies: Zerodha Kite Connect API, json, datetime
 
 PURPOSE:
-    - Updates sectoral volatility data for 9 NSE sectoral indices
-    - Fetches constituents and volatility data directly from NSE
-    - Covers NIFTY_50, NIFTY_BANK, NIFTY_AUTO, NIFTY_IT, NIFTY_PHARMA, NIFTY_FMCG, NIFTY_METAL, NIFTY_ENERGY, NIFTY_REALTY
-    - Used for backtesting and sector correlation analysis
-    - Independent of intraday crawler (174 instruments)
+    - Updates overall volatility for 9 NSE sectoral indices (the indices themselves, not constituents)
+    - Fetches historical index data from Zerodha API
+    - Calculates 20-day and 55-day volatility for each index
+    - Provides baseline volatility understanding for market regime analysis
+    - Covers: NIFTY 50, NIFTY BANK, NIFTY AUTO, NIFTY IT, NIFTY PHARMA, NIFTY FMCG, NIFTY METAL, NIFTY ENERGY, NIFTY REALTY
 
-NSE SECTORAL INDICES:
-    - NIFTY_50: 50 stocks (broad market)
-    - NIFTY_BANK: 12 stocks (banking sector)
-    - NIFTY_AUTO: 10 stocks (automotive sector)
-    - NIFTY_IT: 9 stocks (IT sector)
-    - NIFTY_PHARMA: 10 stocks (pharmaceutical sector)
-    - NIFTY_FMCG: 10 stocks (FMCG sector)
-    - NIFTY_METAL: 10 stocks (metals sector)
-    - NIFTY_ENERGY: 9 stocks (energy sector)
-    - NIFTY_REALTY: 6 stocks (realty sector)
-    - Total: 126+ stocks across 9 sectors
+NSE SECTORAL INDICES (Index Symbols):
+    - NIFTY 50: NSE:NIFTY 50 (broad market index)
+    - NIFTY BANK: NSE:NIFTY BANK (banking sector index)
+    - NIFTY AUTO: NSE:NIFTY AUTO (automotive sector index)
+    - NIFTY IT: NSE:NIFTY IT (IT sector index)
+    - NIFTY PHARMA: NSE:NIFTY PHARMA (pharmaceutical sector index)
+    - NIFTY FMCG: NSE:NIFTY FMCG (FMCG sector index)
+    - NIFTY METAL: NSE:NIFTY METAL (metals sector index)
+    - NIFTY ENERGY: NSE:NIFTY ENERGY (energy sector index)
+    - NIFTY REALTY: NSE:NIFTY REALTY (realty sector index)
 
 SCHEDULING:
     - WEEKLY EXECUTION: Run every Sunday for weekly sector updates
@@ -35,14 +34,13 @@ SCHEDULING:
     - Production scheduler: Integrated with weekly data refresh
     - Market calendar aware: Skips holidays
 
-CREATED: January 15, 2025
-UPDATED: January 15, 2025 - Initial implementation for NSE sectoral indices
+CREATED: October 31, 2025
+UPDATED: November 6, 2025 - Initial implementation for NSE sectoral indices
 """
 
 import sys
 from pathlib import Path
 import json
-import requests
 from datetime import datetime, timedelta
 import time
 import math
@@ -50,82 +48,111 @@ import math
 # Add parent directory to path to import from config
 sys.path.append(str(Path(__file__).parent.parent))
 
-def get_nse_sectoral_indices():
-    """
-    Get sectoral indices data from NSE API
-    
-    RETURNS:
-        dict: Sectoral indices data with constituents and volatility
-    """
-    try:
-        print("🌐 FETCHING NSE SECTORAL INDICES DATA")
-        print("=" * 60)
-        
-        # NSE sectoral indices endpoints
-        sectoral_endpoints = {
-            'NIFTY_50': 'https://www.niftyindices.com/indices/equity/sectoral-indices/nifty-50',
-            'NIFTY_BANK': 'https://www.niftyindices.com/indices/equity/sectoral-indices/nifty-bank',
-            'NIFTY_AUTO': 'https://www.niftyindices.com/indices/equity/sectoral-indices/nifty-auto',
-            'NIFTY_IT': 'https://www.niftyindices.com/indices/equity/sectoral-indices/nifty-it',
-            'NIFTY_PHARMA': 'https://www.niftyindices.com/indices/equity/sectoral-indices/nifty-pharma',
-            'NIFTY_FMCG': 'https://www.niftyindices.com/indices/equity/sectoral-indices/nifty-fmcg',
-            'NIFTY_METAL': 'https://www.niftyindices.com/indices/equity/sectoral-indices/nifty-metal',
-            'NIFTY_ENERGY': 'https://www.niftyindices.com/indices/equity/sectoral-indices/nifty-energy',
-            'NIFTY_REALTY': 'https://www.niftyindices.com/indices/equity/sectoral-indices/nifty-realty'
-        }
-        
-        sectoral_data = {}
-        
-        for sector_name, endpoint in sectoral_endpoints.items():
-            print(f"📊 Fetching {sector_name}...")
-            
-            try:
-                # Make request to NSE API
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
-                
-                response = requests.get(endpoint, headers=headers, timeout=30)
-                response.raise_for_status()
-                
-                # Parse the response (this would need to be adapted based on actual NSE API structure)
-                # For now, we'll create a mock structure based on the existing sector_volatility.json
-                sectoral_data[sector_name] = []
-                
-                # Rate limiting
-                time.sleep(1)
-                
-            except Exception as e:
-                print(f"⚠️ Error fetching {sector_name}: {e}")
-                continue
-        
-        print(f"✅ Fetched data for {len(sectoral_data)} sectors")
-        return sectoral_data
-        
-    except Exception as e:
-        print(f"❌ Error fetching NSE sectoral indices: {e}")
-        return {}
+from config.zerodha_config import ZerodhaConfig
 
-def calculate_sector_volatility(stock_data, window_days=20):
+def get_index_instrument_tokens(kite):
     """
-    Calculate volatility for a stock using price data
+    Get instrument tokens for NSE sectoral indices
     
     ARGS:
-        stock_data: List of price data points
-        window_days: Number of days for volatility calculation
+        kite: Zerodha Kite Connect instance
+    
+    RETURNS:
+        dict: Mapping of index name to instrument token
+    """
+    # NSE sectoral index symbols (Zerodha tradingsymbol format)
+    index_symbols = {
+        'NIFTY_50': 'NIFTY 50',
+        'NIFTY_BANK': 'NIFTY BANK',
+        'NIFTY_AUTO': 'NIFTY AUTO',
+        'NIFTY_IT': 'NIFTY IT',
+        'NIFTY_PHARMA': 'NIFTY PHARMA',
+        'NIFTY_FMCG': 'NIFTY FMCG',
+        'NIFTY_METAL': 'NIFTY METAL',
+        'NIFTY_ENERGY': 'NIFTY ENERGY',
+        'NIFTY_REALTY': 'NIFTY REALTY'
+    }
+    
+    try:
+        # Get all instruments from Zerodha
+        instruments = kite.instruments("NSE")
+        
+        # Map index symbols to tokens
+        index_tokens = {}
+        for index_name, symbol in index_symbols.items():
+            # Find matching instrument by exact tradingsymbol match
+            for inst in instruments:
+                if inst.get('tradingsymbol') == symbol:
+                    index_tokens[index_name] = inst['instrument_token']
+                    print(f"✅ Found {index_name}: token {inst['instrument_token']} ({symbol})")
+                    break
+            else:
+                print(f"⚠️ Could not find token for {index_name} ({symbol})")
+        
+        return index_tokens
+        
+    except Exception as e:
+        print(f"❌ Error fetching instrument tokens: {e}")
+        return {}
+
+def fetch_index_historical_data(kite, instrument_token, days_back=60):
+    """
+    Fetch historical data for an index
+    
+    ARGS:
+        kite: Zerodha Kite Connect instance
+        instrument_token: Instrument token for the index
+        days_back: Number of days of historical data to fetch
+        
+    RETURNS:
+        list: List of historical OHLC data points
+    """
+    try:
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=days_back)
+        
+        historical_data = kite.historical_data(
+            instrument_token=instrument_token,
+            from_date=from_date.date(),
+            to_date=to_date.date(),
+            interval="day"
+        )
+        
+        return historical_data if historical_data else []
+        
+    except Exception as e:
+        print(f"⚠️ Error fetching historical data for token {instrument_token}: {e}")
+        return []
+
+def calculate_index_volatility(historical_data, window_days=20):
+    """
+    Calculate volatility for an index using historical price data
+    
+    ARGS:
+        historical_data: List of historical OHLC data (from Zerodha API)
+        window_days: Number of days for volatility calculation window
         
     RETURNS:
         float: Annualized volatility percentage
     """
     try:
-        if len(stock_data) < window_days:
+        if not historical_data or len(historical_data) < window_days:
             return 0.0
+        
+        # Extract closing prices from historical data
+        closes = [day['close'] for day in historical_data if day.get('close')]
+        
+        if len(closes) < window_days:
+            return 0.0
+        
+        # Use last window_days for calculation
+        recent_closes = closes[-window_days:]
         
         # Calculate daily returns
         returns = []
-        for i in range(1, len(stock_data)):
-            if stock_data[i-1] > 0:
-                daily_return = (stock_data[i] - stock_data[i-1]) / stock_data[i-1]
+        for i in range(1, len(recent_closes)):
+            if recent_closes[i-1] > 0:
+                daily_return = (recent_closes[i] - recent_closes[i-1]) / recent_closes[i-1]
                 returns.append(daily_return)
         
         if len(returns) < 2:
@@ -147,22 +174,32 @@ def calculate_sector_volatility(stock_data, window_days=20):
 
 def update_sectoral_volatility():
     """
-    Update sectoral volatility data from NSE
+    Update sectoral index volatility data from Zerodha API
     
     PROCESS:
-        1. Fetch sectoral indices data from NSE
-        2. Calculate volatility for each constituent
-        3. Update sector_volatility.json with fresh data
-        4. Maintain metadata and structure
+        1. Initialize Zerodha Kite Connect API
+        2. Get instrument tokens for sectoral indices
+        3. Fetch historical data for each index
+        4. Calculate 20-day and 55-day volatility for each index
+        5. Update sector_volatility.json with index volatility data
+        6. Maintain metadata and structure
         
     RETURNS:
-        dict: Updated sectoral volatility data
+        dict: Updated sectoral volatility data with index-level volatility
     """
-    print("🚀 UPDATING SECTORAL VOLATILITY DATA FROM NSE")
+    print("🚀 UPDATING SECTORAL INDEX VOLATILITY DATA")
     print("=" * 70)
-    print("Fetching 9 NSE sectoral indices for backtesting and sector correlation analysis")
-    print("Covers NIFTY_50, NIFTY_BANK, NIFTY_AUTO, NIFTY_IT, NIFTY_PHARMA, NIFTY_FMCG, NIFTY_METAL, NIFTY_ENERGY, NIFTY_REALTY")
+    print("Fetching 9 NSE sectoral indices for baseline volatility understanding")
+    print("Calculating overall index volatility (not individual constituents)")
     print()
+
+    # Initialize Zerodha API
+    try:
+        kite = ZerodhaConfig.get_kite_instance()
+        print("✅ Connected to Zerodha API")
+    except Exception as e:
+        print(f"❌ Failed to connect to Zerodha API: {e}")
+        return {}
 
     # Load existing sector_volatility.json
     project_root = Path(__file__).parent.parent
@@ -173,7 +210,7 @@ def update_sectoral_volatility():
         try:
             with open(sector_file, 'r') as f:
                 existing_data = json.load(f)
-            print(f"✅ Loaded existing sector_volatility.json with {len(existing_data.get('sectors', {}))} sectors")
+            print(f"✅ Loaded existing sector_volatility.json")
         except Exception as e:
             print(f"⚠️ Error loading existing data: {e}")
             existing_data = {}
@@ -181,32 +218,68 @@ def update_sectoral_volatility():
         print("ℹ️ No existing sector_volatility.json found, creating new one")
         existing_data = {}
 
-    # Get NSE sectoral indices data
-    nse_data = get_nse_sectoral_indices()
+    # Get index instrument tokens
+    print("\n🔍 Fetching index instrument tokens...")
+    index_tokens = get_index_instrument_tokens(kite)
     
-    if not nse_data:
-        print("❌ No NSE data fetched, using existing data")
+    if not index_tokens:
+        print("❌ No index tokens found, using existing data")
         return existing_data
 
-    # Update sectoral volatility data
-    updated_sectors = existing_data.get('sectors', {}).copy()
+    # Fetch historical data and calculate volatility for each index
+    print("\n📊 Calculating index volatility...")
+    index_volatility = {}
     
-    # For now, we'll use the existing structure and update metadata
-    # In a real implementation, you would:
-    # 1. Parse the NSE API response
-    # 2. Extract constituent stocks
-    # 3. Calculate fresh volatility data
-    # 4. Update the sectors data
+    for index_name, token in index_tokens.items():
+        print(f"  📈 Processing {index_name} (token {token})...", end=" ")
+        
+        try:
+            # Fetch 60 days of historical data (for both 20d and 55d calculations)
+            historical_data = fetch_index_historical_data(kite, token, days_back=60)
+            
+            if not historical_data:
+                print("❌ No data")
+                continue
+            
+            # Calculate 20-day and 55-day volatility
+            vol_20d = calculate_index_volatility(historical_data, window_days=20)
+            vol_55d = calculate_index_volatility(historical_data, window_days=55)
+            
+            # Get current price
+            current_price = historical_data[-1]['close'] if historical_data else 0.0
+            
+            index_volatility[index_name] = {
+                'symbol': index_name,
+                'instrument_token': token,
+                'current_price': round(current_price, 2),
+                'volatility_20d_pct': vol_20d,
+                'volatility_55d_pct': vol_55d,
+                'data_points': len(historical_data),
+                'last_updated': datetime.now().isoformat()
+            }
+            
+            print(f"✅ Vol 20d: {vol_20d}%, Vol 55d: {vol_55d}%")
+            
+            # Rate limiting
+            time.sleep(0.5)
+            
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            continue
+
+    # Preserve existing sectors data if it exists, but update metadata
+    existing_sectors = existing_data.get('sectors', {})
     
-    # Update metadata
+    # Update metadata with index volatility data
     updated_data = {
         'metadata': {
             'generated_at': datetime.now().isoformat(),
-            'source': 'NSE sectoral indices API',
+            'source': 'Zerodha Kite Connect API',
             'window_days': 20,
-            'sectors': len(updated_sectors),
-            'formula': 'volatility = sqrt(252) * std_dev(price_20d, price_55d)',
-            'data_source': 'https://www.niftyindices.com/indices/equity/sectoral-indices',
+            'sectors': len(index_volatility),
+            'formula': 'volatility = sqrt(252) * std_dev(returns)',
+            'data_type': 'index_volatility',
+            'description': 'Overall volatility for sectoral indices (baseline understanding)',
             'straddle_patterns': {
                 'description': 'Straddle strategy patterns for NIFTY/BANKNIFTY options',
                 'underlying_symbols': ['NIFTY', 'BANKNIFTY'],
@@ -216,39 +289,38 @@ def update_sectoral_volatility():
                 'telegram_routing': True
             }
         },
-        'sectors': updated_sectors
+        'index_volatility': index_volatility,  # New: Index-level volatility
+        'sectors': existing_sectors  # Preserve existing constituent data if any
     }
 
     # Save updated data
     try:
         with open(sector_file, 'w') as f:
             json.dump(updated_data, f, indent=2)
-        print(f"💾 Saved updated sectoral volatility data to {sector_file}")
+        print(f"\n💾 Saved updated sectoral volatility data to {sector_file}")
     except Exception as e:
         print(f"❌ Failed to save sectoral volatility data: {e}")
         return existing_data
 
     # Summary
-    total_stocks = sum(len(stocks) for stocks in updated_sectors.values())
-    print(f"\n📈 SECTORAL VOLATILITY UPDATE SUMMARY")
+    print(f"\n📈 SECTORAL INDEX VOLATILITY UPDATE SUMMARY")
     print("=" * 70)
-    print(f"Total sectors updated: {len(updated_sectors)}")
-    print(f"Total stocks covered: {total_stocks}")
-    print(f"Data source: NSE sectoral indices API")
-    print(f"Use case: Backtesting and sector correlation analysis")
-    print(f"Independent of intraday crawler (174 instruments)")
+    print(f"Total indices updated: {len(index_volatility)}")
+    print(f"Data source: Zerodha Kite Connect API")
+    print(f"Use case: Baseline volatility understanding for market regime analysis")
+    print(f"Data type: Index-level volatility (not individual constituents)")
     
-    # Show sector breakdown
-    if updated_sectors:
-        print(f"\n📊 SECTOR BREAKDOWN:")
-        for sector_name, stocks in updated_sectors.items():
-            print(f"  • {sector_name}: {len(stocks)} stocks")
-            if stocks:
-                sample = stocks[0]
-                print(f"    Sample: {sample.get('symbol')} - Vol: {sample.get('avg_volume_20d', 0):,.0f}")
+    # Show index breakdown
+    if index_volatility:
+        print(f"\n📊 INDEX VOLATILITY BREAKDOWN:")
+        for index_name, data in index_volatility.items():
+            print(f"  • {index_name}:")
+            print(f"    Price: {data['current_price']}")
+            print(f"    20d Vol: {data['volatility_20d_pct']}%")
+            print(f"    55d Vol: {data['volatility_55d_pct']}%")
 
-    print(f"\n✅ SECTORAL VOLATILITY UPDATE COMPLETED")
-    print(f"🎯 Ready for backtesting and sector correlation analysis")
+    print(f"\n✅ SECTORAL INDEX VOLATILITY UPDATE COMPLETED")
+    print(f"🎯 Ready for baseline volatility analysis")
     print(f"📁 Output: config/sector_volatility.json")
     print(f"🔄 Recommended: Weekly execution (Sundays at 6:00 PM IST)")
     
@@ -256,15 +328,15 @@ def update_sectoral_volatility():
 
 def main():
     """Main execution function"""
-    print("🔄 Starting sectoral volatility update from NSE...")
+    print("🔄 Starting sectoral index volatility update...")
     result = update_sectoral_volatility()
     
     if result:
-        print("\n🎉 Sectoral volatility update completed successfully!")
-        print("📊 Ready for backtesting and sector correlation analysis")
+        print("\n🎉 Sectoral index volatility update completed successfully!")
+        print("📊 Ready for baseline volatility analysis")
         return True
     else:
-        print("\n❌ Sectoral volatility update failed!")
+        print("\n❌ Sectoral index volatility update failed!")
         return False
 
 if __name__ == "__main__":
