@@ -10,10 +10,11 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-# Add config directory to path
-sys.path.append(str(Path(__file__).parent / "config"))
+# Add project root to path
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
 
-from zerodha_config import ZerodhaConfig
+from config.zerodha_config import ZerodhaConfig
 
 def load_existing_tokens():
     """Load existing master token file"""
@@ -98,10 +99,22 @@ def update_all_token_files():
             if not symbol or not token:
                 continue
                 
-            # Add to comprehensive mapping (only if not already exists)
+            # Update or add to comprehensive mapping (use token as key to match existing structure)
+            token_str = str(token)
             key = f"{exchange}:{symbol}"
-            if key not in token_mapping:
-                token_mapping[key] = {
+            
+            # Update existing entry or create new one
+            if token_str in token_mapping:
+                # Update existing entry with latest data
+                token_mapping[token_str]['key'] = key
+                token_mapping[token_str]['name'] = name
+                token_mapping[token_str]['exchange'] = exchange
+                token_mapping[token_str]['instrument_type'] = instrument_type
+                token_mapping[token_str]['updated_at'] = datetime.now().isoformat()
+            else:
+                # Add new entry
+                token_mapping[token_str] = {
+                    'key': key,
                     'token': token,
                     'name': name,
                     'exchange': exchange,
@@ -112,19 +125,19 @@ def update_all_token_files():
             
             # Check if it's a NIFTY 50 stock (only add if not already exists)
             if exchange == 'NSE' and instrument_type == 'EQ':
-                # Check if it's in current NIFTY 50 list (Official 50 stocks)
-                nifty50_symbols = [
-                    'ADANIENT', 'ADANIPORTS', 'APOLLOHOSP', 'ASIANPAINT', 'AXISBANK',
-                    'BAJAJ-AUTO', 'BAJFINANCE', 'BAJAJFINSV', 'BEL', 'BHARTIARTL',
-                    'CIPLA', 'COALINDIA', 'DRREDDY', 'EICHERMOT', 'ETERNAL',
-                    'GRASIM', 'HCLTECH', 'HDFCBANK', 'HDFCLIFE', 'HINDUNILVR',
-                    'HINDALCO', 'ICICIBANK', 'INFY', 'INDIGO', 'ITC',
-                    'JIOFIN', 'JSWSTEEL', 'KOTAKBANK', 'LT', 'M&M',
-                    'MARUTI', 'MAXHEALTH', 'NESTLEIND', 'NTPC', 'ONGC',
-                    'POWERGRID', 'RELIANCE', 'SBIN', 'SBILIFE', 'SHRIRAMFIN',
-                    'SUNPHARMA', 'TATACONSUM', 'TATAMOTORS', 'TATASTEEL', 'TCS',
-                    'TECHM', 'TITAN', 'TRENT', 'ULTRACEMCO', 'WIPRO'
-                ]
+                # Load NIFTY 50 symbols from source of truth (nifty50_tokens.json)
+                # This ensures consistency across the codebase
+                nifty50_file = Path("crawlers/master_token/nifty50_tokens.json")
+                if nifty50_file.exists():
+                    try:
+                        with open(nifty50_file, 'r') as f:
+                            nifty50_data = json.load(f)
+                        nifty50_symbols = set(nifty50_data.keys())
+                    except Exception as e:
+                        print(f"⚠️ Error loading NIFTY 50 list: {e}")
+                        nifty50_symbols = set()
+                else:
+                    nifty50_symbols = set()
                 
                 if symbol in nifty50_symbols:
                     nifty50_tokens[symbol] = {

@@ -96,7 +96,6 @@ class InstrumentMapper:
         )
 
         if not token_file.exists():
-            self.logger.debug("Token catalog not found at %s", token_file)
             return
 
         try:

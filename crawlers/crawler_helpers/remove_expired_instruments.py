@@ -10,9 +10,9 @@ and eliminate processing of invalid/stale tokens.
 
 Dependent Scripts:
 ----------------
-- crawlers/crawler2_volatility/crawler2_volatility.json: Data mining crawler config
-- crawlers/crawler3_sso_xvenue/crawler3_sso_xvenue.json: Research crawler config
 - core/data/token_lookup.json: Token validation reference
+
+Note: crawler2_volatility and crawler3_sso_xvenue have been removed from this codebase and run independently
 
 Important Aspects:
 -----------------
@@ -131,8 +131,8 @@ def main():
     
     # Configuration files to process
     config_files = [
-        Path("crawlers/crawler2_volatility/crawler2_volatility.json"),
-        Path("crawlers/crawler3_sso_xvenue/crawler3_sso_xvenue.json"),
+        # Note: crawler2_volatility and crawler3_sso_xvenue moved to ubuntu_crawler/
+        # Add intraday crawler config here if needed
     ]
     
     total_expired = 0

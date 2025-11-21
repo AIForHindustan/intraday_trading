@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import struct
 import time
 from datetime import datetime
@@ -11,8 +12,8 @@ import pyarrow.parquet as pq
 import pandas as pd
 
 from crawlers.base_crawler import BaseCrawler, CrawlerConfig
-from crawlers.websocket_message_parser import ZerodhaWebSocketMessageParser
-from crawlers.bulletproof_parser import BulletproofZerodhaParser, ParserHealthMonitor
+from crawlers.websocket_message_parser import ZerodhaWebSocketMessageParser, ParserHealthMonitor
+from crawlers.enhanced_tick_parser import EnhancedTickParser
 from config.utils.timestamp_normalizer import TimestampNormalizer
 from crawlers.metadata_resolver import metadata_resolver
 from utils.yaml_field_loader import (
@@ -20,6 +21,7 @@ from utils.yaml_field_loader import (
     resolve_session_field,
     resolve_calculated_field as resolve_indicator_field,
 )
+from utils.update_all_20day_averages import correct_symbol_expiry_date
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,7 @@ class IntradayCrawler(BaseCrawler):
     --------
     Specialized crawler for real-time intraday trading that:
     - Connects to Zerodha WebSocket in full mode
-    - Publishes parsed tick data to Redis for real-time pattern detection
+    - Publishes parsed tick data to Redis 8.2 for real-time pattern detection
     - Writes Parquet files to disk for historical analysis (DuckDB compatible)
     - Optimized for low-latency processing
 
@@ -40,7 +42,7 @@ class IntradayCrawler(BaseCrawler):
     -----------------
     - crawlers/metadata_resolver.py: Provides instrument metadata resolution
     - crawlers/websocket_message_parser.py: WebSocket message parsing
-    - core/data/redis_storage.py: Redis data storage
+    - redis_files/redis_storage.py: Redis data storage
     - config/schemas.py: Data normalization and field mapping
     - utils/yaml_field_loader.py: Field name standardization
 
@@ -53,7 +55,14 @@ class IntradayCrawler(BaseCrawler):
     - Handles 218+ intraday data files
     - Supports field mapping standardization
     - Optimized for low-latency processing
-    - Optimized buffer size (500 records) for 176 instruments
+    - Optimized buffer size (2000 records) for 176 instruments
+    
+    ⚠️ TROUBLESHOOTING & DOCUMENTATION:
+    - Read `data_feeding.md` for architecture overview and troubleshooting guide
+    - Always read method docstrings in this class before making assumptions
+    - Method signatures, parameters, return values, and data formats are documented in docstrings
+    - Buffer configuration, Redis publishing, and disk writing behavior are documented in docstrings
+    - Don't assume crawler behavior - check docstrings for exact implementation details
     """
 
     def __init__(
@@ -64,9 +73,9 @@ class IntradayCrawler(BaseCrawler):
         instrument_info: Dict[int, Dict],
         data_directory: str = "crawlers/raw_data/intraday_data",
         websocket_url: str = "wss://ws.kite.trade",
-        redis_host: str = "localhost",
-        redis_port: int = 6379,
-        redis_db: int = 1,  # Use realtime database (DB 1) for tick data (consolidated from DB 4)
+        redis_host: str = None,  # Redis 8.2 host
+        redis_port: int = None,  # Redis 8.2 port
+        redis_db: int = 1,  # Redis database (DB 1 for realtime tick data)
         name: str = "intraday_crawler",
     ):
         """
@@ -79,9 +88,9 @@ class IntradayCrawler(BaseCrawler):
             instrument_info: Mapping of token -> instrument details
             data_directory: Directory to store Parquet data files
             websocket_url: WebSocket endpoint URL
-            redis_host: Redis host
-            redis_port: Redis port
-            redis_db: Redis database
+            redis_host: Redis 8.2 host
+            redis_port: Redis 8.2 port
+            redis_db: Redis database (DB 1 for realtime tick data)
             name: Crawler name
         """
         self.api_key = api_key
@@ -93,41 +102,60 @@ class IntradayCrawler(BaseCrawler):
         self.data_directory = Path(data_directory)
         self.data_directory.mkdir(parents=True, exist_ok=True)
 
-        # Parquet writing state
-        self.buffer = []
-        self.buffer_size = 500  # Optimized for 176 instruments (low-latency real-time)
-        self.parquet_writer = None
-        self._records_written = 0
-
         # Configure crawler for intraday trading
+        # ✅ Redis 8.2: Use RedisManager82 for process-specific connection pools
+        final_redis_host = redis_host or "127.0.0.1"
+        final_redis_port = redis_port if redis_port is not None else 6379
+        
         config = CrawlerConfig(
             name=name,
             websocket_url=websocket_url,
             tokens=instruments,
-            redis_host=redis_host,
-            redis_port=redis_port,
-            redis_db=redis_db,
+            redis_host=final_redis_host,  # Redis 8.2 host
+            redis_port=final_redis_port,  # Redis 8.2 port
+            redis_db=redis_db,  # DB 1 (realtime) for tick data
             max_reconnect_attempts=10,  # More aggressive reconnection for intraday
             reconnect_delay=1.0,  # Faster reconnection
             heartbeat_interval=15.0,  # More frequent heartbeats
             connection_timeout=10.0,
             max_threads=20,  # More threads for high-frequency data
-            buffer_size=500,  # Smaller buffer for lower latency
+            buffer_size=2000,  # ✅ UPDATED: Increased from 500 to 2000 for I/O efficiency
             enable_compression=True,
         )
 
         super().__init__(config)
 
-        # ✅ BULLETPROOF PARSER: Initialize robust parser with health monitoring
+        # Parquet writing state
+        # ✅ FIXED: Use config.buffer_size instead of hardcoded 500
+        self.buffer = []
+        self.buffer_size = config.buffer_size  # Use config value (2000) for consistency
+        self.parquet_writer = None
+        self._records_written = 0
+
+        # Ensure Redis client from BaseCrawler is available (needed for parser + downstream storage)
+        if not getattr(self, "redis_client", None):
+            try:
+                from redis_files.redis_client import redis_manager
+                self.redis_client = redis_manager.get_client()
+                logger.info("✅ Intraday crawler reconnected to Redis singleton (DB 1)")
+            except Exception as redis_exc:
+                logger.error(f"❌ Unable to initialize Redis client for intraday crawler: {redis_exc}")
+                self.redis_client = None
+
+        # ✅ Redis 8.2: Use redis_client from base_crawler (RedisManager82)
+        # BULLETPROOF PARSER: Initialize robust parser with health monitoring
         # Pass redis_client to constructor so volume_calculator is properly initialized
-        self.parser = BulletproofZerodhaParser(instrument_info, self.redis_client)
+        parser_redis_client = getattr(self.redis_client, "redis", self.redis_client)
+        self.parser = ZerodhaWebSocketMessageParser(instrument_info, parser_redis_client)
+        
+        # ✅ ENHANCED PARSER: Initialize enhanced tick parser for complete field preservation
+        self.enhanced_parser = EnhancedTickParser(instrument_info)
         
         # Add health monitoring
         self.health_monitor = ParserHealthMonitor(self.parser)
         
-        # Initialize Redis storage layer
-        from redis_files.redis_storage import RedisStorage
-        self.redis_storage = RedisStorage(self.redis_client)
+        # ✅ Redis 8.2: Using write_tick_to_redis from base_crawler
+        # Uses RedisManager82 for process-specific connection pools
         
         # Initialize metadata resolver for symbol resolution
         self.metadata_resolver = metadata_resolver
@@ -136,6 +164,10 @@ class IntradayCrawler(BaseCrawler):
         self.field_mapping_manager = get_field_mapping_manager()
         self.resolve_session_field = resolve_session_field
         self.resolve_indicator_field = resolve_indicator_field
+        
+        # Initialize symbol parser for option field enrichment
+        from redis_files.redis_key_standards import get_symbol_parser
+        self.symbol_parser = get_symbol_parser()
 
         # Intraday-specific state tracking
         self._subscription_sent = False
@@ -191,13 +223,21 @@ class IntradayCrawler(BaseCrawler):
             self._subscription_sent = False
 
     def _process_message(self, message):
-        """Process incoming WebSocket messages for intraday trading"""
+        """Process incoming WebSocket messages with COMPLETE data extraction
+        
+        Enhanced version that:
+        - Preserves ALL fields from Zerodha WebSocket
+        - Logs data completeness for monitoring
+        - Publishes complete data to Redis
+        """
         try:
             self._binary_message_count += 1
 
             # Handle binary messages (tick data)
             if isinstance(message, bytes):
+                # Process binary message with complete data extraction
                 self._process_binary_message(message)
+            
             # Handle text messages (heartbeats, errors, etc.)
             elif isinstance(message, str):
                 self._process_text_message(message)
@@ -205,24 +245,47 @@ class IntradayCrawler(BaseCrawler):
                 logger.warning(f"Unknown message type: {type(message)}")
 
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
+            logger.error(f"Error processing message: {e}", exc_info=True)
 
     def _process_binary_message(self, binary_data: bytes):
-        """Process binary WebSocket message containing tick data"""
+        """Process binary WebSocket message with COMPLETE data extraction
+        
+        Enhanced version that:
+        - Preserves ALL fields from Zerodha WebSocket
+        - Logs data completeness for monitoring
+        - Publishes complete data to Redis
+        """
         try:
             # ✅ BULLETPROOF PARSER: Use health-monitored parsing
+            # Parse with enhanced parser that preserves all fields
             ticks = self.health_monitor.monitor_parse_health(binary_data)
 
             if not ticks:
-                logger.debug("No ticks parsed from binary message")
                 return
 
-            # Process each validated tick for intraday trading
-            for tick in ticks:
-                if self._validate_tick(tick):
-                    self._process_intraday_tick(tick)
-                else:
-                    logger.warning(f"Invalid tick: {tick.get('symbol', 'unknown')}")
+            # Process each tick with complete data
+            for tick_data in ticks:
+                if not tick_data:
+                    continue
+                
+                # Validate tick before processing
+                if not self._validate_tick(tick_data):
+                    logger.warning(f"Invalid tick: {tick_data.get('symbol', 'unknown')}")
+                    continue
+                
+                symbol = tick_data.get('symbol', 'unknown')
+                
+                # Log data completeness
+                field_count = len(tick_data)
+                logger.info(f"📦 Processing {symbol} - {field_count} fields extracted")
+                
+                # Process tick with complete data
+                self._process_intraday_tick(tick_data)
+                
+                # Optional: Log sample of what we're publishing (0.1% of ticks)
+                if random.random() < 0.001:
+                    sample_data = {k: v for k, v in list(tick_data.items())[:10]}
+                    logger.debug(f"🧪 SAMPLE TICK: {symbol} - {sample_data}")
 
             # Log processing stats for monitoring
             if (
@@ -243,8 +306,56 @@ class IntradayCrawler(BaseCrawler):
                     f"⚠️ Protocol error in binary message (likely corrupt data): {error_msg[:100]}..."
                 )
             else:
-                logger.error(f"Error processing binary message: {e}")
+                logger.error(f"Error processing binary message: {e}", exc_info=True)
             # Don't crash - continue processing
+    
+    def _enrich_option_fields(self, symbol: str, tick_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Enrich option fields from symbol if missing (strike_price, underlying_price, option_type)
+        
+        WebSocket packet doesn't contain these fields - must be extracted from symbol name.
+        See: https://kite.trade/docs/connect/v3/market-quotes/
+        """
+        try:
+            parsed = self.symbol_parser.parse_symbol(symbol)
+            
+            # If it's an option, extract and add option-specific fields
+            if parsed.instrument_type == 'OPT':
+                # Extract strike_price from parsed.strike
+                if not tick_data.get('strike_price') or tick_data.get('strike_price') == 0:
+                    if parsed.strike and parsed.strike > 0:
+                        tick_data['strike_price'] = float(parsed.strike)
+                        logger.info(f"✅ [CRAWLER_ENRICH] {symbol} - Added strike_price={parsed.strike}")
+                    else:
+                        logger.warning(f"⚠️ [CRAWLER_ENRICH] {symbol} - parsed.strike is {parsed.strike}, cannot add strike_price")
+                
+                # Extract option_type from parsed.option_type (CE/PE -> call/put)
+                if not tick_data.get('option_type'):
+                    if parsed.option_type:
+                        opt_type_lower = parsed.option_type.lower()
+                        if opt_type_lower in ['ce', 'c']:
+                            tick_data['option_type'] = 'call'
+                        elif opt_type_lower in ['pe', 'p']:
+                            tick_data['option_type'] = 'put'
+                        else:
+                            tick_data['option_type'] = opt_type_lower
+                        logger.info(f"✅ [CRAWLER_ENRICH] {symbol} - Added option_type={tick_data['option_type']}")
+                    else:
+                        logger.warning(f"⚠️ [CRAWLER_ENRICH] {symbol} - parsed.option_type is {parsed.option_type}, cannot add option_type")
+                
+                # Extract expiry_date if missing
+                if not tick_data.get('expiry_date') and parsed.expiry:
+                    tick_data['expiry_date'] = parsed.expiry.strftime('%Y-%m-%d')
+                    logger.debug(f"[CRAWLER_ENRICH] {symbol} - Added expiry_date={tick_data['expiry_date']}")
+                
+                # Extract instrument_type if missing
+                if not tick_data.get('instrument_type'):
+                    tick_data['instrument_type'] = parsed.instrument_type
+                    logger.debug(f"[CRAWLER_ENRICH] {symbol} - Added instrument_type={parsed.instrument_type}")
+        
+        except Exception as enrich_err:
+            logger.warning(f"[CRAWLER_ENRICH] {symbol} - Failed to enrich option fields: {enrich_err}")
+        
+        return tick_data
     
     def _validate_tick(self, tick: Dict) -> bool:
         """Validate tick data before processing"""
@@ -282,42 +393,39 @@ class IntradayCrawler(BaseCrawler):
                 }
             )
 
-            if self.redis_client:
-                exchange_timestamp_dt = tick_data.get("exchange_timestamp")
-                if hasattr(exchange_timestamp_dt, "isoformat"):
-                    timestamp_str = exchange_timestamp_dt.isoformat()
-                else:
-                    timestamp_str = str(exchange_timestamp_dt or "")
-
-                # Use canonical field names from optimized_field_mapping.yaml
-                optimized_tick = {
-                    "symbol": tick_data.get("symbol"),
-                    "timestamp": timestamp_str,
-                    "timestamp_epoch": tick_data.get("exchange_timestamp_epoch"),
-                    "last_price": tick_data.get("last_price"),
-                    # Canonical volume fields - use the fields already set by WebSocket parser
-                    "zerodha_cumulative_volume": tick_data.get("zerodha_cumulative_volume", 0),
-                    "bucket_cumulative_volume": tick_data.get("bucket_cumulative_volume", 0),
-                    "bucket_incremental_volume": tick_data.get("bucket_incremental_volume", 0),
-                    "zerodha_last_traded_quantity": tick_data.get("zerodha_last_traded_quantity", 0),
-                    # OHLC data
-                    "open": tick_data.get("ohlc", {}).get("open"),
-                    "high": tick_data.get("ohlc", {}).get("high"),
-                    "low": tick_data.get("ohlc", {}).get("low"),
-                }
-
-                try:
-                    self.redis_client.store_ticks_optimized(
-                        tick_data.get("symbol"), [optimized_tick]
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to store optimized ticks for %s: %s",
-                        tick_data.get("symbol"),
-                        exc,
-                    )
-
-            # Publish to Redis for real-time pattern detection
+            # ✅ CRITICAL: Enrich option fields from symbol BEFORE writing to Redis
+            # WebSocket packet doesn't contain strike_price, underlying_price, option_type
+            # See: https://kite.trade/docs/connect/v3/market-quotes/
+            symbol = tick_data.get('symbol', 'UNKNOWN')
+            
+            # TEMPORARY: Log tick_data keys before enrichment
+            if 'CE' in symbol or 'PE' in symbol:
+                logger.info(f"🔍 [ENRICH_BEFORE] {symbol} - Keys before enrichment: {list(tick_data.keys())[:20]}")
+                logger.info(f"🔍 [ENRICH_BEFORE] {symbol} - strike_price={tick_data.get('strike_price')}, option_type={tick_data.get('option_type')}")
+            
+            tick_data = self._enrich_option_fields(symbol, tick_data)
+            
+            # TEMPORARY: Log tick_data keys after enrichment
+            if 'CE' in symbol or 'PE' in symbol:
+                logger.info(f"🔍 [ENRICH_AFTER] {symbol} - Keys after enrichment: {list(tick_data.keys())[:20]}")
+                logger.info(f"🔍 [ENRICH_AFTER] {symbol} - strike_price={tick_data.get('strike_price')}, option_type={tick_data.get('option_type')}")
+            
+            # TEMPORARY: Validate Greek data before Redis write (expected to be missing - crawler doesn't calculate Greeks)
+            greek_fields = ['delta', 'gamma', 'theta', 'vega', 'iv', 'implied_volatility', 'oi']
+            missing = [g for g in greek_fields if g not in tick_data or tick_data.get(g) is None]
+            if missing and ('CE' in symbol or 'PE' in symbol):
+                logger.debug(f"[GREEK_CHECK] {symbol} - Missing Greeks {missing} (expected - crawler doesn't calculate)")
+                # Log what Greeks are present
+                present_greeks = {g: tick_data.get(g) for g in greek_fields if g in tick_data and tick_data.get(g) is not None}
+                if present_greeks:
+                    logger.debug(f"[GREEK_CHECK] {symbol} - Present Greeks: {present_greeks}")
+            
+            # ✅ Redis 8.2: Publish to Redis for real-time pattern detection
+            # Use optimized write_tick_to_redis from base_crawler (RedisManager82)
+            # Override with validation for intraday crawler
+            self.write_tick_to_redis(symbol, tick_data)
+            
+            # ✅ CRITICAL: Also publish to ticks:intraday:processed stream for scanner consumption
             self._publish_to_redis(tick_data)
 
             # Write to Parquet for historical analysis
@@ -359,7 +467,8 @@ class IntradayCrawler(BaseCrawler):
     def _publish_to_binary_stream(self, tick_data: Dict[str, Any]):
         """Publish to raw binary stream for binary decoder"""
         try:
-            stream_key = "ticks:raw:binary"
+            from redis_files.redis_key_standards import get_key_builder
+            stream_key = get_key_builder().live_raw_binary_stream()
 
             # Extract binary data if available, otherwise create minimal binary representation
             binary_data = tick_data.get("raw_data")
@@ -387,30 +496,13 @@ class IntradayCrawler(BaseCrawler):
                 }
 
                 # Append to Redis Stream in DB 1 (realtime)
-                # ✅ FIXED: Use process-specific client or get DB 1 client properly
+                # ✅ CRITICAL FIX: Use singleton for DB 1
                 try:
-                    from redis_files.redis_manager import RedisManager82
-                    # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
-                    realtime_client = RedisManager82.get_client(process_name="intraday_crawler", db=1)
+                    from redis_files.redis_client import redis_manager
+                    realtime_client = redis_manager.get_client()  # DB 1 singleton
                 except Exception:
-                    # Fallback: If self.redis_client is already on DB 1, use it directly
-                    # Otherwise, try to get a client for DB 1
-                    if hasattr(self.redis_client, 'get_client'):
-                        realtime_client = self.redis_client.get_client(1)
-                    elif hasattr(self.redis_client, 'connection_pool'):
-                        # Plain Redis client - check if it's on the right DB
-                        if self.config.redis_db == 1:
-                            realtime_client = self.redis_client
-                        else:
-                            # Need to create a new client for DB 1
-                            from redis_files.redis_manager import RedisManager82
-                            realtime_client = RedisManager82.get_client(
-                                process_name="intraday_crawler",
-                                db=1,
-                                max_connections=3
-                            )
-                    else:
-                        realtime_client = self.redis_client
+                    # Fallback: Use self.redis_client if it's already DB 1 singleton
+                    realtime_client = self.redis_client
                 
                 if not realtime_client:
                     logger.warning(f"⚠️ No Redis client available for publishing to {stream_key}")
@@ -425,26 +517,18 @@ class IntradayCrawler(BaseCrawler):
     def _publish_to_processed_stream(self, tick_data: Dict[str, Any]):
         """Publish processed tick data for pattern detection"""
         try:
-            # Check if redis_client is available
-            if not self.redis_client:
-                logger.warning("⚠️ Redis client not available, skipping publish")
-                return
-            
             # Remove binary data to reduce message size
             processed_tick = {k: v for k, v in tick_data.items() if k != "raw_data"}
 
             # Get realtime client (DB 1) for pub/sub publishing
             # Use process-specific client if available, otherwise use wrapper's get_client
+            # ✅ CRITICAL FIX: Use singleton for DB 1
             try:
-                from redis_files.redis_manager import RedisManager82
-                # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
-                realtime_client = RedisManager82.get_client(process_name="intraday_scanner", db=1)
+                from redis_files.redis_client import redis_manager
+                realtime_client = redis_manager.get_client()  # DB 1 singleton
             except Exception:
-                # Fallback to existing method
-                if hasattr(self.redis_client, 'get_client'):
-                    realtime_client = self.redis_client.get_client(1)
-                else:
-                    realtime_client = self.redis_client
+                # Fallback: Use self.redis_client if it's already DB 1 singleton
+                realtime_client = self.redis_client
             
             if not realtime_client:
                 logger.warning("⚠️ Realtime client not available, skipping publish")
@@ -462,7 +546,6 @@ class IntradayCrawler(BaseCrawler):
             self._publish_count += 1
             if self._publish_count <= 5 or self._publish_count % 100 == 0:
                 symbol = tick_data.get('symbol', 'unknown')
-                logger.debug(f"📡 Published tick {self._publish_count}: {symbol} to market_data.ticks ({subscribers} subscribers)")
 
             # Publish to asset-class specific channel
             asset_class = tick_data.get("asset_class", "unknown")
@@ -479,7 +562,8 @@ class IntradayCrawler(BaseCrawler):
     def _publish_to_intraday_stream(self, tick_data: Dict[str, Any]):
         """Publish to intraday-specific Redis stream"""
         try:
-            stream_key = "ticks:intraday:processed"
+            from redis_files.redis_key_standards import get_key_builder
+            stream_key = get_key_builder().live_processed_stream()
 
             # ✅ ONE-TIME NORMALIZATION: Convert any timestamp format to epoch milliseconds
             # Use Zerodha field names exactly as per optimized_field_mapping.yaml
@@ -539,20 +623,41 @@ class IntradayCrawler(BaseCrawler):
                     if resolved_symbol:
                         symbol = resolved_symbol
             
+            # ✅ DISABLED: Symbol expiry correction disabled to maintain consistency with JSON file format
+            # The token_lookup_enriched.json uses 25DEC format, so we keep symbols as-is
+            # If expiry correction is needed, it should be done at the JSON file level, not at runtime
+            # if symbol and symbol != "UNKNOWN":
+            #     corrected_symbol = correct_symbol_expiry_date(symbol)
+            #     if corrected_symbol != symbol:
+            #         logger.debug(f"🔄 Corrected symbol expiry: {symbol} -> {corrected_symbol}")
+            #         symbol = corrected_symbol
+            
             # Create intraday-optimized tick data with normalized timestamps using canonical field names
+            # ✅ CRITICAL: Include ALL fields from Zerodha WebSocket API (184-byte full quote packet)
+            # Reference: https://kite.trade/docs/connect/v3/websocket/
             intraday_tick = {
                 "symbol": symbol,
                 "instrument_token": normalized_tick.get("instrument_token", 0),
+                # Quote packet fields (bytes 0-44)
                 "last_price": normalized_tick.get("last_price", 0),
+                "last_traded_quantity": tick_data.get("last_quantity") or tick_data.get("last_traded_quantity") or normalized_tick.get("zerodha_last_traded_quantity", 0),
+                "average_traded_price": tick_data.get("average_price") or tick_data.get("average_traded_price") or normalized_tick.get("average_traded_price", 0),
                 # Use canonical field names from optimized_field_mapping.yaml
                 "zerodha_cumulative_volume": normalized_tick.get("zerodha_cumulative_volume", 0),
                 "bucket_cumulative_volume": normalized_tick.get("bucket_cumulative_volume", 0),
                 "bucket_incremental_volume": normalized_tick.get("bucket_incremental_volume", 0),
                 "zerodha_last_traded_quantity": normalized_tick.get("zerodha_last_traded_quantity", 0),
-                "volume_ratio": normalized_tick.get("volume_ratio", 0.0),
-                # Zerodha timestamp fields with normalization
+                # ✅ CRITICAL FIX: Check tick_data first for volume_ratio (from parser), then normalized_tick as fallback
+                "volume_ratio": tick_data.get("volume_ratio") or normalized_tick.get("volume_ratio", 0.0),
+                # OHLC fields (bytes 28-44) - explicitly include from tick_data
+                "open_price": tick_data.get("open") or (tick_data.get("ohlc", {}).get("open") if isinstance(tick_data.get("ohlc"), dict) else None) or 0,
+                "high_price": tick_data.get("high") or (tick_data.get("ohlc", {}).get("high") if isinstance(tick_data.get("ohlc"), dict) else None) or 0,
+                "low_price": tick_data.get("low") or (tick_data.get("ohlc", {}).get("low") if isinstance(tick_data.get("ohlc"), dict) else None) or 0,
+                "close_price": tick_data.get("close") or (tick_data.get("ohlc", {}).get("close") if isinstance(tick_data.get("ohlc"), dict) else None) or 0,
+                # Zerodha timestamp fields with normalization (bytes 44-48, 60-64)
                 "exchange_timestamp": exchange_timestamp_iso,
                 "exchange_timestamp_ms": exchange_timestamp_ms or 0,
+                "last_traded_timestamp": tick_data.get("last_traded_timestamp") or 0,  # bytes 44-48
                 "timestamp_ns": tick_data.get("timestamp_ns") or "",
                 "timestamp_ns_ms": timestamp_ns_ms or 0,
                 "timestamp": timestamp_iso,
@@ -565,10 +670,69 @@ class IntradayCrawler(BaseCrawler):
                 "best_ask_price": tick_data.get("best_ask_price", 0),
                 "sequence": self._tick_count,
                 "is_tradable": normalized_tick.get("is_tradable", True),
-                "open_interest": normalized_tick.get("open_interest", 0),
+                # Open Interest fields (bytes 48-60)
+                "open_interest": tick_data.get("open_interest") or tick_data.get("oi") or normalized_tick.get("open_interest", 0),
+                "oi_day_high": tick_data.get("oi_day_high", 0),  # bytes 52-56
+                "oi_day_low": tick_data.get("oi_day_low", 0),   # bytes 56-60
                 "change": normalized_tick.get("change", 0.0),
                 "net_change": normalized_tick.get("net_change", 0.0),
             }
+            
+            # ✅ CRITICAL FIX: Include option-specific fields from tick_data
+            option_fields = ['strike_price', 'option_type', 'expiry_date', 'instrument_type', 'underlying_price']
+            for field in option_fields:
+                if field in tick_data and tick_data[field] is not None:
+                    intraday_tick[field] = tick_data[field]
+            
+            # ✅ CRITICAL FIX: Include Greeks if present in tick_data
+            greek_fields = ['delta', 'gamma', 'theta', 'vega', 'rho', 'iv', 'implied_volatility', 'dte_years', 'trading_dte', 'expiry_series', 'option_price']
+            for field in greek_fields:
+                if field in tick_data and tick_data[field] is not None:
+                    intraday_tick[field] = tick_data[field]
+            
+            # ✅ CRITICAL FIX: Include Zerodha market depth and additional fields explicitly
+            # Market depth fields (from _parse_market_depth)
+            market_depth_fields = [
+                'depth',  # Full order book (5 buy + 5 sell levels)
+                'best_bid_quantity', 'best_bid_orders',
+                'best_ask_quantity', 'best_ask_orders'
+            ]
+            for field in market_depth_fields:
+                if field in tick_data and tick_data[field] is not None:
+                    intraday_tick[field] = tick_data[field]
+            
+            # ✅ CRITICAL FIX: Include Zerodha volume fields
+            volume_fields = [
+                'total_buy_quantity', 'total_sell_quantity',
+                'average_traded_price', 'average_price'
+            ]
+            for field in volume_fields:
+                if field in tick_data and tick_data[field] is not None:
+                    intraday_tick[field] = tick_data[field]
+            
+            # ✅ CRITICAL FIX: Include OI fields
+            oi_fields = ['oi', 'oi_day_high', 'oi_day_low']
+            for field in oi_fields:
+                if field in tick_data and tick_data[field] is not None:
+                    intraday_tick[field] = tick_data[field]
+            
+            # ✅ CRITICAL FIX: Include circuit limit fields
+            circuit_fields = ['lower_circuit_limit', 'upper_circuit_limit']
+            for field in circuit_fields:
+                if field in tick_data and tick_data[field] is not None:
+                    intraday_tick[field] = tick_data[field]
+            
+            # ✅ CRITICAL FIX: Include all other fields from tick_data that aren't already included
+            # This ensures nothing is lost
+            # IMPORTANT: Include depth dict even if > 1000 chars (valuable order book data)
+            for key, value in tick_data.items():
+                if key not in intraday_tick and value is not None:
+                    # For depth dict, always include (valuable order book data)
+                    if key == 'depth' and isinstance(value, dict):
+                        intraday_tick[key] = value
+                    # For other complex objects, include if reasonable size
+                    elif not isinstance(value, (dict, list)) or (isinstance(value, (dict, list)) and len(str(value)) < 2000):
+                        intraday_tick[key] = value
 
             # Convert any remaining None values to empty strings
             for key, value in intraday_tick.items():
@@ -576,33 +740,27 @@ class IntradayCrawler(BaseCrawler):
                     intraday_tick[key] = ""
 
             # Store as a Redis Stream entry (JSON blob for compactness) in DB 1 (realtime)
-            # ✅ FIXED: Get proper Redis client for DB 1
+            # ✅ CRITICAL FIX: Use singleton for DB 1
             try:
-                from redis_files.redis_manager import RedisManager82
-                # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
-                realtime_client = RedisManager82.get_client(process_name="intraday_crawler", db=1)
+                from redis_files.redis_client import redis_manager
+                realtime_client = redis_manager.get_client()  # DB 1 singleton
             except Exception:
-                # Fallback: If self.redis_client is already on DB 1, use it directly
-                if hasattr(self.redis_client, 'get_client'):
-                    realtime_client = self.redis_client.get_client(1)
-                elif hasattr(self.redis_client, 'connection_pool'):
-                    # Plain Redis client - check if it's on the right DB
-                    if self.config.redis_db == 1:
-                        realtime_client = self.redis_client
-                    else:
-                        # Need to create a new client for DB 1
-                        from redis_files.redis_manager import RedisManager82
-                        realtime_client = RedisManager82.get_client(
-                            process_name="intraday_crawler",
-                            db=1,
-                            max_connections=3
-                        )
-                else:
-                    realtime_client = self.redis_client
+                # Fallback: Use self.redis_client if it's already DB 1 singleton
+                realtime_client = self.redis_client
             
             if not realtime_client:
                 logger.warning(f"⚠️ No Redis client available for publishing to {stream_key}")
                 return
+            
+            # ✅ DEBUG: Log what we're publishing to the stream
+            current_time = time.time()
+            exchange_ts_sec = exchange_timestamp_ms / 1000.0 if exchange_timestamp_ms else 0
+            tick_age = current_time - exchange_ts_sec if exchange_ts_sec > 0 else 0
+            
+            if tick_age > 300:  # Log if older than 5 minutes
+                logger.warning(f"⚠️ [CRAWLER_PUBLISH] {symbol} - Publishing STALE tick to stream: exchange_ts_ms={exchange_timestamp_ms}, age={tick_age:.1f}s")
+            else:
+                logger.debug(f"✅ [CRAWLER_PUBLISH] {symbol} - Publishing fresh tick to stream: age={tick_age:.1f}s")
             
             # ✅ TIER 1: Keep stream trimmed for performance (last 5k processed ticks)
             realtime_client.xadd(
@@ -613,7 +771,9 @@ class IntradayCrawler(BaseCrawler):
             )
 
         except Exception as e:
-                logger.error(f"Error publishing to intraday stream: {e}")
+            logger.error(f"Error publishing to intraday stream: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def reset_session_volumes(self):
         """Reset cumulative volume tracking at market session boundaries."""
@@ -659,7 +819,7 @@ class IntradayCrawler(BaseCrawler):
                         or bucket.get("bucket_cumulative_volume")
                     )
             except Exception as exc:
-                logger.debug("Volume bucket lookup failed for %s: %s", symbol, exc)
+                pass
 
         try:
             if not hasattr(self, "_historical_baseline_helper"):
@@ -672,7 +832,7 @@ class IntradayCrawler(BaseCrawler):
                 symbol, datetime.now()
             )
         except Exception as exc:
-            logger.debug("Baseline computation failed for %s: %s", symbol, exc)
+            pass
 
         def _fmt(value):
             try:
@@ -695,20 +855,20 @@ class IntradayCrawler(BaseCrawler):
             message_type = message_data.get("type")
 
             if message_type == "order":
-                logger.debug(f"Order update: {message_data}")
+                pass
             elif message_type == "error":
                 logger.error(f"WebSocket error: {message_data}")
             elif "ping" in text_message.lower():
                 self._handle_ping(message_data)
             else:
-                logger.debug(f"Unknown text message: {text_message}")
+                pass
 
         except json.JSONDecodeError:
             # Handle non-JSON text messages (like heartbeats)
             if "ping" in text_message.lower():
                 self._handle_ping({"type": "ping"})
             else:
-                logger.debug(f"Non-JSON text message: {text_message}")
+                pass
 
     def _handle_ping(self, ping_data: Dict[str, Any]):
         """Handle ping messages to keep connection alive"""
@@ -720,7 +880,6 @@ class IntradayCrawler(BaseCrawler):
                 pong_message = {"type": "pong"}
                 self.websocket.send(json.dumps(pong_message))
 
-            logger.debug("Handled ping message")
 
         except Exception as e:
             logger.error(f"Error handling ping: {e}")
@@ -731,7 +890,6 @@ class IntradayCrawler(BaseCrawler):
             if self.websocket and self.state.name == "RUNNING":
                 heartbeat_message = {"type": "ping"}
                 self.websocket.send(json.dumps(heartbeat_message))
-                logger.debug("Sent heartbeat")
 
         except Exception as e:
             logger.error(f"Error sending heartbeat: {e}")
@@ -767,6 +925,38 @@ class IntradayCrawler(BaseCrawler):
 
 
 
+    def write_tick_to_redis(self, symbol: str, tick_data: dict):
+        """Override base method to add data validation before writing to Redis"""
+        # Validate option fields for options
+        from redis_files.redis_key_standards import get_symbol_parser
+        parser = get_symbol_parser()
+        try:
+            parsed = parser.parse_symbol(symbol)
+            if parsed.instrument_type == 'OPT':
+                # Validate critical option fields
+                expected_option_fields = ['strike_price', 'option_type']
+                missing_option_fields = [f for f in expected_option_fields if not tick_data.get(f) or tick_data.get(f) == 0]
+                
+                if missing_option_fields:
+                    logger.warning(f"[VALIDATION] {symbol} - Missing option fields: {missing_option_fields}")
+                
+                # Validate Greek data before writing
+                expected_greek_fields = ['delta', 'gamma', 'theta', 'vega']
+                missing_greeks = [greek for greek in expected_greek_fields if greek not in tick_data or tick_data.get(greek) is None or tick_data.get(greek) == 0]
+                
+                if missing_greeks:
+                    logger.warning(f"[VALIDATION] {symbol} - Missing Greek fields: {missing_greeks}")
+                else:
+                    # Log if Greeks are present but all zeros (indicates calculation issue)
+                    greek_values = {g: tick_data.get(g) for g in expected_greek_fields}
+                    if all(v == 0 or v is None for v in greek_values.values()):
+                        logger.warning(f"[VALIDATION] {symbol} - All Greeks are zero: {greek_values}")
+        except Exception as e:
+            logger.debug(f"[VALIDATION] {symbol} - Could not validate (not an option?): {e}")
+        
+        # Continue with existing write logic from base class
+        super().write_tick_to_redis(symbol, tick_data)
+    
     def get_intraday_status(self) -> Dict[str, Any]:
         """Get intraday-specific status metrics"""
         base_status = super().get_status()
@@ -826,10 +1016,66 @@ class IntradayCrawler(BaseCrawler):
         logger.info(f"Intraday WebSocket closed: {close_status_code} - {close_msg}")
 
     def _write_to_parquet(self, tick_data):
-        """Write tick data to Parquet with metadata"""
+        """Write tick data to Parquet with normalized timestamps (epoch milliseconds)"""
         try:
             # Add metadata to each tick
             metadata = metadata_resolver.get_metadata(tick_data.get('instrument_token', 0))
+            
+            # Normalize all timestamps to epoch milliseconds for consistent downstream processing
+            current_time_ms = int(time.time() * 1000)
+            
+            # Normalize exchange_timestamp
+            exchange_ts_ms = None
+            if tick_data.get('exchange_timestamp_ms'):
+                exchange_ts_ms = int(tick_data.get('exchange_timestamp_ms'))
+            elif tick_data.get('exchange_timestamp'):
+                exchange_ts_ms = TimestampNormalizer.to_epoch_ms(tick_data.get('exchange_timestamp'))
+            else:
+                exchange_ts_ms = current_time_ms
+            
+            # Normalize timestamp
+            timestamp_ms = None
+            if tick_data.get('timestamp_ms'):
+                timestamp_ms = int(tick_data.get('timestamp_ms'))
+            elif tick_data.get('timestamp'):
+                timestamp_ms = TimestampNormalizer.to_epoch_ms(tick_data.get('timestamp'))
+            else:
+                timestamp_ms = exchange_ts_ms or current_time_ms
+            
+            # Normalize last_trade_time
+            last_trade_time_ms = None
+            if tick_data.get('last_trade_time_ms'):
+                last_trade_time_ms = int(tick_data.get('last_trade_time_ms'))
+            elif tick_data.get('last_trade_time'):
+                last_trade_time_ms = TimestampNormalizer.to_epoch_ms(tick_data.get('last_trade_time'))
+            
+            # Normalize timestamp_ns (convert nanoseconds to milliseconds)
+            timestamp_ns_ms = None
+            if tick_data.get('timestamp_ns_ms'):
+                timestamp_ns_ms = int(tick_data.get('timestamp_ns_ms'))
+            elif tick_data.get('timestamp_ns'):
+                # If it's a large number, assume nanoseconds and convert to ms
+                ts_ns = tick_data.get('timestamp_ns')
+                if isinstance(ts_ns, (int, float)) and ts_ns > 1e12:
+                    timestamp_ns_ms = int(ts_ns / 1_000_000)
+                else:
+                    timestamp_ns_ms = TimestampNormalizer.to_epoch_ms(ts_ns)
+            
+            # Normalize processed_timestamp
+            processed_ts_ms = None
+            if tick_data.get('processed_timestamp'):
+                processed_ts = tick_data.get('processed_timestamp')
+                if isinstance(processed_ts, (int, float)) and processed_ts < 1e12:
+                    # Unix timestamp in seconds
+                    processed_ts_ms = int(processed_ts * 1000)
+                elif isinstance(processed_ts, (int, float)) and processed_ts > 1e12:
+                    # Already in milliseconds
+                    processed_ts_ms = int(processed_ts)
+                else:
+                    processed_ts_ms = TimestampNormalizer.to_epoch_ms(processed_ts)
+            else:
+                processed_ts_ms = current_time_ms
+            
             tick_data_with_meta = {
                 **tick_data,
                 'symbol': metadata['symbol'],
@@ -837,7 +1083,16 @@ class IntradayCrawler(BaseCrawler):
                 'instrument_type': metadata['instrument_type'],
                 'segment': metadata['segment'],
                 'tradingsymbol': metadata['tradingsymbol'],
-                'processing_timestamp': datetime.now().isoformat()
+                # Normalized timestamps (all in epoch milliseconds as int64)
+                'exchange_timestamp_ms': exchange_ts_ms,
+                'timestamp_ms': timestamp_ms,
+                'timestamp_ns_ms': timestamp_ns_ms or timestamp_ms,
+                'last_trade_time_ms': last_trade_time_ms or 0,
+                'processed_timestamp_ms': processed_ts_ms,
+                # Keep ISO strings for readability (optional, can be removed)
+                'exchange_timestamp': TimestampNormalizer.to_iso_string(exchange_ts_ms),
+                'timestamp': TimestampNormalizer.to_iso_string(timestamp_ms),
+                'processing_timestamp': TimestampNormalizer.to_iso_string(processed_ts_ms),
             }
             
             self.buffer.append(tick_data_with_meta)
@@ -850,13 +1105,22 @@ class IntradayCrawler(BaseCrawler):
             logger.error(f"Error writing to Parquet buffer: {e}")
 
     def _flush_buffer(self):
-        """Flush buffer to Parquet file"""
+        """Flush buffer to Parquet file with atomic write and validation"""
         if not self.buffer:
             return
             
         try:
             # Convert to DataFrame
             df = pd.DataFrame(self.buffer)
+            
+            # Ensure all timestamp columns are int64 (epoch milliseconds)
+            timestamp_columns = [
+                'exchange_timestamp_ms', 'timestamp_ms', 'timestamp_ns_ms',
+                'last_trade_time_ms', 'processed_timestamp_ms'
+            ]
+            for col in timestamp_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
             
             # Create filename with timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -866,15 +1130,40 @@ class IntradayCrawler(BaseCrawler):
             # Ensure directory exists
             filepath.parent.mkdir(parents=True, exist_ok=True)
             
-            # Write to Parquet
-            df.to_parquet(filepath, index=False, compression='snappy')
+            # Atomic write: write to temp file first, then validate and rename
+            temp_file = filepath.with_suffix('.tmp')
+            try:
+                # Write to temp file
+                df.to_parquet(temp_file, index=False, compression='snappy', engine='pyarrow')
+                
+                # Validate the file before renaming
+                try:
+                    pq.ParquetFile(temp_file)
+                    # Check file size > 0
+                    if temp_file.stat().st_size == 0:
+                        raise ValueError("Written file is empty")
+                    
+                    # Atomic rename
+                    temp_file.replace(filepath)
+                    logger.info(f"✅ Written {len(self.buffer)} records to {filepath} (validated)")
+                    self._records_written += len(self.buffer)
+                except Exception as validation_error:
+                    # Validation failed, remove temp file
+                    if temp_file.exists():
+                        temp_file.unlink()
+                    raise ValueError(f"Parquet validation failed: {validation_error}")
+                    
+            except Exception as write_error:
+                # Clean up temp file on error
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise write_error
             
-            logger.info(f"✅ Written {len(self.buffer)} records to {filepath}")
-            self._records_written += len(self.buffer)
             self.buffer.clear()
             
         except Exception as e:
             logger.error(f"❌ Error writing Parquet: {e}")
+            # Don't clear buffer on error - allow retry
 
     def stop(self, timeout: float = 10.0):
         """Override stop to flush remaining buffer"""
@@ -915,3 +1204,105 @@ def create_intraday_crawler(
         instrument_info=instrument_info,
         **kwargs,
     )
+
+
+def main():
+    """Entry point for running intraday crawler - merged from run_intraday_crawler.py"""
+    import sys
+    from pathlib import Path
+    
+    # Add project root to Python path
+    project_root = Path(__file__).parent.parent.parent
+    sys.path.insert(0, str(project_root))
+    
+    from config.zerodha_config import ZerodhaConfig
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    logger = logging.getLogger(__name__)
+    
+    logger.info("🚀 Starting Intraday Crawler with Redis 8.2")
+    logger.info("=" * 60)
+    
+    try:
+        # Load Zerodha credentials
+        logger.info("🔑 Loading Zerodha credentials...")
+        token_data = ZerodhaConfig.get_token_data()
+        if not token_data:
+            raise ValueError("No Zerodha token data found")
+        
+        api_key = token_data.get("api_key")
+        access_token = token_data.get("access_token")
+        
+        if not api_key or not access_token:
+            raise ValueError("Missing API key or access token")
+        
+        logger.info("✅ Zerodha credentials loaded")
+        
+        # Load instrument configuration
+        logger.info("📋 Loading intraday instrument configuration...")
+        intraday_config_path = project_root / "crawlers" / "binary_crawler1" / "binary_crawler1.json"
+        
+        if not intraday_config_path.exists():
+            raise FileNotFoundError(f"Intraday config not found: {intraday_config_path}")
+        
+        with open(intraday_config_path, "r") as f:
+            intraday_config = json.load(f)
+            # The config has a direct 'tokens' array
+            raw_tokens = intraday_config.get("tokens", [])
+            instruments = []
+            for token in raw_tokens:
+                try:
+                    instruments.append(int(token))
+                except (TypeError, ValueError):
+                    continue
+        
+        logger.info(f"📊 Loaded {len(instruments)} intraday instruments")
+        
+        # Create instrument info mapping using metadata_resolver
+        logger.info("🔧 Creating instrument info mapping using metadata_resolver...")
+        instrument_info = {}
+        for token in instruments:
+            instrument_info[token] = metadata_resolver.get_instrument_info(token)
+        
+        logger.info(f"✅ Created instrument info for {len(instrument_info)} instruments")
+        
+        # ✅ Redis 8.2: Create crawler with RedisManager82
+        logger.info("🔧 Creating intraday crawler with Redis 8.2...")
+        
+        crawler = create_intraday_crawler(
+            api_key=api_key,
+            access_token=access_token,
+            instruments=instruments,
+            instrument_info=instrument_info,
+            data_directory="crawlers/raw_data/intraday_data",  # Optional backup
+            name="intraday_crawler",
+            # ✅ Redis 8.2 configuration (uses RedisManager82)
+            redis_host="127.0.0.1",
+            redis_port=6379,
+            redis_db=1,  # DB 1 (realtime) for tick data
+        )
+        
+        logger.info("🚀 Starting intraday crawler with Redis 8.2...")
+        crawler.start()
+        
+        # Keep running until interrupted
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("🛑 Stopping intraday crawler...")
+            crawler.stop()
+            logger.info("✅ Intraday crawler stopped")
+    
+    except Exception as e:
+        logger.error(f"❌ Failed to start intraday crawler: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

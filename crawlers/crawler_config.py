@@ -1,10 +1,13 @@
+from redis_files.redis_client import RedisManager82
+from redis_files.unified_key_builder import get_key_builder as get_unified_key_builder
 #!/usr/bin/env python3
 """
-CRAWLER CONFIGURATION - INTRADAY TRADING SYSTEM
-===============================================
+CRAWLER CONFIGURATION - REDIS
+=============================
 
 Configuration for millisecond and total market crawlers.
 Defines file paths, instrument lists, and settings for data collection.
+Uses Redis for real-time data storage.
 """
 
 import os
@@ -17,6 +20,39 @@ import re
 # Base paths
 PROJECT_ROOT = Path(__file__).parent.parent  # intraday_trading directory
 RAW_TICKS_DIR = PROJECT_ROOT / "raw_ticks"
+
+# ✅ Redis Configuration
+REDIS_HOST = os.environ.get('REDIS_HOST', '127.0.0.1')
+REDIS_PORT = int(os.environ.get('REDIS_PORT', '6379'))
+
+
+class RedisConfig:
+    """Redis configuration for crawlers"""
+    
+    @staticmethod
+    def get_client(max_connections: int = 10):
+        """Get Redis client for any component
+        
+        ✅ CRITICAL FIX: Now uses centralized RedisConnectionManager singleton
+        to prevent connection leaks. The max_connections parameter is ignored
+        as the singleton manages the connection pool.
+        """
+        try:
+            # ✅ Use centralized singleton instead of creating new connections
+            from redis_files.redis_client import redis_manager
+            return redis_manager.get_client()
+        except ImportError:
+            # Fallback to legacy manager only if singleton unavailable
+            return RedisManager82.get_client(
+                process_name="crawler_config",
+                db=1,
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                decode_responses=True,
+                socket_keepalive=True,
+                max_connections=max_connections,
+                retry_on_timeout=True,
+            )
 
 # Directory paths (created lazily when needed)
 MILLISECOND_DIR = RAW_TICKS_DIR / "millisecond_crawler"
@@ -70,7 +106,7 @@ class FilePaths:
 FILE_PATHS = FilePaths()
 
 class Settings:
-    """Crawler settings"""
+    """Crawler settings - SIMPLIFIED for Redis"""
     RECONNECT_BASE_DELAY = 1
     RECONNECT_MAX_DELAY = 60
     MAX_RECONNECT_ATTEMPTS = 10
@@ -78,7 +114,8 @@ class Settings:
     WRITE_INTERVAL = 1  # seconds
     ORDER_WINDOW_MS = 100  # Order tracking window in milliseconds
     # Threshold for flagging very large orders in depth (number of shares)
-    VERY_LARGE_ORDER_THRESHOLD = 10000
+    VERY_LARGE_ORDER_THRESHOLD = 5000
+    REDIS_MAX_CONNECTIONS = 10
 
 class TokenConfig:
     """Token configuration"""
@@ -127,6 +164,7 @@ TokenConfig = TokenConfig()
 
 # ---- Cached metadata loader (symbols -> exchange/instrument_type) ----
 _VOLUME_META_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+KEY_BUILDER = get_unified_key_builder()
 
 def _get_current_and_next_month() -> Dict[str, str]:
     """Get current month and next month in the format used by F&O symbols"""
@@ -184,7 +222,7 @@ def _load_volume_meta() -> Dict[str, Dict[str, Any]]:
             data = json.loads(volume_file.read_text())
             # Normalize keys to un-prefixed symbols (e.g., 'NSE:RELIANCE' -> 'RELIANCE')
             for k, v in data.items():
-                clean = k.split(":", 1)[-1].upper()
+                clean = KEY_BUILDER.normalize_symbol(k)
                 # Keep the last seen (NSE over NFO if duplicates), but store exchange and type
                 meta[clean] = {
                     "exchange": v.get("exchange"),
@@ -298,7 +336,7 @@ def get_asset_class(symbol: str) -> dict:
     Category: sector for equities/derivatives when known; otherwise a generic category.
     """
     # Clean any exchange prefix if present
-    clean = str(symbol).split(":", 1)[-1].upper()
+    clean = KEY_BUILDER.normalize_symbol(str(symbol))
 
     # Load metadata (exchange/instrument_type) if available
     meta = _load_volume_meta().get(clean, {})

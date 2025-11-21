@@ -11,7 +11,7 @@ Provides instrument token to symbol/metadata mapping using the master token_look
 Dependent Scripts:
 -----------------
 - run_data_mining_crawler.py: Uses metadata_resolver for data mining crawler
-- run_intraday_crawler.py: Uses metadata_resolver for intraday crawler  
+- intraday_crawler.py: Uses metadata_resolver for intraday crawler (has main() entry point)  
 - run_research_crawler.py: Uses metadata_resolver for research crawler
 - data_mining_crawler.py: Replaces InstrumentMapper with metadata_resolver
 - intraday_crawler.py: Replaces InstrumentMapper with metadata_resolver

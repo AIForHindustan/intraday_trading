@@ -142,7 +142,6 @@ class ZerodhaWebSocketClient(BaseCrawler):
             ticks = self.parser.parse_websocket_message(binary_data)
 
             if not ticks:
-                logger.debug("No ticks parsed from binary message")
                 return
 
             # Process each tick
@@ -241,20 +240,20 @@ class ZerodhaWebSocketClient(BaseCrawler):
             message_type = message_data.get("type")
 
             if message_type == "order":
-                logger.debug(f"Order update: {message_data}")
+                pass
             elif message_type == "error":
                 logger.error(f"WebSocket error: {message_data}")
             elif "ping" in text_message.lower():
                 self._handle_ping(message_data)
             else:
-                logger.debug(f"Unknown text message: {text_message}")
+                pass
 
         except json.JSONDecodeError:
             # Handle non-JSON text messages (like heartbeats)
             if "ping" in text_message.lower():
                 self._handle_ping({"type": "ping"})
             else:
-                logger.debug(f"Non-JSON text message: {text_message}")
+                pass
 
     def _handle_ping(self, ping_data: Dict[str, Any]):
         """Handle ping messages to keep connection alive"""
@@ -266,7 +265,6 @@ class ZerodhaWebSocketClient(BaseCrawler):
                 pong_message = {"type": "pong"}
                 self.websocket.send(json.dumps(pong_message))
 
-            logger.debug("Handled ping message")
 
         except Exception as e:
             logger.error(f"Error handling ping: {e}")
@@ -277,7 +275,6 @@ class ZerodhaWebSocketClient(BaseCrawler):
             if self.websocket and self.state.name == "RUNNING":
                 heartbeat_message = {"type": "ping"}
                 self.websocket.send(json.dumps(heartbeat_message))
-                logger.debug("Sent heartbeat")
 
         except Exception as e:
             logger.error(f"Error sending heartbeat: {e}")

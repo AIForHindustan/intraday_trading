@@ -10,8 +10,9 @@ with their corresponding NOV 2025 and DEC 2025 contracts.
 
 Dependent Scripts:
 ----------------
-- crawlers/crawler2_volatility/crawler2_volatility.json: Data mining crawler config
 - core/data/token_lookup.json: Token validation and lookup reference
+
+Note: crawler2_volatility has been removed from this codebase and runs independently
 
 Important Aspects:
 -----------------
@@ -152,7 +153,8 @@ def main():
     
     # Configuration files to process
     config_files = [
-        Path("crawlers/crawler2_volatility/crawler2_volatility.json"),
+        # Note: crawler2_volatility moved to ubuntu_crawler/
+        # Add intraday crawler config here if needed
     ]
     
     total_refreshed = 0

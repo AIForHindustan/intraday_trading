@@ -46,6 +46,12 @@ parquet_output/
 parquet_test_output*/
 real_parquet_data/
 research_data/
+temp_parquet/
+enriched_parquet/
+historical_archive/
+parquet_recovery/
+parquet_ingester_output/
+store/
 *.parquet
 *.parquet.*
 *.jsonl
@@ -56,6 +62,9 @@ research_data/
 # Raw binary data
 crawlers/raw_data/
 *.bin
+*.rdb
+temp-*.rdb
+*.zip
 
 # Temporary files
 *.tmp
@@ -79,12 +88,17 @@ zerodha_token_list/
 # CSV files with sensitive data
 hdfc_csv_files/
 *.csv
+config/market_data_combined_*.json
 
 # Documentation that might contain sensitive info
 correlation_analysis_report.md
 daily_alert_report_*.md
 alert_validator_report_*.md
 signal_provider_report.md
+docs/
+legacy_documentation/
+legacy_unused_scripts/
+legacy_unused_scripts/**
 
 # Statistical model data
 statistical_model_data_*.json
@@ -99,4 +113,13 @@ frontend/dist/
 frontend/.vite/
 frontend/.env.local
 frontend/package-lock.json
+
+# Alert validation generated artifacts
+alert_validation/reports/
+alert_validation/alert_validation_report_*.json
+
+# ClickHouse dumps and snapshots
+clickhouse_setup/**/*.parquet
+clickhouse_setup/**/*.rdb
+clickhouse_snapshot*.json
 

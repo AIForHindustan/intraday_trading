@@ -18,11 +18,19 @@ Production benefits:
 - Seamless failover
 - RESP3 protocol for Redis 8.x compatibility
 - XADD trim & group auto-create for Streams memory stability
+
+⚠️ TROUBLESHOOTING & DOCUMENTATION:
+- Read `redis_files/redis_document.md` for architecture overview and troubleshooting guide
+- Always read method docstrings in this file before making assumptions
+- Method signatures, parameters, return values, and data formats are documented in docstrings
+- Storage locations (database, stream keys) are documented in each streaming method's docstring
+- Don't assume method behavior - check docstrings for exact implementation details
 """
 
 from __future__ import annotations
 
 import time
+import os
 import json
 import random
 import redis
@@ -38,11 +46,12 @@ from redis.exceptions import (
 )
 import logging
 from threading import Lock, Thread
+import threading
 from collections import deque, defaultdict
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Callable, Iterable, Tuple, TypeVar
+from typing import Optional, List, Dict, Any, Callable, Iterable, Tuple, TypeVar, Union
 
 from utils.time_utils import INDIAN_TIME_PARSER
 from config.utils.timestamp_normalizer import TimestampNormalizer
@@ -50,10 +59,10 @@ from utils.yaml_field_loader import (
     get_field_mapping_manager,
     resolve_session_field,
 )
-from redis_files.redis_ohlc_keys import (
+from redis_files.redis_key_standards import (
     normalize_symbol as normalize_ohlc_symbol,
-    ohlc_daily_zset,
-    ohlc_hourly_zset,
+    get_key_builder,
+    RedisKeyStandards,
 )
 
 try:
@@ -169,12 +178,292 @@ CIRCUIT_BREAKER_AVAILABLE = True
 # Configure logging
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# Shared helper functions for redis_gateway compatibility
+# ============================================================================
+
+def _redis_categorize_indicator(indicator: str) -> str:
+    """Centralized indicator categorization used by all redis gateway helpers."""
+    indicator_lower = (indicator or "").lower()
+    if indicator_lower in ['rsi', 'macd', 'bollinger', 'ema', 'sma', 'vwap', 'atr'] or \
+       indicator_lower.startswith('ema_') or indicator_lower.startswith('sma_') or \
+       indicator_lower.startswith('bollinger_'):
+        return 'ta'
+    # ✅ FIX: Include ALL Greek-related fields (sync with RedisKeyStandards._categorize_indicator)
+    if indicator_lower in ['delta', 'gamma', 'theta', 'vega', 'rho', 
+                            'dte_years', 'trading_dte', 'expiry_series', 'option_price',
+                            'iv', 'implied_volatility']:
+        return 'greeks'
+    if 'volume' in indicator_lower:
+        return 'volume'
+    return 'custom'
+
+
+def _redis_transform_key(key: str) -> str:
+    """Normalize legacy redis_gateway key patterns into unified DB1 structure."""
+    if not isinstance(key, str):
+        return key
+    if key.startswith('volume_state:'):
+        return key.replace('volume_state:', 'vol:state:', 1)
+    if key.startswith('volume_averages:'):
+        return key.replace('volume_averages:', 'vol:baseline:', 1)
+    if key.startswith('baseline:'):
+        return key.replace('baseline:', 'vol:baseline:', 1)
+    if key.startswith('volume_profile:'):
+        return key.replace('volume_profile:', 'vol:profile:', 1)
+    if key.startswith('straddle_volume:'):
+        return key.replace('straddle_volume:', 'vol:straddle:', 1)
+    if key.startswith('indicators:'):
+        parts = key.split(':')
+        if len(parts) >= 3:
+            symbol = parts[1]
+            indicator = parts[2]
+            # ✅ SOURCE OF TRUTH: Canonicalize symbol in key transformation
+            canonical_symbol = RedisKeyStandards.canonical_symbol(symbol)
+            category = _redis_categorize_indicator(indicator)
+            key_builder = get_key_builder()
+            return key_builder.live_indicator(canonical_symbol, indicator, category)
+    if key.startswith('realtime:'):
+        return key.replace('realtime:', 'ticks:realtime:', 1)
+    return key
+
+
+def _redis_store_volume_state(redis_obj, token: str, data: Dict[str, Any]):
+    """Shared implementation for vol:state writes."""
+    key = _redis_transform_key(f"vol:state:{token}")
+    if isinstance(data, dict) and 'mapping' not in str(type(data)):
+        redis_obj.hset(key, mapping=data)
+    else:
+        iterable = data.items() if isinstance(data, dict) else [(None, data)]
+        for field, value in iterable:
+            if field is not None:
+                redis_obj.hset(key, field, value)
+
+
+def _redis_get_volume_state(redis_obj, token: str) -> dict:
+    """Shared implementation for vol:state reads."""
+    key = _redis_transform_key(f"vol:state:{token}")
+    data = redis_obj.hgetall(key)
+    if not data:
+        return {}
+    return {
+        (k.decode() if isinstance(k, bytes) else k):
+        (v.decode() if isinstance(v, bytes) else v)
+        for k, v in data.items()
+    }
+
+
+def _redis_store_volume_baseline(redis_obj, symbol: str, data: dict, ttl: int = 86400):
+    """Shared implementation for vol:baseline writes."""
+    key = _redis_transform_key(f"vol:baseline:{symbol}")
+    redis_obj.hset(key, mapping=data)
+    if ttl:
+        redis_obj.expire(key, ttl)
+
+
+def _redis_store_volume_profile(redis_obj, symbol: str, period: str, data: dict, ttl: int = 57600):
+    """Shared implementation for vol:profile writes."""
+    key = _redis_transform_key(f"vol:profile:{symbol}:{period}")
+    if isinstance(data, dict):
+        redis_obj.hset(key, mapping=data)
+    if ttl:
+        redis_obj.expire(key, ttl)
+
+
+def _redis_store_straddle_volume(redis_obj, underlying: str, date: str, data: dict, ttl: int = 57600):
+    """Shared implementation for vol:straddle writes."""
+    key = _redis_transform_key(f"vol:straddle:{underlying}:{date}")
+    redis_obj.hset(key, mapping=data)
+    if ttl:
+        redis_obj.expire(key, ttl)
+
+
+def _redis_store_indicator(redis_obj, symbol: str, indicator: str, value, ttl: int = 3600):
+    """Shared implementation for indicator writes using canonical key builder."""
+    if isinstance(value, bytes):
+        value_payload = value
+    elif isinstance(value, str):
+        value_payload = value
+    else:
+        value_payload = str(value)
+    
+    stored = False
+    # ✅ FIXED: Use canonical key builder for indicator storage (DB1)
+    from redis_files.redis_key_standards import get_key_builder
+    builder = get_key_builder()
+    
+    for variant in RedisKeyStandards.get_indicator_symbol_variants(symbol):
+        category = _redis_categorize_indicator(indicator)
+        # ✅ FIXED: Use canonical key builder instead of get_indicator_key
+        key = builder.live_indicator(variant, indicator, category)
+        key = _redis_transform_key(key)
+        try:
+            redis_obj.setex(key, ttl, value_payload)
+            stored = True
+        except Exception as store_err:
+            logger.error(f"Indicator store failed for {variant}:{indicator} -> {store_err}")
+    return stored
+
+
+def _redis_get_indicator(redis_obj, symbol: str, indicator: str) -> Optional[str]:
+    """Shared implementation for indicator reads using canonical key builder."""
+    # ✅ FIXED: Use canonical key builder for indicator retrieval (DB1)
+    from redis_files.redis_key_standards import get_key_builder
+    builder = get_key_builder()
+    
+    for variant in RedisKeyStandards.get_indicator_symbol_variants(symbol):
+        category = _redis_categorize_indicator(indicator)
+        # ✅ FIXED: Use canonical key builder instead of get_indicator_key
+        key = builder.live_indicator(variant, indicator, category)
+        key = _redis_transform_key(key)
+        try:
+            value = redis_obj.get(key)
+        except Exception as fetch_err:
+            logger.debug(f"Indicator fetch failed for {variant}:{indicator} -> {fetch_err}")
+            continue
+        if value is None:
+            continue
+        return value.decode('utf-8') if isinstance(value, bytes) else value
+    return None
+
 FIELD_MAPPING_MANAGER = get_field_mapping_manager()
 SESSION_FIELD_ZERODHA_CUM = resolve_session_field("zerodha_cumulative_volume")
 SESSION_FIELD_BUCKET_CUM = resolve_session_field("bucket_cumulative_volume")
 SESSION_FIELD_BUCKET_INC = resolve_session_field("bucket_incremental_volume")
 # Singleton holder for RobustRedisClient
 _redis_client_instance = None
+
+# ============================================================================
+# Enhanced Redis Data Retriever with Improved Fallback Logic
+# ============================================================================
+
+class RedisDataRetriever:
+    """
+    Enhanced retrieval class with comprehensive fallback logic and debugging.
+    
+    Provides better key variant generation and detailed failure logging.
+    """
+    
+    def __init__(self, redis_db1, redis_db2):
+        self.db1 = redis_db1
+        self.db2 = redis_db2
+        from redis_files.redis_key_standards import get_key_builder
+        self.key_builder = get_key_builder()
+        self.logger = logging.getLogger(__name__)
+
+    def get_indicator_with_fallback(self, symbol: str, indicator: str, max_retries: int = 3) -> Optional[Any]:
+        """
+        Enhanced retrieval with better fallback logic and debugging
+        
+        Args:
+            symbol: Trading symbol
+            indicator: Indicator name (e.g., 'rsi', 'atr', 'gamma')
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Indicator value if found, None otherwise
+        """
+        self.logger.info(f"🔍 [RETRIEVAL] Looking for {indicator} for {symbol}")
+        
+        # Get ALL possible variants (not just 4)
+        all_variants = self._get_all_possible_variants(symbol, indicator)
+        self.logger.info(f"   Variants to try: {all_variants}")
+        
+        for attempt in range(max_retries):
+            for key in all_variants:
+                try:
+                    # Try DB1 first (live data)
+                    data = self.db1.get(key)
+                    if data:
+                        self.logger.info(f"✅ [RETRIEVAL] Found {indicator} at key: {key}")
+                        return data.decode('utf-8') if isinstance(data, bytes) else data
+                    
+                    # Try DB2 (analytics)
+                    data = self.db2.get(key)
+                    if data:
+                        self.logger.info(f"✅ [RETRIEVAL] Found {indicator} at key: {key} (DB2)")
+                        return data.decode('utf-8') if isinstance(data, bytes) else data
+                        
+                except Exception as e:
+                    self.logger.warning(f"   Retrieval error for {key}: {e}")
+            
+            # Wait before retry
+            if attempt < max_retries - 1:
+                import time
+                time.sleep(0.1 * (attempt + 1))
+        
+        # Log detailed debug info
+        self._log_retrieval_failure(symbol, indicator, all_variants)
+        return None
+
+    def _get_all_possible_variants(self, symbol: str, indicator: str) -> List[str]:
+        """Generate comprehensive list of key variants"""
+        variants = set()
+        
+        # Get standard variants
+        from redis_files.redis_key_standards import RedisKeyStandards
+        standard_variants = RedisKeyStandards.get_indicator_symbol_variants(symbol)
+        variants.update(standard_variants)
+        
+        # Add raw symbol
+        variants.add(symbol)
+        variants.add(symbol.upper())
+        variants.add(symbol.lower())
+        
+        # Generate keys for each variant
+        keys = set()
+        for variant in variants:
+            # DB1 keys using canonical builder
+            category = RedisKeyStandards._categorize_indicator(indicator)
+            keys.add(self.key_builder.live_indicator(variant, indicator, category))
+            
+            # Also try all categories (in case categorization is wrong)
+            keys.add(f"ind:ta:{variant}:{indicator}")
+            keys.add(f"ind:greeks:{variant}:{indicator}") 
+            keys.add(f"ind:volume:{variant}:{indicator}")
+            keys.add(f"ind:custom:{variant}:{indicator}")
+            
+            # Legacy keys
+            keys.add(f"analysis_cache:indicators:{variant}:{indicator}")
+        
+        return list(keys)
+
+    def _log_retrieval_failure(self, symbol: str, indicator: str, tried_variants: List[str]):
+        """Log detailed failure information"""
+        self.logger.warning(f"❌ [RETRIEVAL_DEBUG] NOT FOUND {indicator} for {symbol}")
+        self.logger.warning(f"   Tried {len(tried_variants)} variants: {tried_variants[:10]}...")  # First 10 only
+        
+        # Check what keys actually exist for this symbol
+        existing_keys = self._find_existing_keys_for_symbol(symbol)
+        if existing_keys:
+            self.logger.info(f"   Existing keys for {symbol}: {existing_keys[:10]}")  # First 10
+        else:
+            self.logger.warning(f"   No keys found for {symbol} at all!")
+
+    def _find_existing_keys_for_symbol(self, symbol: str) -> List[str]:
+        """Find what keys actually exist for this symbol (use sparingly)"""
+        existing = []
+        
+        # Check a few common patterns (be very selective to avoid performance issues)
+        patterns_to_check = [
+            f"*{symbol}*",
+            f"*{symbol.upper()}*", 
+            f"*{symbol.lower()}*",
+        ]
+        
+        for pattern in patterns_to_check:
+            try:
+                # DB1 check
+                keys = self.db1.keys(pattern)
+                existing.extend([k.decode('utf-8') if isinstance(k, bytes) else k for k in keys])
+                
+                # DB2 check  
+                keys = self.db2.keys(pattern)
+                existing.extend([k.decode('utf-8') if isinstance(k, bytes) else k for k in keys])
+            except Exception:
+                continue
+                
+        return existing
 
 
 class SafeJSONEncoder(json.JSONEncoder):
@@ -195,127 +484,365 @@ class SafeJSONEncoder(json.JSONEncoder):
             return obj.__dict__
         return super().default(obj)
 
+# ---------------------------------------------------------------------------
+# Base connection configuration (Redis 8.x)
+# ---------------------------------------------------------------------------
 
-# Import Redis configuration from consolidated config
-from redis_files.redis_config import (
-    REDIS_DATABASES,
-    AION_CHANNELS,
-    get_database_for_data_type,
-    get_ttl_for_data_type,
-)
+REDIS_8_CONFIG: Dict[str, Any] = {
+    "host": os.environ.get("REDIS_HOST", "localhost"),
+    "port": int(os.environ.get("REDIS_PORT", 6379)),
+    "password": os.environ.get("REDIS_PASSWORD") or None,
+    "decode_responses": True,  # Decode to strings for easier processing
+    "socket_connect_timeout": 5,
+    "socket_keepalive": True,
+    "retry_on_timeout": True,
+    "max_connections": 400,  # Increased for high-frequency trading data (crawler + scanner + volume operations)         
+    "health_check_interval": 30,  # Redis 8.0 enhancement
+    "socket_timeout": 10,  # ✅ Matched to Zerodha intraday crawler connection_timeout (10s)
+    # Zerodha WebSocket uses 10-15s connection timeout for high-frequency tick data
+    # This prevents premature timeouts during tick bursts while maintaining responsiveness
+}
 
-
-def _detect_process_name():
-    """
-    Detect which process is running based on script name or environment.
-    Used to automatically select appropriate process-specific connection pools.
-    """
-    import sys
-    import os
+# Redis 8.2 low-latency optimizations for tick/crawler workload
+REDIS_8_LOW_LATENCY_CONFIG: Dict[str, Any] = {
+    # Persistence (avoid per-write fsync stalls)
+    "appendonly": True,
+    "appendfsync": "everysec",
+    "no-appendfsync-on-rewrite": True,
+    "rdb-save-incremental-fsync": True,
+    "save": "",  # Disable RDB saves if AOF is sufficient
     
-    # Check for explicit process name in environment
-    process_name = os.getenv("REDIS_PROCESS_NAME")
-    if process_name:
-        return process_name
+    # Latency monitoring (8.x adds per-command percentiles)
+    "latency-tracking": True,
+    "latency-monitor-threshold": 100,  # Record spikes >=100ms
     
-    # Detect from script name
-    script_name = sys.argv[0] if sys.argv else ""
-    if "scanner_main" in script_name or "scanner" in script_name.lower():
-        return "intraday_scanner"
-    elif "alert_dashboard" in script_name or "dashboard" in script_name.lower():
-        return "dashboard"
-    elif "alert_validator" in script_name or "validator" in script_name.lower():
-        return "validator"
-    elif "ngrok" in script_name.lower():
-        return "ngrok"
-    elif "crawler" in script_name.lower():
-        return "intraday_scanner"  # Crawlers share scanner pool
+    # Networking / event loop
+    "tcp-keepalive": 60,
+    "tcp-backlog": 511,
     
-    # Default fallback
-    return "default"
+    # I/O threads (helpful for read-heavy Pub/Sub / Streams)
+    "io-threads": 4,  # min(CPU cores/2, 4)
+    "io-threads-do-reads": True,  # Only reads (writes remain single-threaded)
+    
+    # Memory & defrag (avoid stop-the-world malloc)
+    "maxmemory": "4gb",
+    "maxmemory-policy": "allkeys-lru",
+    "activedefrag": True,
+    "active-defrag-ignore-bytes": 1048576,
+    "active-defrag-threshold-lower": 10,
+    "active-defrag-threshold-upper": 100,
+    
+    # Lazy frees (reduce big-key delete stalls)
+    "lazyfree-lazy-eviction": True,
+    "lazyfree-lazy-expire": True,
+    "lazyfree-lazy-server-del": True,
+    
+    # Pub/Sub buffers (protect server under bursts)
+    "client-output-buffer-limit": "pubsub 64mb 16mb 60",
+    "client-output-buffer-limit-normal": "0 0 0",
+    
+    # Streams (prefer over LPUSH/LTRIM; cheap trimming)
+    # ✅ Redis 8.2: Optimized for high-frequency tick data
+    "stream-node-max-bytes": 4096,
+    "stream-node-max-entries": 100,
+    # Note: maxlen and approximate=True are set per-stream in code:
+    # - ticks:intraday:processed: maxlen=10000, approximate=True
+    # - patterns streams: maxlen=5000, approximate=True
+    # - alerts:stream: maxlen=1000, approximate=True
+    
+    # Server loop
+    "hz": 10,  # Default; avoid cranking up unless measured
+}
+
+# Optional global feature flags (e.g., client tracking, RedisJSON support)
+REDIS_8_FEATURE_FLAGS: Dict[str, bool] = {
+    "client_tracking": True,
+    "use_json": False,  # set to True when RedisJSON module is loaded
+}
+
+# ---------------------------------------------------------------------------
+# Database segmentation (single source of truth)
+# Simplified to 3 databases:
+# - DB 0: Empty (unused)
+# - DB 1: Historical OHLC + current tick data + rolling windows
+# - DB 2: Pattern validation results only
+# ---------------------------------------------------------------------------
+
+REDIS_DATABASES: Dict[int, Dict[str, Any]] = {
+    # DB 0: Empty (unused)
+    0: {
+        "name": "empty",
+        "ttl": 3600,
+        "data_types": [],  # Empty - unused
+        "client_tracking": False,
+        "use_json": False,
+    },
+    # DB 1: Historical OHLC + current tick data + rolling windows
+    1: {
+        "name": "ohlc_and_ticks",
+        "ttl": 57_600,  # 16 hours
+        "data_types": [
+            # Historical OHLC data
+            "ohlc_latest",      # Latest OHLC data (Hash)
+            "ohlc_daily",       # Historical OHLC data (Sorted Set, 55 days)
+            "ohlc_hourly",      # Hourly OHLC data
+            "ohlc_stats",       # OHLC statistics
+            # Current tick data
+            "ticks_stream",     # Tick data streams
+            "ticks:intraday:processed",  # Processed tick data stream
+            "ticks:realtime",   # Real-time tick streams
+            "ticks_optimized",  # Optimized tick data
+            "5s_ticks",         # 5-second tick data
+            "stream_data",      # Generic stream data
+            "real_time_data",   # Real-time data
+            "streaming_data",   # Streaming data
+            # Rolling windows
+            "rolling_windows",  # Rolling window data
+            "time_buckets",     # Time bucket data
+            "bucket_incremental_volume",  # Volume buckets
+            "bucket_cumulative_volume",  # Cumulative volume buckets
+            # Legacy compatibility
+            "incremental_volume",  # Legacy identifier
+            "daily_cumulative",   # Daily cumulative data
+            "symbol_volume",      # Symbol volume data
+        ],
+        "client_tracking": True,
+        "use_json": True,
+    },
+    # DB 2: Pattern validation results only
+    2: {
+        "name": "pattern_validation",
+        "ttl": 604800,  # 7 days
+        "data_types": [
+            "pattern_performance",    # Pattern performance metrics
+            "pattern_metrics",        # Aggregated pattern statistics
+            "signal_quality",        # Signal quality tracking per symbol/pattern
+            "validator_metadata",     # Validator metadata
+            "validation_results",     # Validation results
+            "forward_validation",     # Forward validation results
+        ],
+        "client_tracking": False,
+        "use_json": True,
+    },
+}
 
 
-class ConnectionPooledRedisClient:
-    """Shared connection-pool wrapper with process-specific pools to avoid connection exhaustion."""
+# ---------------------------------------------------------------------------
+# Redis 8.0 configuration helper
+# ---------------------------------------------------------------------------
 
-    _pools: Dict[str, ConnectionPool] = {}
-    _lock: Lock = Lock()
+class Redis8Config:
+    """Unified Redis configuration with feature awareness."""
 
-    def __init__(
-        self,
-        host: str = "localhost",
-        port: int = 6379,
-        db: int = 0,
-        password: Optional[str] = None,
-        max_connections: int = 50,  # Reduced to prevent pool exhaustion (pools are shared)
-        decode_responses: bool = True,
-        socket_connect_timeout: int = 5,
-        socket_timeout: int = 5,
-        retry_on_timeout: bool = True,
-        health_check_interval: int = 30,
-        process_name: Optional[str] = None,  # Process name for process-specific pools
-    ):
-        # Use process-specific pools if available
-        if process_name is None:
-            process_name = _detect_process_name()
+    def __init__(self, environment: Optional[str] = None):
+        self.environment = environment or os.environ.get("ENVIRONMENT", "dev")
+        self.base_config = REDIS_8_CONFIG.copy()
+        self.global_features = REDIS_8_FEATURE_FLAGS.copy()
+
+        # Environment tuning
+        if self.environment == "prod":
+            self.base_config.update({"max_connections": 50, "health_check_interval": 60})
+        elif self.environment == "dev":
+            self.base_config.update({"max_connections": 10, "health_check_interval": 10})
+
+    def apply_low_latency_optimizations(self, redis_client) -> bool:
+        """
+        Apply Redis 8.2 low-latency optimizations for tick/crawler workload.
         
-        # Try to use process-specific pools from redis_config
+        Args:
+            redis_client: Connected Redis client instance
+            
+        Returns:
+            bool: True if optimizations applied successfully
+        """
         try:
-            from redis_files.redis_manager import RedisManager82
-            # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
-            # RedisManager82.get_client() automatically uses PROCESS_POOL_CONFIG
-            process_client = RedisManager82.get_client(process_name=process_name, db=db)
-            # Extract the pool from the client
-            if hasattr(process_client, 'connection_pool') and process_client.connection_pool:
-                self.pool = process_client.connection_pool
-                self.redis = process_client
-                # Set client name if not already set
+            import redis
+            
+            # Apply low-latency configurations
+            for config_key, config_value in REDIS_8_LOW_LATENCY_CONFIG.items():
                 try:
-                    import time
-                    import os
-                    timestamp = int(time.time())
-                    instance_id = str(os.getpid())
-                    client_name = f"{process_name}_{instance_id}_{timestamp}"
-                    process_client.client_setname(client_name)
-                except Exception:
-                    pass
-                return
+                    if isinstance(config_value, str) and config_value == "":
+                        # Handle empty string values (like save "")
+                        redis_client.config_set(config_key, "")
+                    elif isinstance(config_value, bool):
+                        # Convert boolean to string
+                        redis_client.config_set(config_key, "yes" if config_value else "no")
+                    else:
+                        redis_client.config_set(config_key, config_value)
+                except redis.exceptions.ResponseError as e:
+                    # Some configs might not be available or require restart
+                    print(f"⚠️  Config {config_key}={config_value} failed: {e}")
+                    continue
+            
+            print("✅ Redis 8.2 low-latency optimizations applied successfully!")
+            return True
+            
         except Exception as e:
-            # Fallback to old method if process-specific pools fail
-            logger.debug(f"Failed to use process-specific pool for {process_name}, falling back: {e}")
+            print(f"❌ Failed to apply Redis optimizations: {e}")
+            return False
+
+    def _resolve_db_number(self, db_name: str) -> int:
+        for number, spec in REDIS_DATABASES.items():
+            if spec["name"] == db_name:
+                return number
+        raise KeyError(f"Unknown Redis DB name: {db_name}")
+
+    def get_db_config(self, db_name: str) -> Dict[str, Any]:
+        """Return base connection kwargs for a named database."""
+        config = self.base_config.copy()
+        config["db"] = self._resolve_db_number(db_name)
+        return config
+
+    def get_db_features(self, db_name: str) -> Dict[str, bool]:
+        """Return feature flags (client tracking / JSON) for a named database."""
+        db_num = self._resolve_db_number(db_name)
+        spec = REDIS_DATABASES[db_num]
+        return {
+            "client_tracking": bool(spec.get("client_tracking", False)),
+            "use_json": bool(spec.get("use_json", False)),
+        }
+
+# ---------------------------------------------------------------------------
+# Compatibility helpers (legacy API)
+# ---------------------------------------------------------------------------
+
+def get_redis_config(environment: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Backwards-compatible accessor that returns the base connection configuration.
+    (Note: client-tracking must be enabled explicitly by the caller.)
+    """
+    cfg = Redis8Config(environment)
+    return cfg.base_config.copy()
+
+
+def get_database_for_data_type(data_type: str) -> int:
+    """Map a logical data type to its Redis database number."""
+    for db_num, spec in REDIS_DATABASES.items():
+        if data_type in spec.get("data_types", []):
+            return db_num
+    return 0
+
+
+def get_ttl_for_data_type(data_type: str) -> int:
+    """Return TTL (seconds) for a given data type."""
+    for spec in REDIS_DATABASES.values():
+        if data_type in spec.get("data_types", []):
+            return spec.get("ttl", 3600)
+    return 3600
+
+
+def apply_redis_low_latency_optimizations(redis_client) -> bool:
+    """
+    Convenience function to apply Redis 8.2 low-latency optimizations.
+    
+    Args:
+        redis_client: Connected Redis client instance
         
-        # Fallback: Use old shared pool method (backward compatibility)
-        pool_key = f"{host}:{port}:{db}:{decode_responses}:{process_name}"
-        with self._lock:
-            pool = self._pools.get(pool_key)
-            if not pool:
-                pool = ConnectionPool(
-                    host=host,
-                    port=port,
-                    db=db,
-                    password=password,
-                    max_connections=max_connections,
-                    decode_responses=decode_responses,
-                    socket_connect_timeout=socket_connect_timeout,
-                    socket_timeout=socket_timeout,
-                    retry_on_timeout=retry_on_timeout,
-                    health_check_interval=health_check_interval,
-                )
-                self._pools[pool_key] = pool
-        self.pool_key = pool_key
-        self.pool = pool
-        self.redis = redis.Redis(connection_pool=self.pool)
+    Returns:
+        bool: True if optimizations applied successfully
+    """
+    config = Redis8Config()
+    return config.apply_low_latency_optimizations(redis_client)
 
-    def close(self):
-        try:
-            # Return connection to pool; redis-py handles pooling automatically.
-            if isinstance(self.redis, redis.Redis):
-                self.redis.close()
-        except Exception:
-            pass
 
-    def __del__(self):
-        self.close()
+# ---------------------------------------------------------------------------
+# Connection Pool Configuration - Process-Specific Pools
+# ---------------------------------------------------------------------------
+
+# Process-specific pool size configurations (prevents over-allocation)
+# ✅ SOLUTION 4: Increased pool sizes to prevent connection exhaustion
+# 
+# IMPORTANT: RedisManager82.get_client() will automatically use PROCESS_POOL_CONFIG values
+# if available, so these values override any hardcoded max_connections parameter.
+# 
+# Pool sizes are optimized for high-throughput processes:
+# - High-frequency processes (scanner, crawler) get larger pools
+# - Moderate processes (consumers, validators) get moderate pools
+# - Low-frequency processes (dashboard, cleanup) get smaller pools
+PROCESS_POOL_CONFIG: Dict[str, int] = {
+    # ✅ SOLUTION 4: Increased for high-throughput processes
+    "intraday_scanner": 30,      # Main scanner needs more connections for high-frequency processing
+    "intraday_crawler": 15,      # Crawler needs dedicated pool for high-frequency publishing
+    "stream_consumer": 10,       # Stream consumers need dedicated connections
+    "data_pipeline": 10,         # Data pipeline consumer group
+    "redis_storage": 10,         # ✅ RedisStorage batching operations (50 ticks/100ms flush)
+    "dashboard": 8,              # Dashboard needs fewer (mostly read operations)
+    "validator": 10,            # Moderate needs (validation processing)
+    "alert_validator": 10,       # Alert validator consumer
+    "cleanup": 3,                # Maintenance tasks (minimal connections)
+    "monitor": 3,                # Stream monitor (proactive monitoring)
+    # Legacy/fallback values
+    "crawler": 15,               # Generic crawler pool size (matches intraday_crawler)
+    "gift_nifty_crawler": 2,     # Index updater needs minimal connections (30s intervals)
+    "gift_nifty_gap": 2,         # Alias for gift_nifty_crawler (backward compatibility)
+    "default": 10,               # Default for unknown processes
+}
+
+# ⚠️ DEPRECATED FUNCTIONS REMOVED:
+# - create_process_specific_pool() -> Use RedisManager82.get_client()
+# - get_redis_connection_pool() -> Use RedisManager82.get_client()
+# - get_redis_client_from_pool() -> Use RedisManager82.get_client()
+#
+# Migration guide:
+# - Old: get_redis_client_from_pool(db=1)
+# - New: RedisManager82.get_client(process_name="your_process", db=1)
+
+
+# ---------------------------------------------------------------------------
+# Redis 8.2 Optimization Settings
+# ---------------------------------------------------------------------------
+
+# ✅ RedisStorage batching configuration (migrated from Dragonfly)
+# Used by RedisStorage.queue_tick_for_storage() for optimized tick storage
+REDIS_STORAGE_BATCH_CONFIG: Dict[str, Any] = {
+    "max_batch_size": 50,        # Flush after 50 ticks
+    "flush_interval": 0.1,       # Or flush every 100ms
+    "tick_ttl": 300,             # 5 minutes TTL for tick data
+    "latest_tick_ttl": 60,       # 1 minute TTL for latest tick metadata
+}
+
+# ✅ Stream maxlen settings (Redis 8.2 approximate trimming)
+# Prevents unbounded stream growth while maintaining performance
+REDIS_STREAM_MAXLEN_CONFIG: Dict[str, int] = {
+    "ticks:intraday:processed": 2000000,    # ✅ INCREASED: Keep 10 days of data for ClickHouse recovery (2M ticks)
+    "patterns:global": 5000,              # Keep last 5k patterns
+    "patterns:{symbol}": 5000,            # Keep last 5k patterns per symbol
+    "indicators:{indicator_type}:{symbol}": 5000,  # Keep last 5k indicator updates
+    "indicators:{indicator_type}:global": 5000,    # Keep last 5k global indicator updates
+    "alerts:stream": 1000,                # Keep last 1k alerts (Tier 1 performance)
+}
+
+# ✅ Redis 8.2 hset mapping optimization
+# All hash operations use hset with mapping parameter for batch updates
+# Example: pipe.hset(f"ticks:{symbol}", mapping=tick_hash_data)
+# This reduces round-trips from N operations to 1 operation per hash
+REDIS_HSET_MAPPING_ENABLED: bool = True  # Always enabled for Redis 8.2
+
+
+class RedisConfig(Redis8Config):
+    """
+    Legacy wrapper retained for import compatibility.
+    Exposes a ``databases`` property (name -> db number) matching prior usage.
+    """
+
+    def __init__(self, environment: Optional[str] = None):
+        super().__init__(environment)
+        self.databases = {spec["name"]: db for db, spec in REDIS_DATABASES.items()}
+
+
+# ---------------------------------------------------------------------------
+# AION analytics channels (replaces legacy DeepSeek exports)
+# ---------------------------------------------------------------------------
+
+AION_CHANNELS: Dict[str, str] = {
+    "correlations": "aion.correlations",
+    "divergences": "aion.divergences",
+    "validations": "aion.validated",
+    "alerts": "aion.alerts",
+    "monte_carlo": "aion.monte_carlo",
+    "granger": "aion.granger",
+    "dbscan": "aion.dbscan",
+}
 
 
 class RobustRedisClient:
@@ -362,7 +889,7 @@ class RobustRedisClient:
         else:
             # Try to get from centralized config if no config provided
             try:
-                from redis_files.redis_config import get_redis_config
+                # Use local get_redis_config() function (consolidated from redis_config.py)
                 redis_config = get_redis_config()
                 if "max_connections" in redis_config:
                     self.max_connections = int(redis_config["max_connections"])
@@ -371,7 +898,7 @@ class RobustRedisClient:
 
         # ✅ FIXED: Separate Redis clients per database
         self.clients = {}
-        self.connection_wrappers: Dict[int, ConnectionPooledRedisClient] = {}
+        self.connection_wrappers: Dict[int, Optional[Any]] = {}  # Not using ConnectionPooledRedisClient anymore (Any is a placeholder)
         self.pubsub = None
         self.is_connected = False
         self.connection_lock = Lock()
@@ -425,6 +952,19 @@ class RobustRedisClient:
     # Status: Never actually used - HybridCalculations handles all calculations
     # Impact: Removed to eliminate dead code and initialization overhead
 
+        # REMOVED: _init_redis_calculations() - was initializing unused RedisCalculations
+    # Purpose: Was intended to provide in-server calculations via Lua for performance
+    # Status: Never actually used - HybridCalculations handles all calculations
+    # Impact: Removed to eliminate dead code and initialization overhead
+
+    def _transform_key(self, key: str) -> str:
+        """Transform old key patterns to new unified structure"""
+        return _redis_transform_key(key)
+
+    def _categorize_indicator(self, indicator: str) -> str:
+        """Categorize indicators for better organization"""
+        return _redis_categorize_indicator(indicator)
+
     @property
     def current_session(self) -> str:
         if getattr(self, "cumulative_tracker", None):
@@ -437,40 +977,44 @@ class RobustRedisClient:
             self.cumulative_tracker.current_session = value
         self._fallback_session = value
 
+    @property
+    def redis(self):
+        """Backward compatibility property for redis_gateway.redis access"""
+        return self.redis_client
+
     def _initialize_clients(self):
         """Initialize separate Redis clients for each database using process-specific pools"""
         try:
             # Detect process name for process-specific pools
-            process_name = _detect_process_name()
+            process_name = "redis_client"
             logger.info(f"📡 Initializing Redis clients for process: {process_name}")
             
             # Initialize clients for all databases defined in REDIS_DATABASES
             for db_num in REDIS_DATABASES.keys():
                 try:
-                    # Use process-specific pools via ConnectionPooledRedisClient
-                    wrapper = ConnectionPooledRedisClient(
-                        host=self.host,
-                        port=self.port,
+                    # Use RedisManager82.get_client() for process-specific pools
+                    client = RedisManager82.get_client(
+                        process_name=process_name,
                         db=db_num,
-                        password=self.password,
-                        max_connections=self.max_connections,
-                        decode_responses=self.decode_responses,
-                        process_name=process_name,  # Pass process name for process-specific pools
+                        host=REDIS_8_CONFIG.get("host", "localhost"),
+                        port=REDIS_8_CONFIG.get("port", 6379),
+                        password=REDIS_8_CONFIG.get("password"),
+                        decode_responses=REDIS_8_CONFIG.get("decode_responses", True)
                     )
-                    client = wrapper.redis
+                    # Test connection
                     client.ping()
-                    self.connection_wrappers[db_num] = wrapper
+                    self.connection_wrappers[db_num] = None  # Not using wrapper anymore
                     self.clients[db_num] = client
                     logger.info(
-                        f"✅ Redis client initialized for DB {db_num} using process-specific pool ({process_name}, max {self.max_connections})"
+                        f"✅ Redis client initialized for DB {db_num} using process-specific pool ({process_name})"
                     )
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to initialize client for DB {db_num}: {e}")
                     self.connection_wrappers[db_num] = None
                     self.clients[db_num] = None
 
-            # Set primary client (DB 0 or first available)
-            self.redis_client = self.clients.get(0) or next(
+            # Set primary client (DB 1 is the default for unified structure)
+            self.redis_client = self.clients.get(1) or self.clients.get(0) or next(
                 (client for client in self.clients.values() if client is not None),
                 None,
             )
@@ -511,7 +1055,31 @@ class RobustRedisClient:
         return client.function_load(script)
 
     def publish_to_stream(self, stream_name, data, maxlen=10000):
-        """Publish to Redis Stream instead of simple SET"""
+        """
+        Publish to Redis Stream instead of simple SET.
+        
+        Storage Location:
+        - Database: DB 1 (realtime) - via get_database_for_data_type("stream_data")
+        - Stream Key: stream_name (as provided)
+        
+        Data Format/Signature:
+        - Input: data (dict, list, str, bytes, or other serializable type)
+        - Stored Format: Redis Stream entry with fields:
+          {
+            "data": <JSON string of input data>,
+            "timestamp": <current timestamp in milliseconds>
+          }
+        - Serialization: dict/list are JSON-encoded using SafeJSONEncoder
+        - Other types are converted to string
+        
+        Args:
+            stream_name: Redis stream key name
+            data: Data to publish (will be JSON-serialized if dict/list)
+            maxlen: Maximum stream length before trimming (default: 10000)
+            
+        Returns:
+            Stream entry ID (string) on success, False on failure
+        """
         try:
             # Get the appropriate client for the stream
             db_num = self.get_database_for_data_type("stream_data")
@@ -541,8 +1109,158 @@ class RobustRedisClient:
             self.stats["failed_operations"] += 1
             return False
 
+    def produce_ticks_batch_sync(
+        self, 
+        ticks: List[Dict[str, Any]],
+        stream_name: str = "ticks:intraday:processed",
+        maxlen: int = 10000,
+        approximate: bool = True
+    ) -> Dict[str, Any]:
+        """
+        High-throughput tick production with batching (storage only, no calculations).
+        Uses pipelines for efficient batch writes to Redis streams.
+        
+        ✅ STORAGE ONLY: This method only stores ticks, no calculations are performed.
+        Calculations should be done in calculations.py via HybridCalculations.
+        
+        Storage Location:
+        - Database: DB 1 (realtime) - via get_database_for_data_type("stream_data")
+        - Stream Keys:
+          * Single symbol: "ticks:intraday:{symbol}" (e.g., "ticks:intraday:NSE:RELIANCE")
+          * Multiple symbols: stream_name (default: "ticks:intraday:processed")
+        
+        Data Format/Signature:
+        - Input: List of tick dictionaries with fields:
+          {
+            "symbol": str,                    # Required: Trading symbol
+            "price" or "last_price": float,   # Price field (prefers "price", falls back to "last_price")
+            "volume" or "traded_quantity" or "bucket_incremental_volume": int,  # Volume field
+            "timestamp" or "exchange_timestamp_ms": int,  # Timestamp in milliseconds
+            "high": float (optional),          # High price
+            "low": float (optional),           # Low price
+            "open": float (optional),          # Open price
+            "close": float (optional),        # Close price
+            "instrument_token": int (optional), # Instrument token
+            "bucket_incremental_volume": int (optional),  # Incremental volume
+            "bucket_cumulative_volume": int (optional)   # Cumulative volume
+          }
+        - Stored Format: Redis Stream entry with fields (all values converted to strings):
+          {
+            "symbol": "<symbol>",
+            "price": "<price>",
+            "volume": "<volume>",
+            "timestamp": "<timestamp_ms>",
+            ... (all other fields from input tick, converted to strings)
+          }
+        - Field Mapping: All tick fields are preserved and converted to strings for Redis streams
+        
+        Args:
+            ticks: List of tick dictionaries (see Data Format above)
+            stream_name: Stream name (defaults to "ticks:intraday:processed")
+            maxlen: Maximum stream length (default: 10000)
+            approximate: Use approximate trimming (default: True, faster)
+            
+        Returns:
+            Dict with ticks_produced, batch_duration_ms, throughput_tps, symbols
+        """
+        import time
+        start_time = time.perf_counter()
+        
+        # Get the appropriate client for streams (DB 1 for realtime)
+        db_num = self.get_database_for_data_type("stream_data")
+        client = self.get_client(db_num)
+        if not client:
+            logger.error(f"No client available for stream {stream_name}")
+            return {
+                'ticks_produced': 0,
+                'batch_duration_ms': 0,
+                'throughput_tps': 0,
+                'symbols': []
+            }
+        
+        # Group ticks by symbol for efficient streaming
+        ticks_by_symbol = {}
+        for tick in ticks:
+            symbol = tick.get('symbol', 'UNKNOWN')
+            if symbol not in ticks_by_symbol:
+                ticks_by_symbol[symbol] = []
+            ticks_by_symbol[symbol].append(tick)
+        
+        # Use pipelines for each symbol (batched writes)
+        total_written = 0
+        for symbol, symbol_ticks in ticks_by_symbol.items():
+            # Use existing stream naming
+            if len(ticks_by_symbol) == 1:
+                stream_key = f"ticks:intraday:{symbol}"
+            else:
+                stream_key = stream_name
+            
+            # Batch writes using pipeline
+            with client.pipeline(transaction=False) as pipe:
+                for tick in symbol_ticks:
+                    fields = {
+                        'symbol': str(tick.get('symbol', 'UNKNOWN')),
+                        'price': str(tick.get('price', tick.get('last_price', 0))),
+                        'volume': str(tick.get('volume', tick.get('traded_quantity', tick.get('bucket_incremental_volume', 0)))),
+                        'timestamp': str(tick.get('timestamp', tick.get('exchange_timestamp_ms', time.time() * 1000)))
+                    }
+                    # Add optional fields
+                    if 'high' in tick:
+                        fields['high'] = str(tick['high'])
+                    if 'low' in tick:
+                        fields['low'] = str(tick['low'])
+                    if 'open' in tick:
+                        fields['open'] = str(tick['open'])
+                    if 'close' in tick:
+                        fields['close'] = str(tick['close'])
+                    if 'instrument_token' in tick:
+                        fields['instrument_token'] = str(tick['instrument_token'])
+                    if 'bucket_incremental_volume' in tick:
+                        fields['bucket_incremental_volume'] = str(tick['bucket_incremental_volume'])
+                    if 'bucket_cumulative_volume' in tick:
+                        fields['bucket_cumulative_volume'] = str(tick['bucket_cumulative_volume'])
+                    
+                    pipe.xadd(
+                        stream_key,
+                        fields,
+                        maxlen=maxlen,
+                        approximate=approximate
+                    )
+                
+                # Execute pipeline (all writes in one round-trip)
+                results = pipe.execute()
+                total_written += len([r for r in results if r])
+        
+        duration = time.perf_counter() - start_time
+        return {
+            'ticks_produced': total_written,
+            'batch_duration_ms': duration * 1000,
+            'throughput_tps': total_written / duration if duration > 0 else 0,
+            'symbols': list(ticks_by_symbol.keys())
+        }
+
     def read_from_stream(self, stream_name, count=100, start_id="0"):
-        """Read from Redis Stream"""
+        """
+        Read from Redis Stream.
+        
+        Storage Location:
+        - Database: DB 1 (realtime) - via get_database_for_data_type("stream_data")
+        - Stream Key: stream_name (as provided)
+        
+        Data Format/Signature:
+        - Returns: List of tuples (message_id, fields_dict)
+        - Each message contains fields as stored (string values)
+        - For publish_to_stream(): fields = {"data": "<JSON string>", "timestamp": "<ms>"}
+        - For produce_ticks_batch_sync(): fields = {"symbol": "...", "price": "...", "volume": "...", ...}
+        
+        Args:
+            stream_name: Redis stream key name
+            count: Maximum number of messages to read (default: 100)
+            start_id: Starting message ID (default: "0" for beginning)
+            
+        Returns:
+            List of (message_id, fields_dict) tuples, or empty list on error
+        """
         try:
             db_num = self.get_database_for_data_type("stream_data")
             client = self.get_client(db_num)
@@ -557,14 +1275,6 @@ class RobustRedisClient:
         except Exception as e:
             logger.error(f"Failed to read from stream {stream_name}: {e}")
             return []
-
-    def get_database_for_data_type(self, data_type):
-        """Get appropriate database number for data type"""
-        return get_database_for_data_type(data_type)
-
-    def get_ttl_for_data_type(self, data_type):
-        """Get TTL for data type"""
-        return get_ttl_for_data_type(data_type)
 
     def switch_database(self, db_num):
         """Switch to specific Redis database safely.
@@ -585,25 +1295,24 @@ class RobustRedisClient:
                 self.db = db_num
                 return True
             except Exception as e:
-                logger.debug(
-                    f"Direct SELECT failed for DB {db_num}, rebuilding pool: {e}"
-                )
+                logger.warning(f"Direct SELECT failed for DB {db_num}, rebuilding pool: {e}")
 
         # Rebuild connection pool bound to the requested DB
         try:
             with self.connection_lock:
-                wrapper = ConnectionPooledRedisClient(
-                    host=self.host,
-                    port=self.port,
+                # Use RedisManager82.get_client() to get a client for the requested DB
+                client = RedisManager82.get_client(
+                    process_name="redis_client",
                     db=db_num,
-                    password=self.password,
-                    max_connections=self.max_connections,
-                    decode_responses=self.decode_responses,
+                    host=REDIS_8_CONFIG.get("host", "localhost"),
+                    port=REDIS_8_CONFIG.get("port", 6379),
+                    password=REDIS_8_CONFIG.get("password"),
+                    decode_responses=REDIS_8_CONFIG.get("decode_responses", True)
                 )
-                self.redis_client = wrapper.redis
-                self.redis_client.ping()
-                self.connection_wrappers[db_num] = wrapper
-                self.clients[db_num] = self.redis_client
+                client.ping()
+                self.redis_client = client
+                self.connection_wrappers[db_num] = None  # Not using wrapper anymore
+                self.clients[db_num] = client
                 self.db = db_num
                 self.is_connected = True
                 self.pubsub = self.redis_client.pubsub()
@@ -760,7 +1469,7 @@ class RobustRedisClient:
                             result = client.set(key, value)
                         key_to_result[key] = bool(result)
                     except Exception as fallback_error:
-                        logger.debug(f"Fallback store failed for {key}: {fallback_error}")
+                        logger.warning(f"Fallback operation failed for key {key}: {fallback_error}")
         
         return key_to_result
 
@@ -790,10 +1499,28 @@ class RobustRedisClient:
 
     # ============ Stream Operations (XADD) ============
     def xadd(self, name, fields, id="*", maxlen=None, approximate=True):
-        """Add entry to a Redis Stream with auto-reconnection and fallback queue.
-
-        Mirrors redis-py's signature. `fields` should be a dict of field->value
-        where values are str/bytes/int/float.
+        """
+        Add entry to a Redis Stream with auto-reconnection and fallback queue.
+        
+        Storage Location:
+        - Database: DB 0 (system) - uses primary redis_client
+        - Stream Key: name (as provided)
+        
+        Data Format/Signature:
+        - Input: fields (dict) with field->value pairs
+        - Value Types: str, bytes, int, float (or will be JSON-encoded/stringified)
+        - Stored Format: Redis Stream entry with fields as-is (values converted to strings if needed)
+        - Field names and values are preserved exactly as provided
+        
+        Args:
+            name: Redis stream key name
+            fields: Dictionary of field->value pairs (values: str/bytes/int/float)
+            id: Message ID (default: "*" for auto-generated)
+            maxlen: Maximum stream length before trimming (optional)
+            approximate: Use approximate trimming if maxlen set (default: True)
+            
+        Returns:
+            Stream entry ID (string) on success, None on failure (queued for retry)
         """
         self._ensure_connection()
         if self.is_connected and self.redis_client:
@@ -843,7 +1570,13 @@ class RobustRedisClient:
     def store_premarket_volume(self, symbol, bucket_incremental_volume):
         """Store premarket bucket_incremental_volume in DB 1 (realtime) via store_by_data_type routing - Critical for 9:00-9:30 AM manipulation detection"""
         # Resolve token to symbol BEFORE storing
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
+        # ✅ Delegate to cumulative_tracker if available
+        if hasattr(self, 'cumulative_tracker') and self.cumulative_tracker:
+            symbol = self.cumulative_tracker._resolve_token_to_symbol_for_storage(symbol)
+        else:
+            symbol_str = str(symbol) if symbol else ""
+            if not symbol_str or symbol_str.startswith("UNKNOWN_") or (symbol_str.isdigit() and ":" not in symbol_str):
+                symbol = None
         key = f"premarket:{symbol}:{int(time.time())}"
         return self.store_by_data_type("premarket_trades", key, json.dumps(bucket_incremental_volume))
 
@@ -883,7 +1616,13 @@ class RobustRedisClient:
     def store_continuous_data(self, symbol, market_data):
         """Store 5s continuous data in DB 1 (realtime) via store_by_data_type routing"""
         # Resolve token to symbol BEFORE storing
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
+        # ✅ Delegate to cumulative_tracker if available
+        if hasattr(self, 'cumulative_tracker') and self.cumulative_tracker:
+            symbol = self.cumulative_tracker._resolve_token_to_symbol_for_storage(symbol)
+        else:
+            symbol_str = str(symbol) if symbol else ""
+            if not symbol_str or symbol_str.startswith("UNKNOWN_") or (symbol_str.isdigit() and ":" not in symbol_str):
+                symbol = None
         key = f"continuous:{symbol}:{int(time.time())}"
         return self.store_by_data_type("5s_ticks", key, json.dumps(market_data))
 
@@ -894,7 +1633,18 @@ class RobustRedisClient:
         
         # Resolve token to symbol BEFORE storing
         # CRITICAL: This will return None if resolution fails (prevents UNKNOWN keys)
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
+        # ✅ Delegate to cumulative_tracker if available, otherwise use simple fallback
+        if hasattr(self, 'cumulative_tracker') and self.cumulative_tracker:
+            symbol = self.cumulative_tracker._resolve_token_to_symbol_for_storage(symbol)
+        else:
+            # Simple fallback: if symbol already contains ':', it's already resolved
+            symbol_str = str(symbol) if symbol else ""
+            if not symbol_str or symbol_str.startswith("UNKNOWN_"):
+                symbol = None
+            elif ":" not in symbol_str and (symbol_str.isdigit() or symbol_str.startswith("TOKEN_")):
+                # Looks like a token, but no resolver available - skip storage
+                logger.warning(f"⚠️ Cannot resolve token {symbol_str} - no cumulative_tracker available")
+                symbol = None
         
         # If resolution failed, skip storage to prevent UNKNOWN keys in Redis
         if not symbol or symbol.startswith("UNKNOWN_"):
@@ -988,7 +1738,7 @@ class RobustRedisClient:
                     last_price=last_price,
                 )
             except Exception as bucket_err:
-                logger.debug(
+                logger.warning(
                     "Failed to update bucket_incremental_volume buckets from store_ticks_optimized for %s: %s",
                     symbol,
                     bucket_err,
@@ -1002,7 +1752,13 @@ class RobustRedisClient:
     def store_cumulative_volume(self, symbol, bucket_incremental_volume):
         """Store cumulative bucket_incremental_volume in DB 2 (analytics) via store_by_data_type routing"""
         # Resolve token to symbol BEFORE storing
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
+        # ✅ Delegate to cumulative_tracker if available
+        if hasattr(self, 'cumulative_tracker') and self.cumulative_tracker:
+            symbol = self.cumulative_tracker._resolve_token_to_symbol_for_storage(symbol)
+        else:
+            symbol_str = str(symbol) if symbol else ""
+            if not symbol_str or symbol_str.startswith("UNKNOWN_") or (symbol_str.isdigit() and ":" not in symbol_str):
+                symbol = None
         key = f"cumulative:{symbol}"
         return self.store_by_data_type("daily_cumulative", key, json.dumps(bucket_incremental_volume))
 
@@ -1024,33 +1780,175 @@ class RobustRedisClient:
     # ============ Redis Streams Methods ============
 
     def publish_tick_stream(self, symbol, tick_data):
-        """Publish tick data to Redis Stream"""
-        stream_name = f"ticks:{symbol}"
+        """
+        Publish tick data to Redis Stream.
+        
+        Storage Location:
+        - Database: DB 1 (realtime) - via publish_to_stream() -> get_database_for_data_type("stream_data")
+        - Stream Key: "ticks:{symbol}" (e.g., "ticks:NSE:RELIANCE")
+        - Max Length: 50000 entries (auto-trimmed)
+        
+        Data Format/Signature:
+        - Input: tick_data (dict, list, str, or other serializable type)
+        - Stored Format: Redis Stream entry with fields:
+          {
+            "data": <JSON string of tick_data>,
+            "timestamp": <current timestamp in milliseconds>
+          }
+        - See publish_to_stream() for full data format details
+        
+        Args:
+            symbol: Trading symbol (e.g., "NSE:RELIANCE")
+            tick_data: Tick data dictionary or serializable object
+            
+        Returns:
+            Stream entry ID (string) on success, False on failure
+        """
+        # ✅ SOURCE OF TRUTH: Canonicalize symbol and use key builder
+        canonical_symbol = RedisKeyStandards.canonical_symbol(symbol)
+        key_builder = get_key_builder()
+        stream_name = key_builder.live_ticks_stream(canonical_symbol)
         
         return self.publish_to_stream(stream_name, tick_data, maxlen=50000)
 
     def publish_alert_stream(self, alert_data):
-        """Publish alert data to Redis Stream"""
+        """
+        Publish alert data to Redis Stream.
+        
+        Storage Location:
+        - Database: DB 1 (realtime) - via publish_to_stream() -> get_database_for_data_type("stream_data")
+        - Stream Key: "alerts:system"
+        - Max Length: 10000 entries (auto-trimmed)
+        
+        Data Format/Signature:
+        - Input: alert_data (dict, list, str, or other serializable type)
+        - Stored Format: Redis Stream entry with fields:
+          {
+            "data": <JSON string of alert_data>,
+            "timestamp": <current timestamp in milliseconds>
+          }
+        - See publish_to_stream() for full data format details
+        
+        Args:
+            alert_data: Alert data dictionary or serializable object
+            
+        Returns:
+            Stream entry ID (string) on success, False on failure
+        """
         stream_name = "alerts:system"
         return self.publish_to_stream(stream_name, alert_data, maxlen=10000)
 
     def publish_pattern_stream(self, symbol, pattern_data):
-        """Publish pattern detection data to Redis Stream"""
+        """
+        Publish pattern detection data to Redis Stream.
+        
+        Storage Location:
+        - Database: DB 1 (realtime) - via publish_to_stream() -> get_database_for_data_type("stream_data")
+        - Stream Key: "patterns:{symbol}" (e.g., "patterns:NSE:RELIANCE")
+        - Max Length: 5000 entries (auto-trimmed)
+        
+        Data Format/Signature:
+        - Input: pattern_data (dict, list, str, or other serializable type)
+        - Stored Format: Redis Stream entry with fields:
+          {
+            "data": <JSON string of pattern_data>,
+            "timestamp": <current timestamp in milliseconds>
+          }
+        - See publish_to_stream() for full data format details
+        
+        Args:
+            symbol: Trading symbol (e.g., "NSE:RELIANCE")
+            pattern_data: Pattern detection data dictionary or serializable object
+            
+        Returns:
+            Stream entry ID (string) on success, False on failure
+        """
         stream_name = f"patterns:{symbol}"
         return self.publish_to_stream(stream_name, pattern_data, maxlen=5000)
 
     def read_tick_stream(self, symbol, count=100, start_id="0"):
-        """Read from tick stream"""
-        stream_name = f"ticks:{symbol}"
+        """
+        Read from tick stream.
+        
+        Storage Location:
+        - Database: DB 1 (realtime) - via read_from_stream() -> get_database_for_data_type("stream_data")
+        - Stream Key: "ticks:{symbol}" (e.g., "ticks:NSE:RELIANCE")
+        
+        Data Format/Signature:
+        - Returns: List of tuples (message_id, fields_dict)
+        - Fields format (from publish_tick_stream()):
+          {
+            "data": "<JSON string of tick_data>",
+            "timestamp": "<timestamp in milliseconds>"
+          }
+        - See read_from_stream() for full return format details
+        
+        Args:
+            symbol: Trading symbol (e.g., "NSE:RELIANCE")
+            count: Maximum number of messages to read (default: 100)
+            start_id: Starting message ID (default: "0" for beginning)
+            
+        Returns:
+            List of (message_id, fields_dict) tuples, or empty list on error
+        """
+        # ✅ SOURCE OF TRUTH: Canonicalize symbol and use key builder
+        canonical_symbol = RedisKeyStandards.canonical_symbol(symbol)
+        key_builder = get_key_builder()
+        stream_name = key_builder.live_ticks_stream(canonical_symbol)
         return self.read_from_stream(stream_name, count, start_id)
 
     def read_alert_stream(self, count=100, start_id="0"):
-        """Read from alert stream"""
+        """
+        Read from alert stream.
+        
+        Storage Location:
+        - Database: DB 1 (realtime) - via read_from_stream() -> get_database_for_data_type("stream_data")
+        - Stream Key: "alerts:system"
+        
+        Data Format/Signature:
+        - Returns: List of tuples (message_id, fields_dict)
+        - Fields format (from publish_alert_stream()):
+          {
+            "data": "<JSON string of alert_data>",
+            "timestamp": "<timestamp in milliseconds>"
+          }
+        - See read_from_stream() for full return format details
+        
+        Args:
+            count: Maximum number of messages to read (default: 100)
+            start_id: Starting message ID (default: "0" for beginning)
+            
+        Returns:
+            List of (message_id, fields_dict) tuples, or empty list on error
+        """
         stream_name = "alerts:system"
         return self.read_from_stream(stream_name, count, start_id)
 
     def read_pattern_stream(self, symbol, count=100, start_id="0"):
-        """Read from pattern stream"""
+        """
+        Read from pattern stream.
+        
+        Storage Location:
+        - Database: DB 1 (realtime) - via read_from_stream() -> get_database_for_data_type("stream_data")
+        - Stream Key: "patterns:{symbol}" (e.g., "patterns:NSE:RELIANCE")
+        
+        Data Format/Signature:
+        - Returns: List of tuples (message_id, fields_dict)
+        - Fields format (from publish_pattern_stream()):
+          {
+            "data": "<JSON string of pattern_data>",
+            "timestamp": "<timestamp in milliseconds>"
+          }
+        - See read_from_stream() for full return format details
+        
+        Args:
+            symbol: Trading symbol (e.g., "NSE:RELIANCE")
+            count: Maximum number of messages to read (default: 100)
+            start_id: Starting message ID (default: "0" for beginning)
+            
+        Returns:
+            List of (message_id, fields_dict) tuples, or empty list on error
+        """
         stream_name = f"patterns:{symbol}"
         return self.read_from_stream(stream_name, count, start_id)
 
@@ -1141,132 +2039,7 @@ class RobustRedisClient:
 
         return symbol
 
-    def get_rolling_window_buckets(self, symbol: str, lookback_minutes: int = 60, session_date: str = None, max_days_back: int = None) -> List[Dict[str, Any]]:
-        """
-        Get rolling window bucket data from history lists for volume profile calculations
-        
-        This method retrieves data from history lists which contain the rolling window data
-        that the volume profile library needs for proper volume threshold calculations.
-        
-        Args:
-            symbol: Trading symbol
-            lookback_minutes: Lookback window in minutes (used to calculate reasonable max_days_back if not provided)
-            session_date: Optional date string (YYYY-MM-DD) to filter by specific date
-            max_days_back: Maximum days to look back if session_date is None. 
-                          If None, calculates based on history list TTL (7 days) and lookback_minutes.
-                          Defaults to: max(7, ceil(lookback_minutes / 1440) + 1) to ensure enough data
-        
-        Returns:
-            List of bucket dictionaries filtered by date
-        """
-        try:
-            # Ensure symbol is a string (may be int like instrument_token)
-            if not isinstance(symbol, str):
-                symbol = str(symbol)
-            # Extract base symbol for F&O contracts
-            base_symbol = self._extract_base_symbol(symbol)
-            
-            # Calculate date range for filtering
-            from datetime import datetime, timedelta
-            import math
-            
-            # Calculate max_days_back if not provided
-            # History lists have TTL of 7 days, so we can safely look back that far
-            # For rolling windows, we need at least enough days to cover the lookback window
-            # Add buffer for weekend/non-trading days
-            if max_days_back is None:
-                # History list TTL is 7 days (7 * 86400 seconds from update_volume_buckets)
-                # Calculate based on lookback_minutes: need at least lookback_minutes / minutes_per_day days
-                # Trading day = ~375 minutes (9:15 AM to 3:30 PM), but account for gaps
-                minutes_per_day = 1440  # Full day in minutes
-                days_needed = math.ceil(lookback_minutes / minutes_per_day) if lookback_minutes > 0 else 1
-                # Use history list TTL (7 days) as upper bound, but ensure we have enough for lookback
-                max_days_back = max(7, days_needed + 1)  # +1 for buffer
-                logger.debug(f"Calculated max_days_back={max_days_back} based on lookback_minutes={lookback_minutes} and history TTL=7 days")
-            
-            if session_date:
-                # Filter by specific date
-                try:
-                    target_date = datetime.strptime(session_date, '%Y-%m-%d').date()
-                    date_min = target_date
-                    date_max = target_date
-                except ValueError:
-                    logger.warning(f"Invalid session_date format: {session_date}, using max_days_back={max_days_back}")
-                    date_max = datetime.now().date()
-                    date_min = date_max - timedelta(days=max_days_back)
-            else:
-                # Use max_days_back to limit how far we look
-                date_max = datetime.now().date()
-                date_min = date_max - timedelta(days=max_days_back)
-            
-            # ✅ SINGLE SOURCE OF TRUTH: Check history lists first (rolling window data)
-            # History lists contain the data that volume profile library needs for rolling windows
-            history_keys = [
-                f"bucket_incremental_volume:history:5min:5min:{symbol}",
-                f"bucket_incremental_volume:history:5min:5min:{base_symbol}",
-                f"bucket_incremental_volume:history:10min:10min:{symbol}",
-                f"bucket_incremental_volume:history:10min:10min:{base_symbol}",
-                f"bucket_incremental_volume:history:2min:2min:{symbol}",
-                f"bucket_incremental_volume:history:2min:2min:{base_symbol}",
-                f"bucket_incremental_volume:history:1min:1min:{symbol}",
-                f"bucket_incremental_volume:history:1min:1min:{base_symbol}",
-            ]
-            
-            # Check history lists first (these contain rolling window data)
-            for history_key in history_keys:
-                if self.redis_client.exists(history_key):
-                    history_length = self.redis_client.llen(history_key)
-                    if history_length > 0:
-                        logger.info(f"🔍 [ROLLING_WINDOW_DEBUG] {symbol} -> Found history list: {history_key} with {history_length} buckets")
-                        # Get more buckets for rolling window analysis (up to 500 to ensure we cover enough dates)
-                        recent_buckets = self.redis_client.lrange(history_key, -min(500, history_length), -1)
-                        buckets = []
-                        for bucket_data in recent_buckets:
-                            try:
-                                bucket = json.loads(bucket_data)
-                                
-                                # Filter by date using timestamp field
-                                if 'timestamp' in bucket:
-                                    try:
-                                        # Parse ISO timestamp from history entry
-                                        bucket_time = bucket['timestamp']
-                                        if isinstance(bucket_time, str):
-                                            # Handle ISO format timestamps
-                                            if 'T' in bucket_time:
-                                                bucket_dt = datetime.fromisoformat(bucket_time.replace('Z', '+00:00'))
-                                            else:
-                                                # Try parsing as date string
-                                                bucket_dt = datetime.strptime(bucket_time.split()[0], '%Y-%m-%d')
-                                        else:
-                                            # Numeric timestamp
-                                            bucket_dt = datetime.fromtimestamp(float(bucket_time))
-                                        
-                                        bucket_date = bucket_dt.date()
-                                        
-                                        # Only include if within date range
-                                        if date_min <= bucket_date <= date_max:
-                                            buckets.append(bucket)
-                                    except (ValueError, TypeError) as e:
-                                        # If timestamp parsing fails, include the bucket anyway (don't lose data)
-                                        logger.debug(f"Could not parse timestamp in bucket: {e}")
-                                        buckets.append(bucket)
-                                else:
-                                    # No timestamp field, include anyway (legacy data)
-                                    buckets.append(bucket)
-                            except Exception as e:
-                                logger.debug(f"Error parsing bucket from history list: {e}")
-                                continue
-                        
-                        if buckets:
-                            logger.info(f"🔍 [ROLLING_WINDOW_DEBUG] {symbol} -> Retrieved {len(buckets)} buckets from history list (filtered by date range {date_min} to {date_max})")
-                            return buckets
-            
-            logger.info(f"🔍 [ROLLING_WINDOW_DEBUG] {symbol} -> No history lists found, falling back to individual buckets")
-            return []
-            
-        except Exception as e:
-            logger.error(f"Error getting rolling window buckets for {symbol}: {e}")
-            return []
+    # ✅ REMOVED: get_rolling_window_buckets - session and bucket window logic removed
 
     def get_time_buckets_enhanced(self, symbol: str, lookback_minutes: int = 60) -> List[Dict[str, Any]]:
         """
@@ -1274,21 +2047,18 @@ class RobustRedisClient:
         """
         try:
             # Bucket data is in DB 0 (system), not DB 5
-            logger.debug(f"Switching to DB 0 for bucket retrieval")
             self.redis_client.select(0)
             
             # ✅ FIXED: get_time_buckets is in CumulativeDataTracker, not RobustRedisClient
             buckets = self.cumulative_tracker.get_time_buckets(symbol, lookback_minutes=lookback_minutes)
-            logger.debug(f"Found {len(buckets)} buckets from get_time_buckets")
             
             # ✅ SINGLE SOURCE OF TRUTH: Accept any available bucket data
             # Don't require specific number of buckets - use whatever real data is available
             # This prevents "NO_BUCKET_DATA" when sparse but valid data exists
             required_buckets = 1  # Accept any bucket data
-            logger.debug(f"Required buckets: {required_buckets}, Found: {len(buckets)}")
             
             if len(buckets) >= required_buckets:
-                logger.debug(
+                logger.info(
                     f"✅ [BUCKET_DATA] {symbol} - Using {len(buckets)} real-time buckets"
                 )
                 return buckets
@@ -1302,7 +2072,7 @@ class RobustRedisClient:
                 )
                 return ohlc_buckets
 
-            logger.debug(
+            logger.info(
                 f"ℹ️ [NO_BUCKET_DATA] {symbol} - No real bucket data available, using 4 consolidated bucket system"
             )
             # ✅ SINGLE SOURCE OF TRUTH: Do NOT generate synthetic data
@@ -1364,14 +2134,17 @@ class RobustRedisClient:
 
         symbol_key = normalize_ohlc_symbol(symbol)
         if interval == "1h":
-            zset_key = ohlc_hourly_zset(symbol_key)
+            # ✅ FIXED: Use canonical key builder for OHLC hourly (DB1)
+            builder = get_key_builder()
+            zset_key = builder.live_ohlc_timeseries(symbol_key, "1h")
         else:
-            zset_key = ohlc_daily_zset(symbol_key)
+            # ✅ FIXED: Use canonical key builder for OHLC daily (DB1)
+            builder = get_key_builder()
+            zset_key = builder.live_ohlc_daily(symbol_key)
 
         try:
             entries = client.zrevrange(zset_key, 0, max(limit - 1, 0), withscores=True)
         except Exception as exc:
-            logger.debug(f"Failed to load OHLC series {symbol}:{interval}: {exc}")
             return []
 
         series: List[Dict[str, Any]] = []
@@ -1479,7 +2252,7 @@ class RobustRedisClient:
 
         simple_buckets = self._convert_ohlc_to_buckets(symbol, ohlc_series, lookback_minutes)
         if simple_buckets:
-            logger.debug(
+            logger.info(
                 f"✅ [OHLC_SIMPLE] {symbol} - Generated {len(simple_buckets)} simple buckets from 30-day data"
             )
             return simple_buckets
@@ -1537,7 +2310,10 @@ class RobustRedisClient:
         if not client:
             return []
 
-        tick_key = f"ticks:{symbol}"
+        # ✅ SOURCE OF TRUTH: Canonicalize symbol and use key builder
+        canonical_symbol = RedisKeyStandards.canonical_symbol(symbol)
+        key_builder = get_key_builder()
+        tick_key = key_builder.live_ticks_hash(canonical_symbol)
         try:
             recent_ticks = client.lrange(tick_key, -2000, -1)
         except Exception as e:
@@ -1643,7 +2419,10 @@ class RobustRedisClient:
         """
         # ✅ PRIMARY: Check ticks stream (most reliable source for real-time prices)
         try:
-            stream_key = f"ticks:{symbol}"
+            # ✅ SOURCE OF TRUTH: Canonicalize symbol and use key builder
+            canonical_symbol = RedisKeyStandards.canonical_symbol(symbol)
+            key_builder = get_key_builder()
+            stream_key = key_builder.live_ticks_stream(canonical_symbol)
             # Try to get last message from stream (most recent tick)
             messages = self.redis_client.xrevrange(stream_key, count=1)
             if messages:
@@ -1720,7 +2499,6 @@ class RobustRedisClient:
         try:
             return self._get_last_price(symbol)
         except Exception as e:
-            logger.debug(f"Failed to fetch last last_price for {symbol}: {e}")
             return None
 
     def _get_buckets_by_pattern(self, symbol, pattern, start_time, bucket_size):
@@ -1740,7 +2518,6 @@ class RobustRedisClient:
                     if bucket_data:
                         buckets.append(bucket_data)
                 except Exception as e:
-                    logger.debug(f"Failed to extract data from key {key}: {e}")
                     continue
             
             return buckets
@@ -1773,7 +2550,6 @@ class RobustRedisClient:
             return None
             
         except Exception as e:
-            logger.debug(f"Failed to extract from {key}: {e}")
             return None
 
     def _parse_hash_bucket(self, key, bucket_data, start_time):
@@ -1798,7 +2574,6 @@ class RobustRedisClient:
             return standardized_data
             
         except Exception as e:
-            logger.debug(f"Failed to parse hash bucket {key}: {e}")
             return None
 
     def _extract_timestamp_from_key(self, key):
@@ -1860,7 +2635,6 @@ class RobustRedisClient:
             return None
             
         except Exception as e:
-            self.logger.debug(f"Timestamp extraction failed for {key}: {e}")
             return None
 
     def _standardize_bucket_data(self, raw_data, timestamp):
@@ -1914,7 +2688,6 @@ class RobustRedisClient:
                 return self._standardize_bucket_data(data, timestamp)
             return None
         except Exception as e:
-            self.logger.debug(f"Failed to parse string bucket {key}: {e}")
             return None
 
     def _parse_zset_bucket(self, key, zset_data, start_time):
@@ -1926,7 +2699,6 @@ class RobustRedisClient:
                 return self._standardize_bucket_data(data, float(timestamp))
             return None
         except Exception as e:
-            logger.debug(f"Failed to parse zset bucket {key}: {e}")
             return None
 
     def get_ohlc_buckets(self, symbol, count=10, session_date=None):
@@ -1988,7 +2760,6 @@ class RobustRedisClient:
                     continue
             return None
         except Exception as e:
-            logger.debug(f"get_index failed for {index_name}: {e}")
             return None
 
     def cleanup_old_sessions(self, days_to_keep=7):
@@ -2057,19 +2828,80 @@ class RobustRedisClient:
         try:
             self._ensure_connection()
             if self.redis_client:
+                # Transform key to new unified structure
+                name = self._transform_key(name)
                 return self.redis_client.hget(name, key)
         except Exception as e:
-            logger.debug(f"hget failed for {name}:{key}: {e}")
+            pass
         return None
 
-    def hset(self, name, key, value):
+    def hset(self, name, key=None, value=None, mapping=None, items=None):
+        """
+        Set key to value within hash name.
+        
+        Matches redis-py 7.0.1 signature:
+        hset(name: str, key: Optional[str] = None, value: Optional[str] = None, 
+             mapping: Optional[dict] = None, items: Optional[list] = None)
+        
+        Args:
+            name: Hash name
+            key: Field name (optional if using mapping or items)
+            value: Field value (optional if using mapping or items)
+            mapping: Dict of key/value pairs for batch update (Redis 8.2 optimization)
+            items: List of key/value pairs (alternative to mapping)
+        
+        Returns:
+            Number of fields added, or 0 on failure
+        """
         try:
             self._ensure_connection()
             if self.redis_client:
-                return self.redis_client.hset(name, key, value)
+                # Transform key to new unified structure
+                name = self._transform_key(name)
+                # Support all parameter combinations matching redis-py 7.0.1
+                if mapping is not None:
+                    return self.redis_client.hset(name, mapping=mapping)
+                elif items is not None:
+                    return self.redis_client.hset(name, items=items)
+                elif key is not None and value is not None:
+                    return self.redis_client.hset(name, key, value)
+                else:
+                    # Invalid call - need at least key+value, mapping, or items
+                    logger.warning(f"hset called with invalid parameters: name={name}, key={key}, value={value}, mapping={mapping}, items={items}")
+                    return 0
         except Exception as e:
-            logger.debug(f"hset failed for {name}:{key}: {e}")
-        return 0
+            logger.error(f"hset failed for {name}: {e}")
+            return 0
+
+    # ============ Volume & Indicator Methods (from redis_gateway) ============
+    
+    def store_volume_state(self, token: str, data: dict):
+        """Store volume state - new structure: vol:state:{token}"""
+        _redis_store_volume_state(self, token, data)
+    
+    def get_volume_state(self, token: str) -> dict:
+        """Get volume state from new structure"""
+        return _redis_get_volume_state(self, token)
+    
+    def store_volume_baseline(self, symbol: str, data: dict, ttl: int = 86400):
+        """Store volume baseline - new structure: vol:baseline:{symbol}"""
+        _redis_store_volume_baseline(self, symbol, data, ttl)
+    
+    def store_volume_profile(self, symbol: str, period: str, data: dict, ttl: int = 57600):
+        """Store volume profile - new structure: vol:profile:{symbol}:{period}"""
+        _redis_store_volume_profile(self, symbol, period, data, ttl)
+    
+    def store_straddle_volume(self, underlying: str, date: str, data: dict, ttl: int = 57600):
+        """Store straddle volume - new structure: vol:straddle:{underlying}:{date}"""
+        _redis_store_straddle_volume(self, underlying, date, data, ttl)
+    
+    def store_indicator(self, symbol: str, indicator: str, value, ttl: int = 3600):
+        """Store indicator - new structure: ind:{category}:{symbol}:{indicator}"""
+        _redis_store_indicator(self, symbol, indicator, value, ttl)
+    
+    def get_indicator(self, symbol: str, indicator: str) -> Optional[str]:
+        """Get indicator from new structure"""
+        return _redis_get_indicator(self, symbol, indicator)
 
     def get_session_order_book_evolution(self, symbol, session_date=None):
         """Get complete order book evolution for a trading session"""
@@ -2104,7 +2936,10 @@ class RobustRedisClient:
             logger.info("✅ Redis clients already connected")
             return True
         else:
-            logger.warning("⚠️ Redis clients not properly initialized")
+            # ✅ FIX: Only warn if clients are actually None, not just not connected yet
+            # _initialize_clients() sets is_connected after successful initialization
+            if not self.redis_client and not any(self.clients.values()):
+                logger.warning("⚠️ Redis clients not properly initialized")
             return False
 
     def _ensure_connection(self):
@@ -2203,6 +3038,9 @@ class RobustRedisClient:
 
     def get(self, key):
         """Get value with fallback and circuit breaker protection"""
+        # Transform key to new unified structure
+        key = self._transform_key(key)
+        
         if self.circuit_breaker_enabled and self.circuit_breaker:
             if not self.circuit_breaker.should_allow_request():
                 logger.warning(f"Circuit breaker open for Redis GET operation: {key}")
@@ -2219,7 +3057,6 @@ class RobustRedisClient:
                     self.circuit_breaker.record_success()
                 return result
             except Exception as e:
-                logger.debug(f"Redis get failed: {e}")
                 self.is_connected = False
                 # Record failure for circuit breaker
                 if self.circuit_breaker_enabled and self.circuit_breaker:
@@ -2234,6 +3071,9 @@ class RobustRedisClient:
 
     def set(self, key, value, ex=None):
         """Set value with fallback and circuit breaker protection"""
+        # Transform key to new unified structure
+        key = self._transform_key(key)
+        
         if self.circuit_breaker_enabled and self.circuit_breaker:
             if not self.circuit_breaker.should_allow_request():
                 logger.warning(f"Circuit breaker open for Redis SET operation: {key}")
@@ -2250,7 +3090,6 @@ class RobustRedisClient:
                 if self.circuit_breaker_enabled and self.circuit_breaker:
                     self.circuit_breaker.record_success()
             except Exception as e:
-                logger.debug(f"Redis set failed: {e}")
                 self.is_connected = False
                 # Record failure for circuit breaker
                 if self.circuit_breaker_enabled and self.circuit_breaker:
@@ -2287,7 +3126,6 @@ class RobustRedisClient:
                     num=num,
                 )
         except Exception as e:
-            logger.debug(f"Redis zrevrangebyscore failed: {e}")
             self.is_connected = False
         # No sensible fallback for sorted sets; return empty
         return []
@@ -2299,7 +3137,6 @@ class RobustRedisClient:
             if self.is_connected:
                 return self.redis_client.zadd(key, mapping)
         except Exception as e:
-            logger.debug(f"Redis zadd failed: {e}")
             self.is_connected = False
         return 0
 
@@ -2310,7 +3147,6 @@ class RobustRedisClient:
             if self.is_connected:
                 return self.redis_client.zcard(key)
         except Exception as e:
-            logger.debug(f"Redis zcard failed: {e}")
             self.is_connected = False
         return 0
 
@@ -2321,7 +3157,6 @@ class RobustRedisClient:
             if self.is_connected:
                 return self.redis_client.expire(key, time)
         except Exception as e:
-            logger.debug(f"Redis expire failed: {e}")
             self.is_connected = False
         return False
 
@@ -2345,7 +3180,6 @@ class RobustRedisClient:
                     self.circuit_breaker.record_success()
                 return result
             except Exception as e:
-                logger.debug(f"Redis publish failed: {e}")
                 self.is_connected = False
                 # Record failure for circuit breaker
                 if self.circuit_breaker_enabled and self.circuit_breaker:
@@ -2400,7 +3234,6 @@ class RobustRedisClient:
                 self.stats["successful_operations"] += 1
                 return result
             except Exception as e:
-                logger.debug(f"Redis keys failed: {e}")
                 self.is_connected = False
 
         # Fallback to local storage
@@ -2419,7 +3252,6 @@ class RobustRedisClient:
                 deleted = self.redis_client.delete(*keys)
                 self.stats["successful_operations"] += 1
             except Exception as e:
-                logger.debug(f"Redis delete failed: {e}")
                 self.is_connected = False
 
         # Also delete from fallback
@@ -2536,7 +3368,7 @@ class RobustRedisClient:
                 self.redis_client.delete(*keys)
             logger.info(f"Reset bucket_incremental_volume session tracking for {len(keys)} symbols")
         except Exception as e:
-            logger.debug(f"reset_volume_session error: {e}")
+            logger.warning(f"Error resetting volume session: {e}")
 
     def validate_volume_consistency(self, symbol: str):
         """Debug helper to check incremental vs cumulative consistency for a symbol."""
@@ -2608,7 +3440,6 @@ class RobustRedisClient:
             )
             return result
         except Exception as e:
-            logger.debug(f"validate_volume_consistency error: {e}")
             return None
 
     def pipeline(self):
@@ -2756,7 +3587,14 @@ class RobustRedisClient:
         
         # Resolve token to symbol BEFORE storing volume buckets
         # CRITICAL: This will return None if resolution fails (prevents UNKNOWN keys)
-        symbol = self._resolve_token_to_symbol_for_storage(symbol)
+        # ✅ Delegate to cumulative_tracker if available
+        if hasattr(self, 'cumulative_tracker') and self.cumulative_tracker:
+            symbol = self.cumulative_tracker._resolve_token_to_symbol_for_storage(symbol)
+        else:
+            # Simple fallback
+            symbol_str = str(symbol) if symbol else ""
+            if not symbol_str or symbol_str.startswith("UNKNOWN_") or (symbol_str.isdigit() and ":" not in symbol_str):
+                symbol = None
         
         # If resolution failed, skip storage to prevent UNKNOWN keys in Redis
         if not symbol or symbol.startswith("UNKNOWN_"):
@@ -2850,6 +3688,30 @@ class RobustRedisClient:
                     "history": "bucket_incremental_volume:history:10min",
                     "history_len": 3000,
                 },
+                "15min": {
+                    "size": 15,
+                    "prefix": "bucket_incremental_volume:bucket_incremental_volume:bucket15",
+                    "history": "bucket_incremental_volume:history:15min",
+                    "history_len": 2000,
+                },
+                "30min": {
+                    "size": 30,
+                    "prefix": "bucket_incremental_volume:bucket_incremental_volume:bucket30",
+                    "history": "bucket_incremental_volume:history:30min",
+                    "history_len": 1000,
+                },
+                "45min": {
+                    "size": 45,
+                    "prefix": "bucket_incremental_volume:bucket_incremental_volume:bucket45",
+                    "history": "bucket_incremental_volume:history:45min",
+                    "history_len": 800,
+                },
+                "60min": {
+                    "size": 60,
+                    "prefix": "bucket_incremental_volume:bucket_incremental_volume:bucket60",
+                    "history": "bucket_incremental_volume:history:60min",
+                    "history_len": 600,
+                },
             }
 
             pipe = self.redis_client.pipeline(transaction=False)
@@ -2896,7 +3758,6 @@ class RobustRedisClient:
             return True
 
         except Exception as exc:
-            logger.debug("Failed to update bucket_incremental_volume buckets for %s: %s", symbol, exc)
             return False
 
     def get_time_based_volume(self, symbol, target_time):
@@ -2952,7 +3813,7 @@ class RobustRedisClient:
                 return self.redis_client.info(section)
             return self.redis_client.info()
         except Exception as e:
-            self.logger.error(f"Failed to get Redis info: {e}")
+            logger.error(f"Failed to get Redis info: {e}")
             return {}
     
     def xinfo_stream(self, name):
@@ -2960,15 +3821,17 @@ class RobustRedisClient:
         try:
             return self.redis_client.xinfo_stream(name)
         except Exception as e:
-            self.logger.error(f"Failed to get stream info for {name}: {e}")
+            logger.error(f"Failed to get stream info for {name}: {e}")
             return {}
     
     def hgetall(self, name):
         """Get all fields and values from a hash"""
         try:
+            # Transform key to new unified structure
+            name = self._transform_key(name)
             return self.redis_client.hgetall(name)
         except Exception as e:
-            self.logger.error(f"Failed to get hash {name}: {e}")
+            logger.error(f"Failed to get hash {name}: {e}")
             return {}
 
 
@@ -3150,15 +4013,14 @@ class CumulativeDataTracker:
                                 except Exception as e:
                                     continue
                     except Exception as e:
-                        logger.debug(f"Error reading history for {resolution}: {e}")
                         # Fall through to pattern matching
+                        pass
             
             # ❌ REMOVED: Pattern matching fallback - FORBIDDEN per Redis key standards
             # ✅ STANDARDIZED: Return empty buckets instead of pattern matching
             # If history lists aren't found, buckets should be created by update_volume_buckets() 
             # with proper symbol resolution (no UNKNOWN keys)
             if not buckets:
-                logger.debug(f"🔍 [BUCKET_DEBUG] No history found for {symbol} (symbol may be new or no data stored yet)")
                 # Return empty list - pattern matching is FORBIDDEN
                 # Buckets will be created as new ticks arrive with proper symbol resolution
                 return []
@@ -3226,130 +4088,19 @@ class CumulativeDataTracker:
                     # ✅ Use InstrumentMapper - loads from token_lookup_enriched.json (expected 250K+ instruments)
                     # This is the same file used by metadata_resolver and covers all intraday_crawler tokens
                     # from crawlers/binary_crawler1/binary_crawler1.json (246 tokens)
-                    from crawlers.utils.instrument_mapper import InstrumentMapper
-                    instrument_mapper = InstrumentMapper()
+                    from crawlers.hot_token_mapper import get_hot_token_mapper
+                    instrument_mapper = get_hot_token_mapper()
                     resolved = instrument_mapper.token_to_symbol(token)
                     
                     # Only return if it's not still UNKNOWN
                     if resolved and not resolved.startswith("UNKNOWN_"):
                         return resolved
                 except (ValueError, ImportError) as e:
-                    logger.debug(f"Token resolution failed for {symbol_str}: {e}")
+                    pass
         except Exception as e:
-            logger.debug(f"Token resolution failed for {symbol}: {e}")
+            pass
 
         return None
-    
-    def _resolve_token_to_symbol_for_storage(self, symbol):
-        """Resolve token to symbol for Redis storage - returns resolved symbol or None if resolution fails
-        
-        CRITICAL: Never returns UNKNOWN_xxx format - will return None to prevent storing bad keys
-        """
-        try:
-            symbol_str = str(symbol) if symbol else ""
-            
-            # If already a proper symbol (contains :), return as-is
-            if ":" in symbol_str and not symbol_str.isdigit() and not symbol_str.startswith("UNKNOWN_"):
-                return symbol
-            
-            # Skip empty or pure UNKNOWN symbols
-            if not symbol_str or symbol_str == "UNKNOWN":
-                logger.debug(f"Skipping resolution for empty/UNKNOWN symbol: {symbol_str}")
-                return None  # Don't store with invalid keys
-            
-            if symbol_str.isdigit() or symbol_str.startswith("TOKEN_") or symbol_str.startswith("UNKNOWN_"):
-                try:
-                    # Extract token number
-                    if symbol_str.startswith("TOKEN_"):
-                        token_str = symbol_str.replace("TOKEN_", "")
-                    elif symbol_str.startswith("UNKNOWN_"):
-                        token_str = symbol_str.replace("UNKNOWN_", "")
-                    else:
-                        token_str = symbol_str
-                    
-                    token = int(token_str)
-                    
-                    # ✅ PRIMARY: Use InstrumentMapper - loads from token_lookup_enriched.json
-                    from crawlers.utils.instrument_mapper import InstrumentMapper
-                    instrument_mapper = InstrumentMapper()
-                    resolved = instrument_mapper.token_to_symbol(token)
-                    
-                    if resolved and not resolved.startswith("UNKNOWN_"):
-                        logger.info(f"✅ Redis storage: Resolved token {token} to {resolved}")
-                        # Cache successful resolution in Redis for future lookups (optional, non-critical)
-                        try:
-                            if self.redis_client and hasattr(self, 'get_client'):
-                                # Try to use DB 0 client for system cache (if available)
-                                try:
-                                    db0_client = self.get_client(0)
-                                    if db0_client:
-                                        token_key = f"token_to_symbol:{token}"
-                                        db0_client.setex(token_key, 86400 * 7, resolved)  # Cache for 7 days
-                                except:
-                                    # Fallback: try current client (may not be DB 0, that's okay)
-                                    token_key = f"token_to_symbol:{token}"
-                                    self.redis_client.setex(token_key, 86400 * 7, resolved)
-                        except Exception:
-                            pass  # Cache failure is non-critical
-                        return resolved
-                    
-                    # ✅ FALLBACK 1: Try Redis lookup for previously resolved tokens
-                    if self.redis_client:
-                        try:
-                            token_key = f"token_to_symbol:{token}"
-                            # Try DB 0 first (system cache)
-                            if hasattr(self, 'get_client'):
-                                try:
-                                    db0_client = self.get_client(0)
-                                    if db0_client:
-                                        cached_symbol = db0_client.get(token_key)
-                                        if cached_symbol and not cached_symbol.startswith("UNKNOWN_"):
-                                            logger.info(f"✅ Redis storage: Found cached symbol for token {token}: {cached_symbol}")
-                                            return cached_symbol
-                                except:
-                                    pass
-                            # Fallback to current client
-                            cached_symbol = self.redis_client.get(token_key)
-                            if cached_symbol and not cached_symbol.startswith("UNKNOWN_"):
-                                logger.info(f"✅ Redis storage: Found cached symbol for token {token}: {cached_symbol}")
-                                return cached_symbol
-                        except Exception as e:
-                            logger.debug(f"Redis cache lookup failed for token {token}: {e}")
-                    
-                    # ✅ FALLBACK 2: Try to get symbol from tick data in Redis streams
-                    if self.redis_client:
-                        try:
-                            # Check recent ticks for this token - might have symbol in tick data
-                            stream_key = f"ticks:*"
-                            # Try to find any tick with this token and extract symbol
-                            # This is a best-effort fallback
-                            logger.debug(f"⚠️ Redis storage: Token {token} not found in mapper, checking Redis streams...")
-                        except Exception:
-                            pass
-                    
-                    # All resolution methods failed
-                    logger.warning(f"⚠️ Redis storage: Could not resolve token {token} (got {resolved}), skipping storage to prevent UNKNOWN keys")
-                    return None  # Don't store with UNKNOWN keys
-                    
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"⚠️ Redis storage: Could not parse token from '{symbol_str}': {e}")
-                    return None
-                except Exception as e:
-                    logger.warning(f"⚠️ Redis storage: Token resolution failed for '{symbol_str}': {e}")
-                    return None
-            
-            # If it's not a token format and doesn't contain ':', it might be a valid symbol
-            # But if it starts with UNKNOWN, reject it
-            if symbol_str.startswith("UNKNOWN_"):
-                logger.warning(f"⚠️ Redis storage: Rejecting symbol '{symbol_str}' (UNKNOWN format), skipping storage")
-                return None
-            
-            # Return original symbol only if it looks valid
-            return symbol if symbol_str and not symbol_str.startswith("UNKNOWN_") else None
-            
-        except Exception as e:
-            logger.error(f"Error in _resolve_token_to_symbol_for_storage: {e}")
-            return None  # Don't store on error
 
     def _create_symbol_session(self):
         """Create session data structure for each symbol"""
@@ -3371,29 +4122,9 @@ class CumulativeDataTracker:
         resolved_symbol = self._resolve_token_to_symbol(symbol_str)
         return resolved_symbol or symbol_str
 
-    def _get_session_data(self, symbol):
-        if symbol not in self.session_data:
-            self.session_data[symbol] = self._create_symbol_session()
-        return self.session_data[symbol]
+    # ✅ REMOVED: _get_session_data - session logic removed
 
-    def _persist_session_data(self, symbol, session):
-        try:
-            session_key = f"session:{symbol}:{self.current_session}"
-            self.redis.setex(
-                session_key, 86400, json.dumps(session, cls=SafeJSONEncoder)
-            )
-            try:
-                if (
-                    session["update_count"] in (1, 1000, 10000)
-                    or session["update_count"] % 50000 == 0
-                ):
-                    print(
-                        f"🗄️ SESSION[{symbol}] updates={session['update_count']} cum_vol={int(session['bucket_cumulative_volume'])}"
-                    )
-            except Exception:
-                pass
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error(f"Failed to persist session data for {symbol}: {exc}")
+    # ✅ REMOVED: _persist_session_data - session logic removed
 
     def update_symbol_data(
         self, symbol, last_price, bucket_incremental_volume, timestamp=None, depth_data=None, bucket_cumulative_volume=None
@@ -3419,30 +4150,9 @@ class CumulativeDataTracker:
             symbol, bucket_incremental_volume, bucket_cumulative_volume
         )
 
+        # ✅ REMOVED: Session logic - session data management removed
+        # Store last_price and bucket_incremental_volume in local history only
         with self.lock:
-            session = self._get_session_data(symbol)
-
-            # Update session metrics
-            if session["first_price"] is None:
-                session["first_price"] = last_price
-                session["first_update"] = timestamp
-
-            session["last_price"] = last_price
-            session["last_update"] = timestamp
-            session["high"] = max(session["high"], last_price)
-            session["low"] = min(session["low"], last_price)
-            session["update_count"] += 1
-
-            # Store raw bucket_incremental_volume as-is (no cumulative calculations)
-            # Update cumulative volume fields ONLY if cumulative is provided
-            if bucket_cumulative_volume is not None:
-                session["bucket_cumulative_volume"] = bucket_cumulative_volume
-                session["zerodha_cumulative_volume"] = bucket_cumulative_volume
-                logger.debug(f"Updated cumulative volume for {symbol}: {bucket_cumulative_volume}")
-            # If cumulative not provided, leave existing cumulative values unchanged
-            # This maintains backward compatibility and prevents data corruption
-
-            # Store last_price and bucket_incremental_volume in local history (for immediate analysis)
             self.price_history[symbol].append((timestamp, last_price))
             self.volume_history[symbol].append((timestamp, bucket_incremental_volume))
 
@@ -3452,126 +4162,20 @@ class CumulativeDataTracker:
             if len(self.volume_history[symbol]) > 1000:
                 self.volume_history[symbol] = self.volume_history[symbol][-500:]
 
-            # Update Redis with session data
-            try:
-                self._persist_session_data(symbol, session)
-                self._store_time_bucket(symbol, last_price, bucket_incremental_volume, timestamp, depth_data)
-                return True
-            except Exception as e:
-                logger.error(f"Failed to update bucket_incremental_volume data for {symbol}: {e}")
-                return False
+            # ✅ REMOVED: Session persistence and time bucket storage
+            return True
 
     def _store_time_bucket(self, symbol, last_price, bucket_incremental_volume, timestamp, depth_data=None):
         """Store data in time buckets for pattern analysis with order book data"""
-        # Only store trade ticks (bucket_incremental_volume > 0) in buckets
-        if bucket_incremental_volume <= 0:
-            return
-
-        # Handle different timestamp formats
-        try:
-            if isinstance(timestamp, str):
-                # Parse string timestamp
-                dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            elif isinstance(timestamp, (int, float)):
-                # Handle numeric timestamp
-                dt = datetime.fromtimestamp(timestamp)
-            else:
-                # Fallback to current time
-                dt = datetime.now()
-        except (ValueError, TypeError, OSError) as e:
-            logger.error(f"Failed to parse timestamp {timestamp} for {symbol}: {e}")
-            dt = datetime.now()
-        bucket_minute = dt.minute // 5 * 5
-        hour_bucket = (
-            f"bucket_incremental_volume:bucket:{symbol}:{self.current_session}:{dt.hour}:{bucket_minute}"
-        )
-
-        session = self.session_data[symbol]
-        bucket_key = f"{dt.hour}:{bucket_minute}"
-
-        # Get or initialize bucket data
-        if bucket_key not in session["time_buckets"]:
-            session["time_buckets"][bucket_key] = {
-                "symbol": symbol,
-                "session_date": self.current_session,
-                "hour": dt.hour,
-                "minute_bucket": bucket_minute,
-                "open": last_price,
-                "high": last_price,
-                "low": last_price,
-                "close": last_price,
-                "bucket_incremental_volume": 0,
-                "count": 0,
-                "first_timestamp": timestamp,
-                "last_timestamp": timestamp,
-                "order_book_snapshots": [],  # Store order book evolution
-                # Accumulated (day) bucket_incremental_volume semantics per Kite: store session cumulative at bucket open/close
-                "cumulative_open": session.get("bucket_cumulative_volume", 0),
-                "cumulative_close": session.get("bucket_cumulative_volume", 0),
-            }
-
-        bucket = session["time_buckets"][bucket_key]
-        bucket["close"] = last_price
-        bucket["high"] = max(bucket["high"], last_price)
-        bucket["low"] = min(bucket["low"], last_price)
-        bucket["bucket_incremental_volume"] += bucket_incremental_volume  # Accumulate trade bucket_incremental_volume in bucket
-        bucket["count"] += 1
-        bucket["last_timestamp"] = timestamp
-        # Update cumulative close to current session cumulative bucket_incremental_volume
-        bucket["cumulative_close"] = session.get("bucket_cumulative_volume", bucket.get("cumulative_close", 0))
-        # Calculate incremental bucket_incremental_volume for this bucket (optimized field)
-        try:
-            # REMOVED: Incremental volume calculation - now handled in WebSocket Parser only
-            # Use the incremental volume already calculated by WebSocket Parser
-            bucket["bucket_incremental_volume"] = bucket.get("bucket_incremental_volume", 0)
-        except Exception:
-            pass
-
-        # Store order book snapshot if provided
-        if depth_data:
-            bucket["order_book_snapshots"].append(
-                {
-                    "timestamp": timestamp,
-                    "depth": depth_data,
-                    "last_price": last_price,
-                    "bucket_incremental_volume": bucket_incremental_volume,
-                }
-            )
-            # Keep only last 10 snapshots per bucket to manage memory
-            if len(bucket["order_book_snapshots"]) > 10:
-                bucket["order_book_snapshots"] = bucket["order_book_snapshots"][-10:]
-
-        # Store bucket in Redis with safe expiration time
-        try:
-            # Calculate safe expiration time (until end of day)
-            current_time = datetime.now()
-            end_of_day = datetime(current_time.year, current_time.month, current_time.day, 23, 59, 59)
-            expire_seconds = max(
-                3600, int((end_of_day - current_time).total_seconds())
-            )  # At least 1 hour
-
-            self.redis.setex(
-                hour_bucket, expire_seconds, json.dumps(bucket, cls=SafeJSONEncoder)
-            )
-
-            # Debug log with reduced frequency
-            if bucket["count"] in (1, 100, 1000) or bucket["count"] % 10000 == 0:
-                print(
-                    f"🧰 BUCKET[{symbol} {bucket_key}] count={bucket['count']} vol={int(bucket['bucket_incremental_volume'])}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to store time bucket for {symbol}: {e}")
+        # ✅ REMOVED: Session and bucket window logic - method disabled
+        return
 
     def get_cumulative_data(self, symbol, session_date=None):
         """Get cumulative data for a symbol with in-memory fallback and field validation"""
         if session_date is None:
             session_date = self.current_session
 
-        # Prefer in-memory data for the current session to avoid stale reads
-        if session_date == self.current_session and symbol in self.session_data:
-            # Return a shallow copy to prevent external mutation
-            data = self.session_data[symbol].copy()
-            return self._validate_and_normalize_session_data(symbol, data)
+        # ✅ REMOVED: Session logic - in-memory session data removed
 
         # Otherwise, fetch from Redis
         try:
@@ -3603,42 +4207,7 @@ class CumulativeDataTracker:
             logger.error(f"Failed to store time bucket for {symbol}: {e}")
             return False
     
-    def _validate_and_normalize_session_data(self, symbol, data):
-        """Validate and normalize session data fields for consistency"""
-        if not isinstance(data, dict):
-            return data
-            
-        # Required fields with defaults
-        required_fields = {
-            'bucket_cumulative_volume': 0,
-            'last_price': 0.0,
-            'high': 0.0,
-            'low': 0.0,
-            'session_date': self.current_session,
-            'update_count': 0,
-            'last_update_timestamp': 0.0,
-            'first_update': 0.0,
-            'last_update': 0.0
-        }
-        
-        # Add missing required fields
-        for field, default_value in required_fields.items():
-            if field not in data:
-                data[field] = default_value
-                
-        # Backward compatibility: map old field names to new ones
-        field_mappings = {
-            'high': 'high',
-            'low': 'low',
-            'last_update': 'last_update_timestamp'
-        }
-        
-        for old_field, new_field in field_mappings.items():
-            if old_field in data:
-                # Always map old field to new field, but preserve old field too
-                data[new_field] = data[old_field]
-        
-        return data
+    # ✅ REMOVED: _validate_and_normalize_session_data - session logic removed
 
     def update_symbol_data_direct(
         self,
@@ -3658,48 +4227,43 @@ class CumulativeDataTracker:
 
         symbol = self._normalize_symbol(symbol)
 
+        # ✅ REMOVED: Session logic - session data management removed
         with self.lock:
-            session = self._get_session_data(symbol)
-            
-            # Store raw cumulative bucket_incremental_volume as-is (no calculations)
-            session.update({
-                'bucket_cumulative_volume': bucket_cumulative_volume,  # Store Zerodha's cumulative as-is
-                'zerodha_cumulative_volume': bucket_cumulative_volume,
-                'last_price': last_price,
-                'high': max(session.get('high', last_price), last_price),
-                'low': min(session.get('low', last_price), last_price),
-                'update_count': session.get('update_count', 0) + 1,
-                'last_update_timestamp': timestamp,
-                # Backward compatibility for old field names
-                'high': max(session.get('high', last_price), last_price),
-                'low': min(session.get('low', last_price), last_price),
-                'last_update': timestamp
-            })
-            
-            # Update history with raw cumulative bucket_incremental_volume
+            # Store last_price and bucket_cumulative_volume in local history only
             self.price_history[symbol].append((timestamp, last_price))
-            self.volume_history[symbol].append((timestamp, bucket_cumulative_volume))  # Store raw cumulative
+            self.volume_history[symbol].append((timestamp, bucket_cumulative_volume))
+            
+            # Keep only recent history to prevent memory bloat
             if len(self.price_history[symbol]) > 1000:
                 self.price_history[symbol] = self.price_history[symbol][-500:]
             if len(self.volume_history[symbol]) > 1000:
                 self.volume_history[symbol] = self.volume_history[symbol][-500:]
 
-            try:
-                # Store in buckets with raw cumulative bucket_incremental_volume
-                self._store_time_bucket_direct(symbol, bucket_cumulative_volume, timestamp, last_price)
-                self._persist_session_data(symbol, session)
-                return bucket_cumulative_volume  # Return raw cumulative bucket_incremental_volume
-            except Exception as exc:
-                logger.error(f"Failed to store cumulative data for {symbol}: {exc}")
-                return 0
+            # ✅ REMOVED: Session persistence and time bucket storage
+            return bucket_cumulative_volume
 
     def _store_time_bucket_direct(
-        self, symbol, bucket_cumulative_volume, timestamp, last_price, depth_data=None
+        self, symbol, bucket_cumulative_volume, timestamp, last_price, previous_cumulative=None, depth_data=None
     ):
         """Store raw cumulative bucket_incremental_volume in time buckets (no calculations)"""
         if bucket_cumulative_volume <= 0:
             return
-        self._store_time_bucket(symbol, last_price, bucket_cumulative_volume, timestamp, depth_data)
+        
+        # ✅ FIXED: Calculate incremental volume from cumulative
+        # ✅ REMOVED: Session logic - session data lookup removed
+        if previous_cumulative is None:
+            previous_cumulative = 0  # Default fallback
+        
+        # Calculate incremental: current - previous (only if current > previous)
+        if bucket_cumulative_volume > previous_cumulative:
+            bucket_incremental_volume = bucket_cumulative_volume - previous_cumulative
+        else:
+            # Session reset or data anomaly - use 0 to avoid negative increments
+            bucket_incremental_volume = 0
+        
+        # Only store if there's actual incremental volume
+        if bucket_incremental_volume > 0:
+            self._store_time_bucket(symbol, last_price, bucket_incremental_volume, timestamp, depth_data)
 
     def get_session_price_movement(self, symbol, minutes_back=30):
         """Get last_price movement analysis for recent period"""
@@ -3853,9 +4417,10 @@ REDIS_DEFAULTS = {
     "username": os.getenv("REDIS_USERNAME"),
     "password": os.getenv("REDIS_PASSWORD"),
     "ssl": os.getenv("REDIS_SSL", "false").lower() == "true",
-    # Timeouts (seconds): short connect, reasonable command window under load
-    "socket_connect_timeout": float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "1.5")),
-    "socket_timeout": float(os.getenv("REDIS_SOCKET_TIMEOUT", "2.5")),
+    # Timeouts (seconds): matched to Zerodha WebSocket configuration
+    # Zerodha intraday crawler uses 10s connection_timeout, standard client uses 15s
+    "socket_connect_timeout": float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "5.0")),
+    "socket_timeout": float(os.getenv("REDIS_SOCKET_TIMEOUT", "10.0")),  # ✅ Matched to Zerodha (10s for intraday)
     # RESP3 for richer types & better INFO/Streams parsing issues on Redis 8.x
     "protocol": int(os.getenv("REDIS_PROTOCOL", "3")),
     # Health/probing
@@ -4004,6 +4569,26 @@ def xadd_safe(
     """
     Safe XADD with optional stream trimming.
     Why: prevent unbounded growth causing memory pressure and slow restarts.
+    
+    Storage Location:
+    - Database: DB 0 (system) - uses get_sync_modern() default connection
+    - Stream Key: key (as provided)
+    
+    Data Format/Signature:
+    - Input: fields (dict) with field->value pairs
+    - Value Types: Any (will be converted to strings by Redis)
+    - Stored Format: Redis Stream entry with fields as-is (all values as strings)
+    - Field names and values are preserved exactly as provided
+    
+    Args:
+        key: Redis stream key name
+        fields: Dictionary of field->value pairs
+        maxlen: Maximum stream length before trimming (optional)
+        approximate: Use approximate trimming if maxlen set (default: True)
+        trim_strategy: Trimming strategy (default: "MAXLEN")
+        
+    Returns:
+        Stream entry ID (string)
     """
     r = get_sync_modern()
     kwargs: dict[str, Any] = {}
@@ -4024,156 +4609,578 @@ def create_consumer_group_if_needed(stream: str, group: str, mkstream: bool = Tr
         if "BUSYGROUP" not in str(e):
             raise
 
-# ⚠️ DEPRECATED: xreadgroup_blocking removed - use RobustStreamConsumer instead
-# This function was replaced by RobustStreamConsumer.process_messages() for standardized stream consumption.
-# 
-# Migration guide:
-# - Use RobustStreamConsumer from intraday_scanner.data_pipeline instead
-# - Example: consumer = RobustStreamConsumer(stream_key, group_name, consumer_name, db)
-#            consumer.process_messages(callback)
+# ============================================================================
+# Redis Connection Managers (from redis_manager.py)
+# ============================================================================
 
-# ---------------- Health utilities ----------------
-def ping_modern() -> bool:
-    try:
-        return bool(get_sync_modern().ping())
-    except (ConnectionError, RedisTimeoutError, AuthenticationError, BusyLoadingError):
-        return False
-
-def info_sections_modern(sections: Iterable[str] = ("server", "memory", "clients", "replication", "keyspace")) -> dict[str, dict]:
-    r = get_sync_modern()
-    out: dict[str, dict] = {}
-    for s in sections:
-        try:
-            out[s] = r.info(section=s)  # RESP3 returns rich types
-        except ResponseError:
-            out[s] = {}  # tolerate partial failures
-    return out
-
-def role_modern() -> Tuple[Any, ...]:
-    try:
-        return tuple(get_sync_modern().execute_command("ROLE"))  # finer-grained than r.role() on some versions
-    except Exception:
-        return tuple()
-
-# ============================================
-# Backward-compatible get_redis_client (wraps modern or legacy)
-# ============================================
-
-def get_redis_client(config=None, db: Optional[int] = None, *, decode_responses: bool = False):
+class RedisManager82:
     """
-    ⚠️ DEPRECATED: Legacy factory function for backward compatibility.
+    Redis 8.2 optimized connection manager with process-specific pools.
     
-    RECOMMENDED: Use RedisManager82.get_client() for new code.
+    Features:
+    - Process-specific connection pools
+    - Redis 8.2 health check intervals
+    - Automatic client naming (process_PID_timestamp)
+    - Connection cleanup methods
+    - Thread-safe pool management
+    """
     
-    Factory function to create and return a singleton RobustRedisClient instance.
-    Now uses modern RESP3 + retry/backoff client under the hood when available.
-    Maintains backward compatibility with existing RobustRedisClient interface.
+    _pools: Dict[str, Dict[int, redis.ConnectionPool]] = {}  # process_name -> {db -> pool}
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_client(
+        cls, 
+        process_name: str, 
+        db: int = 0,
+        max_connections: int = None,  # ✅ SOLUTION 4: Default to None to force config lookup
+        host: str = 'localhost',
+        port: int = 6379,
+        password: Optional[str] = None,
+        decode_responses: bool = True
+    ) -> redis.Redis:
+        """
+        Get a Redis client with process-specific connection pool.
+        
+        ✅ SOLUTION 4: Uses PROCESS_POOL_CONFIG for optimal connection pool sizes.
+        Connection pools are cached per process+db to enable connection reuse.
+        
+        Args:
+            process_name: Unique identifier for the process
+            db: Redis database number (default: 0)
+            max_connections: Max connections for this pool (if None, uses PROCESS_POOL_CONFIG)
+            host: Redis host (default: 'localhost')
+            port: Redis port (default: 6379)
+            password: Redis password (optional)
+            decode_responses: If True, decode responses to strings (default: True)
+            
+        Returns:
+            redis.Redis: Redis client instance with process-specific pool
+        """
+        # Check for environment or config overrides
+        host = os.getenv('REDIS_HOST', host)
+        port = int(os.getenv('REDIS_PORT', port))
+        password = os.getenv('REDIS_PASSWORD') or password
+        
+        # ✅ SOLUTION 4: Get optimized pool size from PROCESS_POOL_CONFIG
+        # Priority: PROCESS_POOL_CONFIG > provided max_connections > default (10)
+        if max_connections is None:
+            try:
+                # PROCESS_POOL_CONFIG is defined in this file (redis_client.py)
+                max_connections = PROCESS_POOL_CONFIG.get(
+                    process_name, 
+                    PROCESS_POOL_CONFIG.get('default', 10)
+                )
+            except Exception:
+                max_connections = 10  # Fallback default
+        else:
+            # If max_connections provided, still check config for override
+            try:
+                # PROCESS_POOL_CONFIG is defined in this file (redis_client.py)
+                config_max = PROCESS_POOL_CONFIG.get(process_name)
+                if config_max is not None:
+                    max_connections = config_max  # Use config value (overrides provided)
+            except Exception:
+                pass  # Use provided max_connections if config lookup fails
+        
+        # Thread-safe pool creation/caching
+        with cls._lock:
+            if process_name not in cls._pools:
+                cls._pools[process_name] = {}
+            
+            if db not in cls._pools[process_name]:
+                # Create process-specific pool for this db
+                pool_config = {
+                    'host': host,
+                    'port': port,
+                    'db': db,
+                    'password': password,
+                    'max_connections': max_connections,
+                    'socket_keepalive': True,
+                    'retry_on_timeout': True,
+                    'health_check_interval': 30,  # Redis 8.2 enhancement
+                    'socket_timeout': 10,
+                    'socket_connect_timeout': 5,
+                }
+                
+                # Remove None values
+                pool_config = {k: v for k, v in pool_config.items() if v is not None}
+                
+                pool = ConnectionPool(**pool_config)
+                cls._pools[process_name][db] = pool
+        
+        # Get cached pool
+        pool = cls._pools[process_name][db]
+        
+        # Create client with connection pool
+        client = redis.Redis(
+            connection_pool=pool,
+            decode_responses=decode_responses
+        )
+        
+        # Set descriptive client name (process_PID) for monitoring
+        try:
+            client_id = f"{process_name}_{os.getpid()}"
+            client.client_setname(client_id)
+        except Exception:
+            pass  # Ignore errors setting name
+        
+        return client
+    
+    @classmethod
+    def cleanup(cls, process_name: Optional[str] = None):
+        """
+        Cleanup connection pools.
+        
+        Args:
+            process_name: If provided, cleanup only this process's pools.
+                         If None, cleanup all pools.
+        """
+        with cls._lock:
+            if process_name:
+                # Cleanup specific process
+                if process_name in cls._pools:
+                    for pool in cls._pools[process_name].values():
+                        try:
+                            pool.disconnect()
+                        except Exception:
+                            pass
+                    del cls._pools[process_name]
+            else:
+                # Cleanup all processes
+                for process_pools in cls._pools.values():
+                    for pool in process_pools.values():
+                        try:
+                            pool.disconnect()
+                        except Exception:
+                            pass
+                cls._pools.clear()
+    
+    @classmethod
+    def get_pool_stats(cls) -> Dict:
+        """Get statistics about connection pools"""
+        with cls._lock:
+            stats = {}
+            for process_name, db_pools in cls._pools.items():
+                stats[process_name] = {
+                    'databases': list(db_pools.keys()),
+                    'total_pools': len(db_pools),
+                    'total_connections': sum(
+                        pool.connection_kwargs.get('max_connections', 0) 
+                        for pool in db_pools.values()
+                    )
+                }
+            return stats
+
+
+class UnifiedRedisManager:
+    """
+    Unified Redis Manager - Alias for RedisManager82.
+    
+    Provides a consistent interface name across the trading system.
+    All components should use this for Redis connections.
+    
+    Usage:
+        from redis_files.redis_client import UnifiedRedisManager
+        
+        client = UnifiedRedisManager.get_client(
+            process_name="my_process",
+            db=1  # ✅ Use DB 1 (unified structure)
+        )
+    """
+    
+    @staticmethod
+    def get_client(process_name: str, db: int = 0, **kwargs) -> redis.Redis:
+        """
+        Get Redis client - delegates to RedisManager82.
+        
+        Args:
+            process_name: Unique identifier for the process
+            db: Redis database number
+            **kwargs: Additional arguments passed to RedisManager82.get_client()
+        
+        Returns:
+            redis.Redis: Redis client instance
+        """
+        return RedisManager82.get_client(process_name=process_name, db=db, **kwargs)
+    
+    @staticmethod
+    def cleanup(process_name: Optional[str] = None):
+        """Cleanup connection pools - delegates to RedisManager82"""
+        return RedisManager82.cleanup(process_name)
+    
+    @staticmethod
+    def get_pool_stats() -> Dict:
+        """Get pool statistics - delegates to RedisManager82"""
+        return RedisManager82.get_pool_stats()
+
+
+class RedisConnectionManager:
+    """
+    SINGLE Redis connection manager to prevent connection leaks.
+    
+    All components should use this singleton instance instead of creating 
+    their own connections. This ensures a single connection pool is shared
+    across the entire application, preventing "Too many connections" errors.
+    
+    Features:
+    - Singleton pattern (only one instance per process)
+    - Single connection pool for entire application
+    - Thread-safe initialization
+    - Connection usage monitoring
+    - Integrates with PROCESS_POOL_CONFIG for max_connections
+    
+    STATUS: Still valid for DB 1 singleton access. For new code, prefer:
+    RedisManager82.get_client(process_name="...", db=N) for process-specific pools.
+    This singleton is primarily used for backward compatibility with existing code.
+    
+    Usage:
+        from redis_files.redis_client import redis_manager
+        
+        # Get the single Redis client instance
+        client = redis_manager.get_client()
+        
+        # Monitor connection usage
+        info = redis_manager.get_connection_info()
+    """
+    
+    _instance = None
+    _lock = Lock()
+    
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+    
+    def _initialize(self):
+        """Initialize the singleton instance (called once)"""
+        if self._initialized:
+            return
+        
+        # Get max_connections from REDIS_8_CONFIG or PROCESS_POOL_CONFIG or use default
+        max_connections = 100  # Increased default for high-frequency operations (crawler + scanner + volume)
+        try:
+            # REDIS_8_CONFIG and PROCESS_POOL_CONFIG are defined in this file (redis_client.py)
+            # Use REDIS_8_CONFIG first (higher priority), then PROCESS_POOL_CONFIG default
+            max_connections = REDIS_8_CONFIG.get('max_connections', 
+                PROCESS_POOL_CONFIG.get('default', 100))
+        except Exception:
+            pass  # Use default if config unavailable
+        
+        # Get Redis connection settings
+        host = os.getenv('REDIS_HOST', 'localhost')
+        port = int(os.getenv('REDIS_PORT', 6379))
+        password = os.getenv('REDIS_PASSWORD') or None
+        
+        # Single connection pool for entire application (DB 1 - unified structure)
+        self.connection_pool = redis.ConnectionPool(
+            host=host,
+            port=port,
+            db=1,  # ✅ Consolidated DB 1 (unified structure)
+            password=password,
+            max_connections=max_connections,  # Limit total connections
+            decode_responses=True,
+            retry_on_timeout=True,
+            socket_keepalive=True,
+            health_check_interval=30,  # Redis 8.2 enhancement
+            socket_timeout=10,
+            socket_connect_timeout=5,
+        )
+        
+        # Single Redis client instance
+        self.redis = redis.Redis(connection_pool=self.connection_pool)
+        
+        # Track usage
+        self.connection_count = 0
+        self.max_connections = max_connections
+        
+        # Set descriptive client name
+        try:
+            client_id = f"redis_connection_manager_{os.getpid()}"
+            self.redis.client_setname(client_id)
+        except Exception:
+            pass  # Ignore errors setting name
+        
+        self._initialized = True
+        
+    def get_client(self):
+        """
+        Get the single Redis client instance (DB 1 singleton).
+        
+        STATUS: Still valid for DB 1 singleton access. For new code, prefer:
+        RedisManager82.get_client(process_name="...", db=N) for process-specific pools.
+        
+        Returns:
+            redis.Redis: The singleton Redis client instance (DB 1)
+        """
+        if not self._initialized:
+            self._initialize()
+        return self.redis
+    
+    def get_connection_info(self):
+        """
+        Monitor connection usage.
+        
+        Returns:
+            dict: Connection information including:
+                - connected_clients: Number of currently connected clients
+                - max_connections: Maximum connections allowed in pool
+                - blocked_clients: Number of blocked clients
+        """
+        if not self._initialized:
+            self._initialize()
+            
+        try:
+            info = self.redis.info('clients')
+            return {
+                'connected_clients': info.get('connected_clients', 0),
+                'max_connections': self.max_connections,
+                'blocked_clients': info.get('blocked_clients', 0),
+                'pool_size': self.connection_pool.max_connections,
+                'pool_available': self.connection_pool.max_connections - len(self.connection_pool._available_connections) if hasattr(self.connection_pool, '_available_connections') else 'unknown'
+            }
+        except Exception as e:
+            return {'error': f'Could not fetch connection info: {e}'}
+    
+    def cleanup(self):
+        """Cleanup the connection pool"""
+        if self._initialized and hasattr(self, 'connection_pool'):
+            try:
+                self.connection_pool.disconnect()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# Global Instances
+# ============================================================================
+
+# GLOBAL INSTANCE - everyone uses this singleton
+redis_manager = RedisConnectionManager()
+
+# GLOBAL INSTANCE - every file uses this for unified Redis access
+# ✅ FIX: Use singleton connection manager to prevent "Too many connections" errors
+# Instead of creating new RobustRedisClient with its own pools, use the singleton
+# 
+# STATUS: Still valid for DB 1 singleton access. For new code, prefer:
+# RedisManager82.get_client(process_name="...", db=N) for process-specific pools
+try:
+    # Use the singleton redis_manager which shares a single connection pool
+    _singleton_client = redis_manager.get_client()  # DB 1 singleton
+    # Wrap it in a lightweight wrapper that provides redis_gateway interface
+    # 
+    # STATUS: redis_gateway is a compatibility wrapper, still valid for backward compatibility.
+    # For new code, prefer: RedisManager82.get_client(process_name="...", db=N)
+    class RedisGatewayWrapper:
+        """
+        Lightweight wrapper around singleton Redis client for redis_gateway compatibility.
+        
+        STATUS: Still valid for backward compatibility. This wrapper provides:
+        - DB 1 singleton access via redis_manager.get_client()
+        - Other DBs via RedisManager82.get_client()
+        - Compatibility methods for existing code
+        
+        For new code, prefer: RedisManager82.get_client(process_name="...", db=N)
+        """
+        def __init__(self, client):
+            self.redis_client = client
+            self.redis = client  # Backward compatibility
+        
+        def get_client(self, db_num=1):
+            """
+            Get client for specific DB - use singleton for DB 1, RedisManager82 for others.
+            
+            STATUS: Still valid. For new code, prefer:
+            RedisManager82.get_client(process_name="...", db=db_num)
+            """
+            if db_num == 1:
+                return self.redis_client  # Use singleton for DB 1
+            else:
+                return RedisManager82.get_client(process_name="redis_gateway", db=db_num)
+        
+        def _categorize_indicator(self, indicator: str) -> str:
+            return _redis_categorize_indicator(indicator)
+
+        def _transform_key(self, key: str) -> str:
+            return _redis_transform_key(key)
+
+        def store_volume_state(self, token: str, data: Dict[str, Any]):
+            """Compatibility shim for vol:state:* writes (DB 1 singleton)."""
+            _redis_store_volume_state(self, token, data)
+    
+        def store_volume_baseline(self, symbol: str, data: Dict[str, Any], ttl: int = 86400):
+            """Compatibility shim for vol:baseline:* writes (DB 1 singleton)."""
+            _redis_store_volume_baseline(self, symbol, data, ttl)
+
+        def store_volume_profile(self, symbol: str, period: str, data: Dict[str, Any], ttl: int = 57600):
+            """Compatibility shim for vol:profile:* writes (DB 1 singleton)."""
+            _redis_store_volume_profile(self, symbol, period, data, ttl)
+
+        def store_straddle_volume(self, underlying: str, date: str, data: Dict[str, Any], ttl: int = 57600):
+            """Compatibility shim for vol:straddle:* writes (DB 1 singleton)."""
+            _redis_store_straddle_volume(self, underlying, date, data, ttl)
+    
+        def store_indicator(self, symbol: str, indicator: str, value, ttl: int = 3600):
+            """Store indicator - new structure: ind:{category}:{symbol}:{indicator}"""
+            _redis_store_indicator(self, symbol, indicator, value, ttl)
+        
+        def get_indicator(self, symbol: str, indicator: str) -> Optional[str]:
+            """Get indicator from new structure"""
+            return _redis_get_indicator(self, symbol, indicator)
+        
+        def produce_ticks_batch_sync(
+            self, 
+            ticks: List[Dict[str, Any]],
+            stream_name: str = "ticks:intraday:processed",
+            maxlen: int = 10000,
+            approximate: bool = True
+        ) -> Dict[str, Any]:
+            """
+            High-throughput tick production with batching (storage only, no calculations).
+            Uses pipelines for efficient batch writes to Redis streams.
+            
+            ✅ Uses singleton client (DB 1) directly to avoid connection pool creation.
+            """
+            import time
+            start_time = time.perf_counter()
+            
+            # Use the singleton client (DB 1 for realtime streams)
+            client = self.redis_client
+            if not client:
+                logger.error(f"No client available for stream {stream_name}")
+                return {
+                    'ticks_produced': 0,
+                    'batch_duration_ms': 0,
+                    'throughput_tps': 0,
+                    'symbols': []
+                }
+            
+            # Group ticks by symbol for efficient streaming
+            ticks_by_symbol = {}
+            for tick in ticks:
+                symbol = tick.get('symbol', 'UNKNOWN')
+                if symbol not in ticks_by_symbol:
+                    ticks_by_symbol[symbol] = []
+                ticks_by_symbol[symbol].append(tick)
+            
+            # Use pipelines for each symbol (batched writes)
+            total_written = 0
+            for symbol, symbol_ticks in ticks_by_symbol.items():
+                # Use existing stream naming
+                if len(ticks_by_symbol) == 1:
+                    stream_key = f"ticks:intraday:{symbol}"
+                else:
+                    stream_key = stream_name
+                
+                # Batch writes using pipeline
+                with client.pipeline(transaction=False) as pipe:
+                    for tick in symbol_ticks:
+                        fields = {
+                            'symbol': str(tick.get('symbol', 'UNKNOWN')),
+                            'price': str(tick.get('price', tick.get('last_price', 0))),
+                            'volume': str(tick.get('volume', tick.get('traded_quantity', tick.get('bucket_incremental_volume', 0)))),
+                            'timestamp': str(tick.get('timestamp', tick.get('exchange_timestamp_ms', time.time() * 1000)))
+                        }
+                        # Add optional fields
+                        if 'high' in tick:
+                            fields['high'] = str(tick['high'])
+                        if 'low' in tick:
+                            fields['low'] = str(tick['low'])
+                        if 'open' in tick:
+                            fields['open'] = str(tick['open'])
+                        if 'close' in tick:
+                            fields['close'] = str(tick['close'])
+                        if 'instrument_token' in tick:
+                            fields['instrument_token'] = str(tick['instrument_token'])
+                        if 'bucket_incremental_volume' in tick:
+                            fields['bucket_incremental_volume'] = str(tick['bucket_incremental_volume'])
+                        if 'bucket_cumulative_volume' in tick:
+                            fields['bucket_cumulative_volume'] = str(tick['bucket_cumulative_volume'])
+                        
+                        pipe.xadd(
+                            stream_key,
+                            fields,
+                            maxlen=maxlen,
+                            approximate=approximate
+                        )
+                    
+                    # Execute pipeline (all writes in one round-trip)
+                    results = pipe.execute()
+                    total_written += len([r for r in results if r])
+            
+            duration = time.perf_counter() - start_time
+            return {
+                'ticks_produced': total_written,
+                'batch_duration_ms': duration * 1000,
+                'throughput_tps': total_written / duration if duration > 0 else 0,
+                'symbols': list(ticks_by_symbol.keys())
+            }
+        
+        # Delegate all other Redis operations to underlying client
+        def __getattr__(self, name):
+            return getattr(self.redis_client, name)
+    
+    # ✅ STATUS: redis_gateway is still valid for backward compatibility
+    # For new code, prefer: RedisManager82.get_client(process_name="...", db=N)
+    redis_gateway = RedisGatewayWrapper(_singleton_client)
+except Exception as e:
+    logger.warning(f"⚠️ Failed to initialize redis_gateway with singleton: {e}, falling back to RobustRedisClient")
+    # Fallback to RobustRedisClient if singleton fails
+    # ✅ STATUS: This fallback is still valid for backward compatibility
+    redis_gateway = RobustRedisClient(
+        host=REDIS_8_CONFIG.get("host", "localhost"),
+        port=REDIS_8_CONFIG.get("port", 6379),
+        db=1,  # DB 1: ohlc_and_ticks (unified structure)
+        password=REDIS_8_CONFIG.get("password"),
+        decode_responses=REDIS_8_CONFIG.get("decode_responses", True),
+    )
+
+
+# ============================================================================
+# Compatibility Functions
+# ============================================================================
+
+def get_redis_client(db: Optional[int] = None, decode_responses: bool = True, process_name: str = "default") -> Union[RobustRedisClient, redis.Redis]:
+    """
+    Compatibility function to get Redis client.
     
     Args:
-        config: Legacy config dict (optional)
-        db: Database number (optional, overrides config)
-        decode_responses: If True, decode Redis responses to strings (for JSON/indicator reads)
+        db: Redis database number. If None, returns redis_gateway (RobustRedisClient).
+        decode_responses: Whether to decode responses (default: True)
+        process_name: Process name for connection pool (default: "default")
     
     Returns:
-        RobustRedisClient instance (or modern client wrapped for backward compatibility)
-        
-    Migration:
-        # Old (deprecated):
-        client = get_redis_client(db=1)
-        
-        # New (recommended):
-        from redis_files.redis_manager import RedisManager82
-        client = RedisManager82.get_client(process_name="your_process", db=1)
+        If db is None: Returns redis_gateway (RobustRedisClient instance)
+        If db is specified: Returns direct Redis client via RedisManager82
     """
-    global _redis_client_instance
+    if db is None:
+        # Return the global redis_gateway instance (RobustRedisClient)
+        return redis_gateway
+    else:
+        # Return a direct Redis client for the specified database
+        return RedisManager82.get_client(
+            process_name=process_name,
+            db=db,
+            decode_responses=decode_responses
+        )
+
+
+def publish_to_redis(stream_name: str, data: Dict[str, Any], maxlen: int = 10000) -> Optional[str]:
+    """
+    Compatibility function to publish data to Redis stream.
     
-    # If db or decode_responses specified, use RobustRedisClient to ensure connection pooling
-    # Don't create new connections - reuse singleton and get_client() for specific DB
-    if db is not None or decode_responses:
-        # Get or create singleton RobustRedisClient
-        if _redis_client_instance is None:
-            # Create singleton first
-            from redis_files.redis_config import get_redis_config
-            redis_config = get_redis_config()
-            redis_config_with_max_conn = redis_config.copy()
-            if "max_connections" in redis_config:
-                redis_config_with_max_conn["redis_max_connections"] = redis_config["max_connections"]
-            _redis_client_instance = RobustRedisClient(
-                host=redis_config.get("host", "localhost"),
-                port=redis_config.get("port", 6379),
-                db=redis_config.get("db", 0),
-                password=redis_config.get("password"),
-                decode_responses=decode_responses,
-                health_check_interval=redis_config.get("health_check_interval", 30),
-                config=redis_config_with_max_conn
-            )
-        
-        # Return appropriate client for the requested DB
-        if db is not None:
-            return _redis_client_instance.get_client(db)
-        return _redis_client_instance
-    if _redis_client_instance is None:
-        try:
-            # Try modern implementation first (if config allows)
-            use_modern = os.getenv("REDIS_USE_MODERN", "true").lower() == "true"
-            # Always use RobustRedisClient to ensure wrapper methods are available
-            # Modern client can be used internally but we need the wrapper interface
-            use_modern = False  # Force RobustRedisClient for compatibility
-            
-            if not use_modern or _redis_client_instance is None:
-                # Use centralized Redis configuration (legacy path)
-                from redis_files.redis_config import get_redis_config, Redis8Config
-                
-                # Get base Redis configuration
-                redis_config = get_redis_config()
-                
-                # Allow config override for specific settings
-                if config:
-                    redis_config.update({
-                        k: v for k, v in config.items() 
-                        if k.startswith('redis_') and k in ['redis_host', 'redis_port', 'redis_db', 'redis_password']
-                    })
-                
-                # Create RobustRedisClient with proper configuration
-                # Pass max_connections through config, not as direct parameter
-                redis_config_with_max_conn = redis_config.copy()
-                # Ensure max_connections is passed as redis_max_connections
-                if "max_connections" in redis_config:
-                    redis_config_with_max_conn["redis_max_connections"] = redis_config["max_connections"]
-                if config:
-                    redis_config_with_max_conn.update(config)
-                
-                _redis_client_instance = RobustRedisClient(
-                    host=redis_config.get("host", "localhost"),
-                    port=redis_config.get("port", 6379),
-                    db=redis_config.get("db", 0),
-                    password=redis_config.get("password"),
-                    decode_responses=redis_config.get("decode_responses", True),
-                    health_check_interval=redis_config.get("health_check_interval", 30),
-                    config=redis_config_with_max_conn
-                )
-                logger.info("✅ Redis client created using centralized configuration")
-        except Exception as e:
-            logger.error(f"Failed to create Redis client with centralized config: {e}")
-            # Fallback to basic configuration
-            try:
-                _redis_client_instance = RobustRedisClient(
-                    host="localhost", port=6379, db=0, config=config
-                )
-                logger.warning("⚠️ Using fallback Redis configuration")
-            except Exception as fallback_e:
-                logger.error(f"Failed to create fallback Redis client: {fallback_e}")
-                return None
-    return _redis_client_instance
-
-
-def publish_to_redis(channel, message, config=None):
-    """Publish a message to a Redis channel"""
-    client = get_redis_client(config)
-    if client and client.is_connected:
-        try:
-            client.publish(channel, message)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to publish to Redis channel {channel}: {e}")
-    return False
+    Args:
+        stream_name: Name of the Redis stream
+        data: Data dictionary to publish
+        maxlen: Maximum length of the stream (default: 10000)
+    
+    Returns:
+        Stream entry ID if successful, None otherwise
+    """
+    try:
+        return redis_gateway.publish_to_stream(stream_name, data, maxlen=maxlen)
+    except Exception as e:
+        logger.error(f"Failed to publish to Redis stream {stream_name}: {e}")
+        return None

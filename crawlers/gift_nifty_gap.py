@@ -19,17 +19,22 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 # Add project root to path
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent  # crawlers -> project root
 sys.path.insert(0, str(project_root))
 
 from config.zerodha_config import ZerodhaConfig
+from redis_files.redis_key_standards import RedisKeyStandards
 
 # Setup logging
+# Ensure logs directory exists
+logs_dir = project_root / 'logs'
+logs_dir.mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/index_updater.log'),
+        logging.FileHandler(logs_dir / 'index_updater.log'),
         logging.StreamHandler()
     ]
 )
@@ -62,53 +67,23 @@ class IndexDataUpdater:
             self.kite = None
             self.initialized = False
 
-        # Initialize Redis connection using process-specific connection pools
+        # Initialize Redis connection - ALL data goes to DB 1 (unified structure)
         try:
-            # ✅ Use RedisManager82 for process-specific pooled connections
-            from redis_files.redis_manager import RedisManager82
+            # ✅ FIX: Use only DB 1 for all publishing (unified structure)
+            from redis_files.redis_client import redis_manager
+            self.redis_client = redis_manager.get_client()  # DB 1 singleton
             
-            # Get process-specific pooled clients for gift_nifty_crawler process
-            self.redis_client = RedisManager82.get_client(
-                process_name="gift_nifty_crawler",
-                db=0,
-                max_connections=2,  # Will be overridden by PROCESS_POOL_CONFIG
-            )
-            self.redis_db1 = RedisManager82.get_client(
-                process_name="gift_nifty_crawler",
-                db=1,
-                max_connections=2,  # Will be overridden by PROCESS_POOL_CONFIG
-            )
-            
-            # Verify both clients are initialized
             if self.redis_client is None:
-                raise Exception("Redis DB 0 client is None")
-            if self.redis_db1 is None:
                 raise Exception("Redis DB 1 client is None")
                 
             self.redis_initialized = True
-            logger.info("✅ Redis connected for index data publishing using process-specific pools (DB 0 and DB 1)")
-        except ImportError:
-            # Fallback to get_optimized_client if RedisManager82 not available
-            logger.warning("RedisManager82 not available, falling back to get_optimized_client")
-            try:
-                from redis_files.redis_manager import RedisManager82
-                # ✅ STANDARDIZED: Use RedisManager82 instead of legacy get_optimized_client
-                self.redis_client = RedisManager82.get_client(process_name="gift_nifty_crawler", db=0)
-                self.redis_db1 = RedisManager82.get_client(process_name="gift_nifty_crawler", db=1)
-                self.redis_initialized = True
-                logger.info("✅ Redis connected using get_optimized_client (DB 0 and DB 1)")
-            except Exception as fallback_error:
-                logger.error(f"⚠️ Redis connection fallback failed: {fallback_error}")
-                self.redis_initialized = False
-                self.redis_client = None
-                self.redis_db1 = None
+            logger.info("✅ Redis connected for index data publishing to DB 1 (unified structure)")
         except Exception as e:
             logger.error(f"⚠️ Redis connection failed: {e}")
             import traceback
             logger.error(traceback.format_exc())
             self.redis_initialized = False
             self.redis_client = None
-            self.redis_db1 = None
 
         # Index definitions with tokens
         self.indices = {
@@ -265,7 +240,6 @@ class IndexDataUpdater:
         try:
             with open(self.jsonl_file, 'a') as f:
                 f.write(json.dumps(data) + '\n')
-            logger.debug(f"📝 Written to JSONL: {data['symbol']}")
         except Exception as e:
             logger.error(f"❌ Error writing to JSONL: {e}")
 
@@ -417,53 +391,84 @@ class IndexDataUpdater:
         updated_count = 0
         for symbol, token in self.indices.items():
             try:
-                # Get latest quote
-                quote = self.kite.quote(f"{token}")
+                # Get latest quote using instrument key (symbol) - more reliable than token
+                # Zerodha API quote() expects a list of instrument keys or tokens
+                quote = self.kite.quote([symbol])
 
-                if quote and str(token) in quote:
+                if quote and symbol in quote:
+                    data = quote[symbol]
+                elif quote and str(token) in quote:
+                    # Fallback: try token format if symbol format doesn't work
                     data = quote[str(token)]
-
-                    # Extract ONLY the fields that Zerodha actually provides
-                    index_info = {
-                        'symbol': symbol,
-                        'instrument_token': data.get('instrument_token', token),
-                        'tradingsymbol': data.get('tradingsymbol', symbol.split(':')[-1]),
-                        'timestamp': data.get('timestamp', datetime.now()).isoformat() if data.get('timestamp') else datetime.now().isoformat(),
-                        'last_price': data.get('last_price', 0),
-                        'net_change': data.get('net_change', 0),
-                        'ohlc': data.get('ohlc', {}),
-                        # Add calculated fields for backtesting
-                        'percent_change': (data.get('net_change', 0) / data.get('last_price', 1)) * 100 if data.get('last_price', 0) > 0 else 0,
-                        'timestamp_ns': int(data.get('timestamp', datetime.now()).timestamp() * 1_000_000_000) if data.get('timestamp') else int(datetime.now().timestamp() * 1_000_000_000),
-                        'exchange': symbol.split(':')[0] if ':' in symbol else 'NSE',
-                        'segment': 'INDEX' if 'NIFTY' in symbol or 'VIX' in symbol else 'EQUITY',
-                        'mode': 'quote',  # Indicates this is from REST API quote
-                        # Add news/sentiment data for backtesting
-                        'news_sentiment_positive': len([item for item in self.news_data if item.get('sentiment') == 'positive']),
-                        'news_sentiment_negative': len([item for item in self.news_data if item.get('sentiment') == 'negative']),
-                        'news_sentiment_neutral': len([item for item in self.news_data if item.get('sentiment') == 'neutral']),
-                        'news_total_count': len(self.news_data),
-                        'news_sentiment_score': self._calculate_news_sentiment_score(),
-                        'market_news_available': len(self.news_data) > 0,
-                        'news_sources': list(set(item.get('publisher', '') for item in self.news_data if item.get('publisher'))),
-                        'news_last_updated': datetime.now().isoformat() if self.news_data else ''
-                    }
-
-                    # Store locally
-                    self.index_data[symbol] = index_info
-                    self.last_updates[symbol] = datetime.now()
-
-                    # Write to JSONL for backtesting
-                    self._write_to_jsonl(index_info)
-
-                    # Publish to Redis
-                    self._publish_to_redis(symbol, index_info)
-
-                    updated_count += 1
-                    logger.info(f"✅ Updated {symbol}: {index_info['last_price']:.2f} pts ({index_info['percent_change']:+.2f}%)")
-
                 else:
-                    logger.warning(f"⚠️ No data received for {symbol}")
+                    # Try alternative: use token as list
+                    quote_alt = self.kite.quote([token])
+                    if quote_alt and str(token) in quote_alt:
+                        data = quote_alt[str(token)]
+                    else:
+                        logger.warning(f"⚠️ No data received for {symbol} (token: {token})")
+                        if symbol == 'NSE:INDIA VIX':
+                            logger.error(f"❌ CRITICAL: VIX data not available. Quote response: {quote}")
+                        continue
+
+                # Validate data before processing (especially important for VIX)
+                last_price = data.get('last_price', 0)
+                if symbol == 'NSE:INDIA VIX' and (not last_price or last_price == 0):
+                    logger.warning(f"⚠️ VIX last_price is 0 or None. Raw data: {data}")
+                    # Try to get from OHLC if last_price is missing
+                    ohlc = data.get('ohlc', {})
+                    last_price = ohlc.get('close', 0) or ohlc.get('last_price', 0)
+                    if last_price and last_price > 0:
+                        logger.info(f"✅ Using VIX close price from OHLC: {last_price}")
+                    else:
+                        logger.error(f"❌ VIX data invalid - last_price: {last_price}, data keys: {list(data.keys())}")
+                        continue  # Skip this update if VIX data is invalid
+
+                # Extract ONLY the fields that Zerodha actually provides
+                ohlc = data.get('ohlc', {})
+                close_price = ohlc.get('close', 0) or last_price
+                
+                # Calculate percent_change from close price (more accurate than net_change)
+                net_change_from_close = last_price - close_price if close_price > 0 else data.get('net_change', 0)
+                percent_change = (net_change_from_close / close_price * 100) if close_price > 0 else 0
+                
+                index_info = {
+                    'symbol': symbol,
+                    'instrument_token': data.get('instrument_token', token),
+                    'tradingsymbol': data.get('tradingsymbol', symbol.split(':')[-1]),
+                    'timestamp': data.get('timestamp', datetime.now()).isoformat() if data.get('timestamp') else datetime.now().isoformat(),
+                    'last_price': last_price,
+                    'net_change': net_change_from_close,  # Use calculated net_change from close
+                    'ohlc': ohlc,
+                    # Add calculated fields for backtesting
+                    'percent_change': percent_change,
+                    'timestamp_ns': int(data.get('timestamp', datetime.now()).timestamp() * 1_000_000_000) if data.get('timestamp') else int(datetime.now().timestamp() * 1_000_000_000),
+                    'exchange': symbol.split(':')[0] if ':' in symbol else 'NSE',
+                    'segment': 'INDEX' if 'NIFTY' in symbol or 'VIX' in symbol else 'EQUITY',
+                    'mode': 'quote',  # Indicates this is from REST API quote
+                    # Add news/sentiment data for backtesting
+                    'news_sentiment_positive': len([item for item in self.news_data if item.get('sentiment') == 'positive']),
+                    'news_sentiment_negative': len([item for item in self.news_data if item.get('sentiment') == 'negative']),
+                    'news_sentiment_neutral': len([item for item in self.news_data if item.get('sentiment') == 'neutral']),
+                    'news_total_count': len(self.news_data),
+                    'news_sentiment_score': self._calculate_news_sentiment_score(),
+                    'market_news_available': len(self.news_data) > 0,
+                    'news_sources': list(set(item.get('publisher', '') for item in self.news_data if item.get('publisher'))),
+                    'news_last_updated': datetime.now().isoformat() if self.news_data else ''
+                }
+
+                # Store locally
+                self.index_data[symbol] = index_info
+                self.last_updates[symbol] = datetime.now()
+
+                # Write to JSONL for backtesting
+                self._write_to_jsonl(index_info)
+
+                # Publish to Redis
+                self._publish_to_redis(symbol, index_info)
+
+                updated_count += 1
+                logger.info(f"✅ Updated {symbol}: {index_info['last_price']:.2f} pts ({index_info['percent_change']:+.2f}%)")
 
             except Exception as e:
                 logger.error(f"❌ Error updating {symbol}: {e}")
@@ -481,29 +486,102 @@ class IndexDataUpdater:
             self._publish_gap_analysis()
 
     def _publish_to_redis(self, symbol, data):
-        """Publish index data to Redis in DB 1 (realtime)"""
+        """Publish index data to Redis in DB 1 (unified structure)"""
         if not self.redis_initialized:
             return
 
         try:
-            # Use DB 1 client for realtime data (indices)
-            realtime_client = self.redis_db1 if self.redis_db1 else self.redis_client
+            # ✅ FIX: Use only DB 1 client (unified structure)
+            realtime_client = self.redis_client
             
             if not realtime_client:
                 logger.warning(f"⚠️ No Redis client available for publishing {symbol}")
                 return
-            
-            # Publish to individual index channel (keep original case for VIX detector compatibility)
-            channel = f"index:{symbol}"
-            realtime_client.publish(channel, json.dumps(data))
-            
-            # Store in Redis for persistence (both formats for compatibility)
-            key1 = f"index:{symbol}"  # For detector compatibility
-            key2 = f"market_data:indices:{symbol.replace(':', '_').lower()}"  # For market data
-            realtime_client.set(key1, json.dumps(data))
-            realtime_client.set(key2, json.dumps(data))
 
-            logger.debug(f"📡 Published {symbol} to Redis DB 1 (channels: {channel}, keys: {key1}, {key2})")
+            alias_symbol = RedisKeyStandards.canonical_symbol(symbol)
+            symbol_variants = [symbol]
+            if alias_symbol and alias_symbol not in symbol_variants:
+                symbol_variants.append(alias_symbol)
+            
+            payload = json.dumps(data)
+            
+            def _market_suffix(sym: str, replace_spaces: bool) -> str:
+                suffix = sym.replace(':', '_')
+                suffix = suffix.replace(' ', '_' if replace_spaces else ' ')
+                return suffix.lower()
+            
+            for sym_variant in symbol_variants:
+                # Publish realtime channel
+                channel = f"index:{sym_variant}"
+                realtime_client.publish(channel, payload)
+                
+                # Persist JSON payload under multiple key shapes
+                json_key = f"index:{sym_variant}"
+                realtime_client.set(json_key, payload)
+                
+                legacy_suffix = _market_suffix(sym_variant, replace_spaces=False)
+                realtime_client.set(f"market_data:indices:{legacy_suffix}", payload)
+                
+                underscore_suffix = _market_suffix(sym_variant, replace_spaces=True)
+                if underscore_suffix != legacy_suffix:
+                    realtime_client.set(f"market_data:indices:{underscore_suffix}", payload)
+                
+                # Hash storage for fast field access
+                hash_key = f"index_hash:{sym_variant}"
+                hash_data = {
+                    'last_price': str(data.get('last_price', 0)),
+                    'change': str(data.get('change', 0)),
+                    'percent_change': str(data.get('percent_change', 0)),
+                    'net_change': str(data.get('net_change', 0)),
+                    'timestamp': data.get('timestamp', ''),
+                    'symbol': data.get('symbol', sym_variant),
+                }
+                realtime_client.hset(hash_key, mapping=hash_data)
+                realtime_client.expire(hash_key, 60)  # 60 second TTL (updated every 30s)
+            
+            # ✅ NEW: Publish to indices:stream for ClickHouse ingestion (port 6379, DB 1)
+            # Also publish to port 6380 for clickhouse_pipeline.py
+            try:
+                # Format indices data for ClickHouse schema
+                ch_indices_data = {
+                    'instrument_token': str(data.get('instrument_token', 0)),
+                    'symbol': data.get('symbol', symbol),
+                    'tradingsymbol': data.get('tradingsymbol', symbol),
+                    'exchange': data.get('exchange', 'NSE'),
+                    'segment': 'INDEX',
+                    'mode': 'quote',
+                    'timestamp': data.get('timestamp', datetime.now().isoformat()),
+                    'timestamp_ns': int(data.get('timestamp_ns', 0)) if data.get('timestamp_ns') else 0,
+                    'last_price': float(data.get('last_price', 0)),
+                    'net_change': float(data.get('net_change', 0)),
+                    'percent_change': float(data.get('percent_change', 0)),
+                    'open': float(data.get('open', 0)) if data.get('open') else 0.0,
+                    'high': float(data.get('high', 0)) if data.get('high') else 0.0,
+                    'low': float(data.get('low', 0)) if data.get('low') else 0.0,
+                    'close': float(data.get('close', 0)) if data.get('close') else 0.0,
+                    'volume': int(data.get('volume', 0)) if data.get('volume') else 0,
+                    'news_sentiment_positive': int(data.get('news_sentiment_positive', 0)),
+                    'news_sentiment_negative': int(data.get('news_sentiment_negative', 0)),
+                    'news_sentiment_neutral': int(data.get('news_sentiment_neutral', 0)),
+                    'news_total_count': int(data.get('news_total_count', 0)),
+                    'news_sentiment_score': float(data.get('news_sentiment_score', 0.0)),
+                    'market_news_available': 1 if data.get('market_news_available', False) else 0,
+                    'news_sources': data.get('news_sources', []) if isinstance(data.get('news_sources'), list) else [],
+                    'news_last_updated': data.get('news_last_updated', '') if data.get('news_last_updated') else ''
+                }
+                
+                # Publish to stream on port 6379 (for redis_clickhouse_bridge)
+                realtime_client.xadd('indices:stream', {k: str(v) if not isinstance(v, (list, dict)) else json.dumps(v) for k, v in ch_indices_data.items()}, maxlen=10000, approximate=True)
+                
+                # Also publish to port 6380 for clickhouse_pipeline.py
+                try:
+                    import redis
+                    redis_6380 = redis.Redis(host='localhost', port=6380, db=0, decode_responses=False)
+                    redis_6380.xadd('indices:stream', {k: str(v) if not isinstance(v, (list, dict)) else json.dumps(v) for k, v in ch_indices_data.items()}, maxlen=10000, approximate=True)
+                except Exception as e:
+                    logger.debug(f"Could not publish to port 6380 (optional): {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not publish to indices:stream: {e}")
 
         except Exception as e:
             logger.error(f"❌ Redis publish error for {symbol}: {e}")
@@ -529,9 +607,9 @@ class IndexDataUpdater:
                     'display_value': f"{data['last_price']:.2f} pts"  # Add display format
                 }
 
-            # Publish market context - use DB 1 for realtime data
+            # ✅ FIX: Use only DB 1 for realtime data (unified structure)
             if self.redis_initialized:
-                redis_client = self.redis_db1 if self.redis_db1 else self.redis_client
+                redis_client = self.redis_client
                 if redis_client:
                     redis_client.publish('market:context', json.dumps(context))
                     redis_client.set('market:context:latest', json.dumps(context))
@@ -543,8 +621,8 @@ class IndexDataUpdater:
 
     def _publish_news_data(self):
         """Publish news data to Redis and write to disk"""
-        if not self.redis_initialized or not self.news_data or not self.redis_db1:
-            if not self.redis_db1:
+        if not self.redis_initialized or not self.news_data or not self.redis_client:
+            if not self.redis_client:
                 logger.warning("⚠️ Redis DB 1 client not available for news publishing")
             return
         
@@ -552,8 +630,8 @@ class IndexDataUpdater:
             # Write news to disk first
             self._write_news_to_disk()
             
-            # Use DB 1 client for all news operations (realtime database)
-            redis_client = self.redis_db1
+            # ✅ FIX: Use only DB 1 client for all news operations (unified structure)
+            redis_client = self.redis_client
             
             # Publish individual news items AND store them persistently
             for i, news_item in enumerate(self.news_data):
@@ -588,6 +666,45 @@ class IndexDataUpdater:
             redis_client.publish('market_data.news_summary', json.dumps(news_summary))
             redis_client.set('market_data.news:latest', json.dumps(news_summary))
             
+            # ✅ NEW: Publish to news:stream for ClickHouse ingestion (port 6379, DB 1)
+            # Also publish to port 6380 for clickhouse_pipeline.py
+            try:
+                # Publish each news item to stream on port 6379 (for redis_clickhouse_bridge)
+                for news_item in self.news_data:
+                    # Format news item for ClickHouse schema
+                    ch_news_data = {
+                        'source': news_item.get('publisher', 'zerodha_pulse'),
+                        'title': news_item.get('title', ''),
+                        'link': news_item.get('link', ''),
+                        'published_at': news_item.get('written_at', datetime.now().isoformat()),
+                        'sentiment': 1.0 if news_item.get('sentiment') == 'positive' else (-1.0 if news_item.get('sentiment') == 'negative' else 0.0),
+                        'sentiment_confidence': news_item.get('sentiment_confidence', 0.5),
+                        'categories': news_item.get('sector_relevance', []) if isinstance(news_item.get('sector_relevance'), list) else []
+                    }
+                    # Convert lists/dicts to JSON strings for Redis stream compatibility
+                    stream_data = {k: str(v) if not isinstance(v, (list, dict)) else json.dumps(v) for k, v in ch_news_data.items()}
+                    redis_client.xadd('news:stream', stream_data, maxlen=10000, approximate=True)
+                
+                # Also publish to port 6380 for clickhouse_pipeline.py
+                try:
+                    import redis
+                    redis_6380 = redis.Redis(host='localhost', port=6380, db=0, decode_responses=False)
+                    for news_item in self.news_data:
+                        ch_news_data = {
+                            'source': news_item.get('publisher', 'zerodha_pulse'),
+                            'title': news_item.get('title', ''),
+                            'link': news_item.get('link', ''),
+                            'published_at': news_item.get('written_at', datetime.now().isoformat()),
+                            'sentiment': 1.0 if news_item.get('sentiment') == 'positive' else (-1.0 if news_item.get('sentiment') == 'negative' else 0.0),
+                            'sentiment_confidence': news_item.get('sentiment_confidence', 0.5),
+                            'categories': news_item.get('sector_relevance', []) if isinstance(news_item.get('sector_relevance'), list) else []
+                        }
+                        redis_6380.xadd('news:stream', {k: str(v) if not isinstance(v, (list, dict)) else json.dumps(v) for k, v in ch_news_data.items()}, maxlen=10000, approximate=True)
+                except Exception as e:
+                    logger.debug(f"Could not publish to port 6380 (optional): {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not publish to news:stream: {e}")
+            
             logger.info(f"📰 Published {len(self.news_data)} news items to Redis DB 1 and disk")
 
         except Exception as e:
@@ -598,7 +715,7 @@ class IndexDataUpdater:
     def _publish_news_to_symbols(self, news_item, redis_client=None):
         """Publish news to symbol-specific keys for DataPipeline consumption"""
         if redis_client is None:
-            redis_client = self.redis_db1 if self.redis_db1 else self.redis_client
+            redis_client = self.redis_client
         
         if not redis_client:
             return
@@ -751,16 +868,15 @@ class IndexDataUpdater:
                 with open(token_lookup_file, 'r') as f:
                     token_lookup = json.load(f)
         except Exception as e:
-            logger.debug(f"Could not load token lookup: {e}")
         
         # Step 1: Match company names from news text to company_symbol_map
         # Only match equity stocks, exclude options/futures
-        if self.company_symbol_map:
-            for company_name, symbol_list in self.company_symbol_map.items():
-                # Skip very short company names (likely false matches)
-                if len(company_name) < 4:
-                    continue
-                
+            if self.company_symbol_map:
+                for company_name, symbol_list in self.company_symbol_map.items():
+                    # Skip very short company names (likely false matches)
+                    if len(company_name) < 4:
+                        continue
+                    
                 # Check if company name appears in news text (exact match or significant words)
                 company_words = [w for w in company_name.split() if len(w) > 3]
                 if company_name in text_upper or (company_words and any(word in text_upper for word in company_words)):
@@ -1001,9 +1117,9 @@ class IndexDataUpdater:
                 'signal': self._get_gap_signal(gap_percent)
             }
 
-            # Publish to Redis (legacy channel) - use DB 1 for realtime data
+            # ✅ FIX: Use only DB 1 for realtime data (unified structure)
             if self.redis_initialized:
-                redis_client = self.redis_db1 if self.redis_db1 else self.redis_client
+                redis_client = self.redis_client
                 if redis_client:
                     redis_client.publish('market.gift_nifty.gap', json.dumps(gap_analysis))
                     redis_client.set('latest_gift_nifty_gap', json.dumps(gap_analysis))
