@@ -63,7 +63,6 @@ class ConnectionManager:
             try:
                 await connection.send_json(message if isinstance(message, dict) else {"data": message_json})
             except Exception as e:
-                logger.debug(f"Error sending to WebSocket: {e}")
                 disconnected.append(connection)
         
         # Clean up disconnected connections
@@ -90,7 +89,6 @@ async def alerts_ws(websocket: WebSocket):
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                 # Clients can send filter requests (optional)
                 # For now, we just keep the connection alive
-                logger.debug(f"Received message from client: {data}")
             except asyncio.TimeoutError:
                 # Send ping to keep connection alive
                 await websocket.send_json({"type": "ping", "timestamp": asyncio.get_event_loop().time()})
@@ -118,7 +116,7 @@ async def redis_alert_listener(redis: Optional[Redis] = None):
     if redis is None:
         try:
             # Try to get Redis config from existing codebase
-            from redis_files.redis_config import get_redis_config
+            from redis_files.redis_client import get_redis_config
             config = get_redis_config()
             redis = Redis(
                 host=config.get('host', 'localhost'),
@@ -148,7 +146,7 @@ async def redis_alert_listener(redis: Optional[Redis] = None):
     except Exception as e:
         # Group might already exist
         if "BUSYGROUP" not in str(e):
-            logger.debug(f"Consumer group creation: {e}")
+            logger.warning(f"Error creating consumer group: {e}")
     
     logger.info(f"Starting Redis alert listener for stream '{stream}' (group: {group}, consumer: {consumer})")
     
@@ -210,7 +208,6 @@ async def redis_alert_listener(redis: Optional[Redis] = None):
                             }
                             await manager.broadcast(broadcast_data)
                             
-                            logger.debug(f"Broadcasted alert from {message_id} to {len(manager.active_connections)} clients")
                             
                         except Exception as e:
                             logger.error(f"Error processing alert message {message_id}: {e}")
