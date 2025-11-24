@@ -1,0 +1,166 @@
+# ============================================
+# AION Trading System - Git Ignore Rules
+# Python files, JSON configs, and Frontend source files are tracked
+# Directory structure is preserved for clarity
+# ============================================
+
+# ============================================
+# EXCLUDE: All Documentation Files
+# ============================================
+*.md
+**/*.md
+
+# ============================================
+# EXCLUDE: Large Data Files (>600KB)
+# ============================================
+*.zip
+*.rdb
+*.aof
+*.jsonl
+*.csv
+*.log
+*.txt
+*.pdf
+*.backup
+*.plist
+*.zst
+*.bin
+# Exclude any file larger than 600KB (handled by gitattributes)
+
+# ============================================
+# EXCLUDE: Python Cache & Compiled Files
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyc
+
+# ============================================
+# EXCLUDE: Virtual Environments
+# ============================================
+.venv/
+venv/
+ENV/
+env/
+
+# ============================================
+# EXCLUDE: IDE & Editor Files
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================================
+# EXCLUDE: OS Files
+# ============================================
+.DS_Store
+Thumbs.db
+
+# ============================================
+# EXCLUDE: Frontend Dependencies & Build
+# ============================================
+node_modules/
+frontend/node_modules/
+aion_trading_dashboard/frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# ============================================
+# EXCLUDE: Build Artifacts
+# ============================================
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ============================================
+# EXCLUDE: Environment & Secrets
+# ============================================
+.env
+.env.local
+.env.*.local
+
+# ============================================
+# EXCLUDE: Large Data Directories
+# ============================================
+zerodha/**/*.jsonl
+zerodha_websocket/**/*.jsonl
+crawlers/raw_data/
+clickhouse_setup/**/*.csv
+clickhouse_setup/**/*.jsonl
+
+# ============================================
+# EXCLUDE: Logs & Temporary Files
+# ============================================
+logs/
+*.log
+backend.log
+frontend.log
+
+# ============================================
+# EXCLUDE: Temporary & Backup Directories
+# ============================================
+temp_zip/
+dashboard_old_backup_*/
+
+# ============================================
+# INCLUDE: Python Files (all .py files are tracked)
+# ============================================
+!*.py
+!**/*.py
+
+# ============================================
+# INCLUDE: JSON Config Files (all .json files are tracked)
+# ============================================
+!*.json
+!**/*.json
+
+# ============================================
+# EXCLUDE: Large JSON Data Files (after including .json)
+# ============================================
+*.jsonl
+zerodha/**/*.jsonl
+zerodha_websocket/**/*.jsonl
+clickhouse_setup/**/*.jsonl
+
+# ============================================
+# INCLUDE: Shell Scripts
+# ============================================
+!*.sh
+!**/*.sh
+
+# ============================================
+# INCLUDE: Essential Config Files
+# ============================================
+!pyrightconfig.json
+!package.json
+!tsconfig.json
+!vite.config.json
+!vite.config.ts
+
+# ============================================
+# INCLUDE: Frontend Source Files (TypeScript/React)
+# ============================================
+!*.ts
+!*.tsx
+!*.js
+!*.jsx
+!*.html
+!*.css
+!*.scss
+!frontend/**/*.ts
+!frontend/**/*.tsx
+!frontend/**/*.js
+!frontend/**/*.jsx
+!frontend/**/*.html
+!frontend/**/*.css
+!frontend/**/*.scss
+
+*.__pycache__*
+*.zst
+
+
