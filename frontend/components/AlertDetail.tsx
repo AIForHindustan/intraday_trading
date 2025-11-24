@@ -1,0 +1,337 @@
+import React, { useEffect, useState } from 'react';
+import { useParams, Link } from 'react-router-dom';
+import { alertsAPI, chartsAPI, volumeProfileAPI, newsAPI, validationAPI, indicatorsAPI, greeksAPI } from '../services/api';
+import { subscribeValidation } from '../services/socket';
+import { adaptOhlcPayload, adaptOverlays } from '../services/adapters';
+import {
+  Box,
+  Typography,
+  Paper,
+  Grid,
+  Chip,
+  Divider,
+  CircularProgress,
+  List,
+  ListItem,
+  ListItemText,
+  Tabs,
+  Tab
+} from '@mui/material';
+import PriceChart from './PriceChart';
+import VolumeProfileChart from './VolumeProfileChart';
+import { format } from 'date-fns';
+
+interface AlertDetailData {
+  alert: any;
+  chart_data: any;
+  volume_profile: any;
+  news: any[];
+  validation: any;
+}
+
+const AlertDetail: React.FC = () => {
+  const { alertId } = useParams<{ alertId: string }>();
+  const [data, setData] = useState<AlertDetailData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState(0);
+
+  useEffect(() => {
+    if (!alertId) return;
+    let mounted = true;
+    (async () => {
+      try {
+        const response = await alertsAPI.getById(alertId);
+        if (!mounted) return;
+        const alertData = response.data;
+        // Extract symbol - use base_symbol if available, otherwise extract from symbol
+        const symbol = alertData.alert.base_symbol || alertData.alert.symbol?.split(':')?.[1]?.split(/\d/)?.[0] || alertData.alert.symbol;
+        
+        // Fetch additional chart, volume, indicators, greeks, news, and validation data
+        const [chartRes, volumeRes, indicatorsRes, greeksRes, newsRes, validationRes] = await Promise.allSettled([
+          chartsAPI.getData(alertData.alert.symbol, { include_indicators: true }).catch(e => ({ data: { ohlc: [], indicators_overlay: {} } })),
+          volumeProfileAPI.getData(alertData.alert.symbol).catch(e => ({ data: { distribution: {}, poc_price: 0 } })),
+          indicatorsAPI.getBySymbol(alertData.alert.symbol).catch(e => ({ data: { indicators: {} } })),
+          alertData.alert.instrument_type === 'OPTIONS' ? greeksAPI.getBySymbol(alertData.alert.symbol).catch(e => ({ data: {} })) : Promise.resolve({ data: {} }),
+          newsAPI.getBySymbol(symbol).catch(e => ({ data: [] })),
+          validationAPI.getByAlertId(alertId).catch(e => ({ data: null }))
+        ]);
+        if (!mounted) return;
+        
+        // Extract data from Promise.allSettled results
+        const chartData = chartRes.status === 'fulfilled' ? chartRes.value.data : { ohlc: [], indicators_overlay: {} };
+        const volumeData = volumeRes.status === 'fulfilled' ? volumeRes.value.data : { distribution: {}, poc_price: 0 };
+        const indicatorsData = indicatorsRes.status === 'fulfilled' ? indicatorsRes.value.data : { indicators: {} };
+        const greeksData = greeksRes.status === 'fulfilled' ? greeksRes.value.data : {};
+        const newsResponse = newsRes.status === 'fulfilled' ? newsRes.value.data : [];
+        const validationData = validationRes.status === 'fulfilled' ? validationRes.value.data : null;
+        
+        // Handle news response - API returns array directly, not wrapped in {news: [...]}
+        const newsData = Array.isArray(newsResponse) ? newsResponse : (newsResponse?.news || []);
+        
+        // Merge indicators and greeks from API if not already in alert data
+        const enrichedAlert = {
+          ...alertData.alert,
+          indicators: alertData.alert.indicators || indicatorsData.indicators || {},
+          greeks: alertData.alert.greeks || greeksData || {}
+        };
+        
+        console.log('AlertDetail: Data received:', { 
+          ohlc_count: chartData.ohlc?.length || 0, 
+          has_indicators: !!chartData.indicators_overlay,
+          volume_dist_keys: Object.keys(volumeData.distribution || {}).length,
+          indicators_count: Object.keys(enrichedAlert.indicators || {}).length,
+          greeks_count: Object.keys(enrichedAlert.greeks || {}).length,
+          news_count: newsData.length
+        });
+        
+        setData({
+          alert: enrichedAlert,
+          chart_data: chartData,
+          volume_profile: volumeData,
+          news: newsData,
+          validation: validationData
+        });
+        setLoading(false);
+      } catch (err) {
+        console.error('Failed to fetch alert details', err);
+        setLoading(false);
+      }
+    })();
+    // Subscribe to validation updates
+    const unsubscribe = subscribeValidation(alertId, (validation) => {
+      setData((prev) => (prev ? { ...prev, validation } : prev));
+    });
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, [alertId]);
+
+  if (loading || !data) {
+    return (
+      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '60vh' }}>
+        <CircularProgress />
+      </Box>
+    );
+  }
+
+  const { alert, chart_data, volume_profile, news, validation } = data;
+
+  // Adapt chart data using adapters
+  const ohlc = adaptOhlcPayload(chart_data || {});
+  const overlay = adaptOverlays(chart_data || {});
+  
+  // Extract EMA and VWAP from overlay
+  const ema = overlay.ema_20?.length > 0 ? {
+    ema_20: overlay.ema_20,
+    ema_50: overlay.ema_50,
+    ema_100: overlay.ema_100,
+    ema_200: overlay.ema_200,
+  } : undefined;
+  const vwap = overlay.vwap;
+
+  return (
+    <Box sx={{ p: 2 }}>
+      <Box sx={{ mb: 2 }}>
+        <Typography variant="h5" gutterBottom>
+          {alert.symbol} - {alert.pattern_label}
+        </Typography>
+        <Typography variant="body2" color="text.secondary">
+          Alert ID: {alert.alert_id}
+        </Typography>
+        <Chip label={alert.signal} color={alert.signal === 'BUY' ? 'success' : 'error'} sx={{ mr: 1, mt: 1 }} />
+        <Chip label={`Confidence: ${(alert.confidence * 100).toFixed(1)}%`} sx={{ mr: 1, mt: 1 }} />
+        <Chip label={`Last Price: ${alert.last_price.toFixed(2)}`} sx={{ mr: 1, mt: 1 }} />
+      </Box>
+
+      <Paper sx={{ p: 2, mb: 2 }}>
+        <Tabs value={tab} onChange={(_, v) => setTab(v)}>
+          <Tab label="Price" />
+          <Tab label="Indicators" />
+          <Tab label="Volume Profile" />
+          <Tab label="Validation" />
+        </Tabs>
+
+        {tab === 0 && (
+          <Box sx={{ mt: 2, width: '100%', height: 380 }}>
+            {ohlc && ohlc.length > 0 ? (
+              <PriceChart 
+                ohlc={ohlc} 
+                ema={ema} 
+                vwap={vwap} 
+                height={380}
+                symbol={alert?.base_symbol || alert?.symbol}
+                enableRealtime={true}
+              />
+            ) : (
+              <Paper sx={{ p: 3, textAlign: 'center' }}>
+                <Typography variant="body1" color="text.secondary">
+                  No chart data available for {alert.symbol}
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                  Chart data will appear here once market data is available
+                </Typography>
+              </Paper>
+            )}
+          </Box>
+        )}
+
+        {tab === 1 && (
+          <Grid container spacing={2} sx={{ mt: 1 }}>
+            {/* @ts-ignore - MUI Grid API mismatch */}
+            <Grid item xs={12} md={6}>
+              <Paper sx={{ p: 2 }}>
+                <Typography variant="h6" gutterBottom>Indicators</Typography>
+                {alert.indicators && Object.keys(alert.indicators).length > 0 ? (
+                  Object.keys(alert.indicators).map((key) => {
+                    const value = alert.indicators[key];
+                    let displayValue: string;
+                    if (typeof value === 'object' && value !== null) {
+                      // Handle complex indicators like MACD, Bollinger Bands
+                      displayValue = JSON.stringify(value, null, 2);
+                    } else if (typeof value === 'number') {
+                      displayValue = value.toFixed(2);
+                    } else {
+                      displayValue = String(value);
+                    }
+                    return (
+                      <Typography key={key} variant="body2" sx={{ mb: 0.5 }}>
+                        <strong>{key.toUpperCase()}:</strong> {displayValue}
+                      </Typography>
+                    );
+                  })
+                ) : (
+                  <Typography variant="body2" color="text.secondary">
+                    No indicators available
+                  </Typography>
+                )}
+              </Paper>
+            </Grid>
+            {/* @ts-ignore - MUI Grid API mismatch */}
+            <Grid item xs={12} md={6}>
+              {alert.instrument_type === 'OPTIONS' && alert.greeks && Object.keys(alert.greeks).length > 0 && (
+                <Paper sx={{ p: 2 }}>
+                  <Typography variant="h6" gutterBottom>Greeks</Typography>
+                  {Object.keys(alert.greeks).map((key) => {
+                    const value = alert.greeks[key];
+                    const displayValue = typeof value === 'number' ? value.toFixed(4) : String(value);
+                    const color = typeof value === 'number' && value < 0 ? 'error.main' : 'success.main';
+                    return (
+                      <Typography key={key} variant="body2" sx={{ mb: 0.5 }}>
+                        <strong>{key.toUpperCase()}:</strong>{' '}
+                        <span style={{ color: color === 'error.main' ? '#f44336' : '#4caf50' }}>
+                          {displayValue}
+                        </span>
+                      </Typography>
+                    );
+                  })}
+                </Paper>
+              )}
+            </Grid>
+          </Grid>
+        )}
+
+        {tab === 2 && volume_profile && (
+          <Box sx={{ mt: 2, minHeight: 300 }}>
+            {volume_profile.distribution && Object.keys(volume_profile.distribution).length > 0 ? (
+              <VolumeProfileChart
+                distribution={volume_profile.distribution || {}}
+                poc_price={volume_profile.poc_price}
+                value_area_low={volume_profile.value_area_low}
+                value_area_high={volume_profile.value_area_high}
+                height={300}
+              />
+            ) : (
+              <Paper sx={{ p: 3, textAlign: 'center' }}>
+                <Typography variant="body1" color="text.secondary">
+                  No volume profile data available for {alert.symbol}
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                  Volume profile will appear here once trading data is available
+                </Typography>
+              </Paper>
+            )}
+          </Box>
+        )}
+
+        {tab === 3 && (
+          <Box sx={{ mt: 2 }}>
+            <Paper sx={{ p: 2 }}>
+              <Typography variant="h6" gutterBottom>Validation</Typography>
+              {validation && (
+                <Box>
+                  <Typography variant="body2">Status: {validation.status}</Typography>
+                  {validation.confidence_score != null && (
+                    <Typography variant="body2">Confidence Score: {(validation.confidence_score * 100).toFixed(1)}%</Typography>
+                  )}
+                  {validation.price_movement_pct != null && (
+                    <Typography variant="body2">Price Move: {validation.price_movement_pct}%</Typography>
+                  )}
+                  {validation.duration_minutes != null && (
+                    <Typography variant="body2">Duration: {validation.duration_minutes} minutes</Typography>
+                  )}
+                  {validation.max_move_pct != null && (
+                    <Typography variant="body2">Max Move: {validation.max_move_pct}%</Typography>
+                  )}
+                  {validation.rolling_windows && typeof validation.rolling_windows === 'object' && (
+                    <Box sx={{ mt: 2 }}>
+                      <Typography variant="subtitle2" gutterBottom>Rolling Windows</Typography>
+                      <Typography variant="body2">
+                        Success: {validation.rolling_windows.success_count || 0} / {validation.rolling_windows.total_windows || 0}
+                      </Typography>
+                      <Typography variant="body2">
+                        Success Ratio: {((validation.rolling_windows.success_ratio || 0) * 100).toFixed(1)}%
+                      </Typography>
+                    </Box>
+                  )}
+                </Box>
+              )}
+            </Paper>
+          </Box>
+        )}
+      </Paper>
+      <Box sx={{ mt: 2 }}>
+        <Paper sx={{ p: 2, mb: 2 }}>
+          <Typography variant="h6">News</Typography>
+          <List>
+            {news.map((item, index) => {
+              const title = item.headline || item.title || 'Untitled';
+              const url = item.url || item.link || '#';
+              const timestamp = item.timestamp || item.collected_at || item.written_at || item.date || new Date().toISOString();
+              return (
+                <ListItem key={index} component="a" href={url} target="_blank" rel="noopener noreferrer" sx={{ color: 'inherit' }}>
+                  <ListItemText 
+                    primary={title} 
+                    secondary={timestamp.includes('T') ? format(new Date(timestamp), 'yyyy-MM-dd HH:mm:ss') : timestamp}
+                  />
+                </ListItem>
+              );
+            })}
+          </List>
+        </Paper>
+        <Paper sx={{ p: 2 }}>
+          <Typography variant="h6">Validation</Typography>
+          {validation && (
+            <Box>
+              <Typography variant="body2">Status: {validation.status}</Typography>
+              {validation.confidence_score != null && (
+                <Typography variant="body2">Confidence Score: {(validation.confidence_score * 100).toFixed(1)}%</Typography>
+              )}
+              {validation.price_movement_pct != null && (
+                <Typography variant="body2">Price Move: {validation.price_movement_pct}%</Typography>
+              )}
+            </Box>
+          )}
+        </Paper>
+      </Box>
+      <Divider sx={{ my: 3 }} />
+      <Box>
+        <Typography variant="body2" component={Link} to="/" sx={{ textDecoration: 'none' }}>
+          &larr; Back to Alerts
+        </Typography>
+      </Box>
+    </Box>
+  );
+};
+
+export default AlertDetail;
